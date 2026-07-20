@@ -1,74 +1,133 @@
-using System;
+// LXRGC benchmark console app.
+//
+// Runs a mixed allocation workload (small short-lived objects, some medium
+// "survivor-like" objects kept alive in a list, and occasional large object
+// heap allocations) for a fixed duration, then reports throughput and GC
+// counters to stdout as a single JSON line so the harness can parse it.
 
-class Program
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Runtime;
+using System.Text.Json;
+
+// Custom Meter so `dotnet-counters collect` can capture a uniform
+// "operations" throughput time series (rate/sec) for this app, the same way
+// it captures built-in GC counters like gen-0-gc-count or time-in-gc. This
+// lets the benchmark harness derive a real throughput-over-time chart
+// without parsing custom app output.
+var meter = new Meter("LXRGC.Bench");
+long opsForCounter = 0;
+var opsCounter = meter.CreateCounter<long>("operations", description: "Completed benchmark operations");
+
+int durationSeconds = args.Length > 0 && int.TryParse(args[0], out var d) ? d : 60;
+string label = args.Length > 1 ? args[1] : "run";
+
+// AppContext doesn't expose the resolved standalone GC name to managed code,
+// so report the DOTNET_GCName knob directly (this is exactly how the bench
+// harness selects LXRGC vs. the built-in GC in the first place).
+string gcName = Environment.GetEnvironmentVariable("DOTNET_GCName")
+    ?? Environment.GetEnvironmentVariable("COMPlus_GCName")
+    ?? (GCSettings.IsServerGC ? "CoreCLR (Server)" : "CoreCLR (Workstation)");
+
+Console.WriteLine($"# LXRGC-bench ConsoleApp starting: duration={durationSeconds}s label={label}");
+Console.WriteLine($"# GC.Name={gcName}");
+
+var survivors = new List<byte[]>();
+var rng = new Random(12345);
+long ops = 0;
+var sw = Stopwatch.StartNew();
+var deadline = TimeSpan.FromSeconds(durationSeconds);
+
+var proc = Process.GetCurrentProcess();
+
+while (sw.Elapsed < deadline)
 {
-    // A strong static root keeps a graph alive across a phase; nulling it makes
-    // the whole graph unreachable so LXR's backup trace + sweep can reclaim it.
-    static object[] s_root;
-
-    sealed class Node
+    // Small short-lived allocations (typical gen0 churn).
+    for (int i = 0; i < 200; i++)
     {
-        public Node Next;                 // reference field -> exercises GCScanObjectRefs
-        public byte[] Payload = new byte[112];
+        var small = new byte[rng.Next(16, 256)];
+        small[0] = (byte)i;
+        ops++;
     }
 
-    static long InUseMB() => GC.GetTotalMemory(false) / (1024 * 1024);
-
-    static void Fill(int n)
+    // Some strings / small objects too.
+    for (int i = 0; i < 50; i++)
     {
-        s_root = new object[n];
-        for (int i = 0; i < n; i++)
-            s_root[i] = new byte[128];
+        var s = new string('x', rng.Next(8, 64));
+        ops++;
+        if (s.Length == -1) Console.WriteLine(s); // never true; keeps JIT from eliding the alloc
     }
 
-    // Build a self-referential cycle and drop all local references to it. Pure
-    // reference counting can never reclaim this; LXR's backup trace must.
-    static void BuildAndDropCycle()
+    // Occasionally keep something alive (simulates real app state growth).
+    if (ops % 5000 == 0)
     {
-        var a = new Node();
-        var b = new Node();
-        a.Next = b;
-        b.Next = a;
-        a = null;
-        b = null;
+        survivors.Add(new byte[rng.Next(1024, 4096)]);
     }
 
-    static void Main()
+    // Occasional large object heap allocation.
+    if (ops % 20000 == 0)
     {
-        Console.WriteLine($"AppContext GCName: {AppContext.GetData("GCName")}");
-
-        const int N = 400_000;
-
-        Console.WriteLine($"[phase0] startup committed-in-use = {InUseMB()} MB");
-
-        // Phase 1: allocate a large live graph and keep it rooted.
-        Fill(N);
-        long live = InUseMB();
-        Console.WriteLine($"[phase1] live graph rooted, committed-in-use = {live} MB");
-
-        // Phase 2: drop the graph, then collect. Dead regions should decommit.
-        s_root = null;
-        GC.Collect();
-        long afterDrop = InUseMB();
-        Console.WriteLine($"[phase2] dropped + GC.Collect(), committed-in-use = {afterDrop} MB");
-
-        // Phase 3: allocate again. Reclaimed regions should be reused, so the
-        // committed footprint should stay near the phase-1 level, not double.
-        Fill(N);
-        long afterReuse = InUseMB();
-        Console.WriteLine($"[phase3] re-allocated, committed-in-use = {afterReuse} MB");
-
-        // Phase 4: cycle collection - drop everything (incl. a cycle) and collect.
-        s_root = null;
-        BuildAndDropCycle();
-        GC.Collect();
-        long afterCycle = InUseMB();
-        Console.WriteLine($"[phase4] cycle dropped + GC.Collect(), committed-in-use = {afterCycle} MB");
-
-        bool reclaimed = afterDrop < live;
-        bool reused = afterReuse <= live + (live / 4) + 8; // stayed roughly flat (not ~2x)
-        Console.WriteLine(reclaimed ? "LXRGC-RECLAIM-OK" : "LXRGC-RECLAIM-NONE");
-        Console.WriteLine(reused ? "LXRGC-REUSE-OK" : "LXRGC-REUSE-NONE");
-        Console.WriteLine("LXRGC-SMOKE-OK");
+        var large = new byte[rng.Next(90_000, 200_000)];
+        large[0] = 1;
+        ops++;
     }
+
+    opsCounter.Add(ops - opsForCounter);
+    opsForCounter = ops;
+
+    // Throttle to a realistic sustained allocation rate. A GC that never
+    // reclaims memory would otherwise commit many tens of GB per minute at
+    // an unthrottled rate, which is unrepresentative of real workloads and
+    // risks exhausting machine memory during a multi-minute comparison run.
+    Thread.Sleep(1);
+}
+
+sw.Stop();
+proc.Refresh();
+
+var result = new BenchResult
+{
+    Label = label,
+    DurationSeconds = sw.Elapsed.TotalSeconds,
+    Operations = ops,
+    OpsPerSecond = ops / sw.Elapsed.TotalSeconds,
+    GcName = gcName,
+    TotalAllocatedBytes = GC.GetTotalAllocatedBytes(precise: false),
+    Gen0Collections = GC.CollectionCount(0),
+    Gen1Collections = GC.CollectionCount(1),
+    Gen2Collections = GC.CollectionCount(2),
+    WorkingSetBytes = proc.WorkingSet64,
+    PrivateBytes = proc.PrivateMemorySize64,
+    PeakWorkingSetBytes = proc.PeakWorkingSet64,
+    SurvivorListCount = survivors.Count
+};
+
+var memInfo = GC.GetGCMemoryInfo();
+result.HeapSizeBytes = memInfo.HeapSizeBytes;
+result.TotalCommittedBytes = memInfo.TotalCommittedBytes;
+result.PauseTimePercentage = memInfo.PauseTimePercentage;
+
+string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = false });
+Console.WriteLine("##RESULT##" + json);
+
+GC.KeepAlive(survivors);
+
+internal class BenchResult
+{
+    public string Label { get; set; } = "";
+    public double DurationSeconds { get; set; }
+    public long Operations { get; set; }
+    public double OpsPerSecond { get; set; }
+    public string GcName { get; set; } = "";
+    public long TotalAllocatedBytes { get; set; }
+    public int Gen0Collections { get; set; }
+    public int Gen1Collections { get; set; }
+    public int Gen2Collections { get; set; }
+    public long WorkingSetBytes { get; set; }
+    public long PrivateBytes { get; set; }
+    public long PeakWorkingSetBytes { get; set; }
+    public long HeapSizeBytes { get; set; }
+    public long TotalCommittedBytes { get; set; }
+    public double PauseTimePercentage { get; set; }
+    public int SurvivorListCount { get; set; }
 }
