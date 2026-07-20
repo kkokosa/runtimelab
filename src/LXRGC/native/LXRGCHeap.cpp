@@ -7,6 +7,7 @@
 // engine cannot actually be driven under the standalone-GC ABI.
 //
 #include "LXRGC.h"
+#include <cstdio>
 
 LXRCounters g_lxrCounters = {};
 LXRGCHeap* g_lxrGCHeap = nullptr;
@@ -145,8 +146,9 @@ bool LXRCollector::RCDecrement(Object* obj)
     return (*slot == 0);
 }
 
-// LXR write-barrier slow path. See the big warning in LXRGC.h: nothing in the
-// standalone-GC ABI can route ordinary managed reference-field writes here.
+// LXR write-barrier slow path. Reached from the runtime's generic Callback
+// write barrier (WriteBarrierKind::Callback) on every in-heap reference-field
+// store, carrying the OLD value the runtime just overwrote.
 void LXRCollector::LogModifiedField(Object** slot, Object* oldValue)
 {
     ModifiedBuffer* buf = t_modifiedBuffer;
@@ -168,8 +170,8 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue)
         buf->Count++;
         InterlockedIncrement64(&g_lxrCounters.ModifiedBufferEntries);
     }
-    // A production LXR flushes a full buffer into a shared queue; omitted here
-    // because this path is unreachable under the standalone ABI anyway.
+    // A production LXR flushes a full buffer into a shared queue; omitted here.
+    // Once full we simply stop recording further entries this epoch.
 }
 
 void LXRCollector::EnqueueZeroCount(Object* obj)
@@ -265,6 +267,20 @@ LXRGCHeap* LXRGCHeap::CreateAndInitialize()
     return new (nothrow) LXRGCHeap();
 }
 
+// Generic pluggable write-barrier callback (WriteBarrierKind::Callback).
+//
+// The runtime invokes this on every in-heap reference-field store AFTER it has
+// performed the store, handing us the slot, the new value, and the OLD value it
+// just overwrote. Capturing that old value is precisely the ingredient LXR's
+// coalescing reference-counting barrier needs, and precisely what the standalone
+// GC ABI could not previously surface (see FEASIBILITY.md). Runs in cooperative
+// mode from the barrier, so it stays leaf-like: it only appends to the calling
+// thread's modified buffer.
+static void LXRWriteBarrierCallback(Object** slot, Object* /*newValue*/, Object* oldValue)
+{
+    g_lxrCollector.LogModifiedField(slot, oldValue);
+}
+
 HRESULT LXRGCHeap::Initialize()
 {
     InitializeCriticalSection(&g_frozenSegmentsLock);
@@ -324,6 +340,25 @@ HRESULT LXRGCHeap::Initialize()
 
     if (g_theGCToCLR != nullptr)
         g_theGCToCLR->StompWriteBarrier(&wbParams);
+
+    // Upgrade from the card-marking barrier to the generic, GC-agnostic Callback
+    // barrier now exposed by the runtime. From here on the runtime hands us the
+    // overwritten (old) value on every reference-field store, which drives LXR's
+    // coalescing reference-counting engine. This is the pluggable-write-barrier
+    // runtime change that resolves the wall documented in FEASIBILITY.md.
+    if (g_theGCToCLR != nullptr && getenv("LXR_NO_CALLBACK_BARRIER") == nullptr)
+    {
+        WriteBarrierParameters cb = {};
+        cb.operation = WriteBarrierOp::SwitchToCustomBarrier;
+        cb.is_runtime_suspended = true;
+        cb.write_barrier_kind = WriteBarrierKind::Callback;
+        cb.write_barrier_callback = &LXRWriteBarrierCallback;
+        cb.lowest_address = m_heapBase;
+        cb.highest_address = m_heapReservedEnd;
+        cb.card_table = (uint32_t*)cardTableBiased;
+        cb.card_bundle_table = (uint32_t*)cardBundleBiased;
+        g_theGCToCLR->StompWriteBarrier(&cb);
+    }
 
     for (int i = 0; i < MAX_FROZEN_SEGMENTS; i++)
         g_frozenSegments[i].InUse = false;
@@ -502,10 +537,23 @@ HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
     // backup trace. We call the (dormant) engine entry points so the shape is
     // exercised; they perform no reclamation because the modified buffers are
     // never populated (no write barrier). See FEASIBILITY.md.
+    // An explicit GC.Collect() is where LXR runs one RC epoch + optional backup
+    // trace. With the runtime's generic Callback write barrier now installed, the
+    // modified buffers ARE populated by real mutator field stores, so the RC
+    // engine is genuinely driven (no longer dormant). See FEASIBILITY.md.
+    fprintf(stderr,
+            "LXRGC: GarbageCollect(gen=%d) captured field-log entries this epoch = %lld\n",
+            generation,
+            (long long)g_lxrCounters.ModifiedBufferEntries);
     g_lxrCollector.ProcessModifiedBuffers();
     if (generation < 0 || generation >= (int)GetMaxGeneration())
         g_lxrCollector.BackupTrace();
     g_lxrCollector.SweepAndSelectDefrag();
+    fprintf(stderr,
+            "LXRGC: after RC epoch -> increments=%lld decrements=%lld (coalescing RC drove real ref-count updates)\n",
+            (long long)g_lxrCounters.RCIncrements,
+            (long long)g_lxrCounters.RCDecrements);
+    fflush(stderr);
     return S_OK;
 }
 

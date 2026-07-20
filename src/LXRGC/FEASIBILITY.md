@@ -1,18 +1,30 @@
 # LXR on the CoreCLR standalone-GC ABI — feasibility analysis
 
-**Verdict: LXR cannot be implemented as a standalone GC without changing the
-runtime.** The blocker is fundamental and appears at the very heart of LXR: its
-*field-logging / coalescing reference-counting write barrier*. The CoreCLR
-standalone-GC ABI gives a plug-in GC no way to observe the **old** value of a
-mutated reference field, and no way to install its own barrier code — the only
-barrier the JIT emits is a fixed **card-marking** barrier whose behaviour the GC
-can parameterise but not replace.
+> **UPDATE — RESOLVED (via a generic runtime facility).** The wall described
+> below was real for the *unmodified* ABI. It has since been removed by adding a
+> **generic, GC-agnostic pluggable write barrier** to the runtime fork
+> [`kkokosa/runtime`, branch `feature/pluggable-write-barrier`], gated behind
+> `FEATURE_GC_CUSTOM_WRITE_BARRIER`. The runtime now exposes a neutral
+> `WriteBarrierKind::Callback` barrier: it captures the **old** field value and
+> hands `(slot, newValue, oldValue)` to a GC-registered callback. Nothing
+> LXR-specific or GC-policy-specific was added to the runtime. LXRGC selects it
+> in `LXRGCHeap::Initialize` and its coalescing-RC engine is now genuinely
+> driven by real managed field stores (verified: the write barrier logs field
+> mutations and the RC engine performs real increments/decrements). See
+> §5 for the design and the original analysis below for why it was needed.
+
+**Original verdict (unmodified ABI): LXR cannot be implemented as a standalone GC
+without changing the runtime.** The blocker is fundamental and appears at the
+very heart of LXR: its *field-logging / coalescing reference-counting write
+barrier*. The CoreCLR standalone-GC ABI gives a plug-in GC no way to observe the
+**old** value of a mutated reference field, and no way to install its own barrier
+code — the only barrier the JIT emits is a fixed **card-marking** barrier whose
+behaviour the GC can parameterise but not replace.
 
 This document explains what LXR needs, what the ABI provides, exactly where they
 diverge (with runtime source citations), and the minimal runtime change that
-would unblock it. A working scaffold (`native/`) that goes *as far as the ABI
-allows* accompanies this analysis and has been built and run against the locally
-compiled runtime.
+unblocks it (now implemented). A working scaffold (`native/`) accompanies this
+analysis and has been built and run against the locally compiled runtime.
 
 ---
 
@@ -152,30 +164,52 @@ memory grows and `GC.Collect()` leaves `CollectionCount` at 0), unlike the
 baseline GC. A bogus `DOTNET_GCName` fails init with `0x8007007E`, confirming the
 load path (and thus that LXRGC was genuinely the active GC).
 
-## 5. Minimal runtime change that would unblock LXR
+## 5. The runtime change that unblocks LXR (implemented)
 
-LXR needs the JIT write barrier to optionally **log the old value**. The
-smallest viable runtime change is to add an **old-value-logging barrier
-variant** the standalone GC can select, mirroring how
-`FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP` already adds write-watch barrier
-variants:
+LXR needs the JIT write barrier to surface the **old value** and let the GC run
+its own barrier logic. Rather than add anything LXR- or policy-specific, the
+runtime fork adds a **generic, GC-agnostic pluggable write barrier**
+(`FEATURE_GC_CUSTOM_WRITE_BARRIER`, amd64) exposing two neutral primitives; LXR
+uses the first:
 
-1. Add a `WriteBarrierOp` / barrier variant (e.g. `JIT_WriteBarrier_FieldLog`)
-   in `writebarriermanager.*` and the per-arch `JitHelpers_FastWriteBarriers`
-   that, before/atomically-with the store, appends `(slot, *slot)` to a
-   per-thread **log buffer** whose base/limit are thread-local (like the
-   allocation context) and refilled via a GC slow-path call.
-2. Extend `WriteBarrierParameters` with the log-buffer configuration and a
-   `WriteBarrierOp::SwitchToFieldLogging` op.
-3. Expose a `GCToEEInterface` upcall for buffer overflow (flush to the GC).
+- **`WriteBarrierKind::Callback` (implemented & used).** The GC registers one
+  function pointer `void (*)(Object** slot, Object* newValue, Object* oldValue)`.
+  The JIT-emitted barrier reads the old value, performs the store, then calls the
+  callback. The runtime ascribes **no** meaning to what the callback does.
+- **`WriteBarrierKind::CustomCode` (reserved, not implemented).** The GC could
+  supply a raw barrier code blob stomped into the `JIT_WriteBarrier` region.
 
-This is the same barrier the runtime's own SATB/precise machinery is *close* to
-but does not expose to standalone GCs. With it, the already-written
-`LXRCollector` in this scaffold could be driven directly.
+Runtime touch-points (all behind the feature flag, nothing GC-specific):
+
+1. `gc/gcinterface.h` — `WriteBarrierKind`, a `WriteBarrierCallback` typedef,
+   extra `WriteBarrierParameters` fields, and `WriteBarrierOp::SwitchToCustomBarrier`
+   (ABI minor version bumped).
+2. `vm/amd64/JitHelpers_FastWriteBarriers.asm` — `JIT_WriteBarrier_Callback64`,
+   the copy-safe barrier body (capture old value → store → tail-call slow path).
+3. `vm/amd64/JitHelpers_Fast.asm` — `JIT_WriteBarrier_CallbackSlow`, an
+   out-of-line wrapper that **preserves the full volatile SIMD state**
+   (YMM0-15 via `vmovups` when AVX is present, else xmm0-5) around the C callback,
+   because the write-barrier ABI requires vector state be preserved across the
+   barrier.
+4. `vm/writebarriermanager.{h,cpp}` — a new barrier type, sticky selection,
+   `SwitchToCustomWriteBarrier`, and the neutral `g_write_barrier_callback` slot.
+5. `vm/gcenv.ee.cpp` — routes `WriteBarrierOp::SwitchToCustomBarrier`.
+
+LXRGC (in `runtimelab`, `feature/LXRGC`) consumes it: `LXRGCHeap::Initialize`
+issues a `SwitchToCustomBarrier` op registering `LXRWriteBarrierCallback`, which
+forwards `(slot, oldValue)` into `LXRCollector::LogModifiedField`. At a
+collection, `ProcessModifiedBuffers` runs the coalescing RC (increment the new
+referent, decrement the old). The default runtime GC is completely unaffected
+(the barrier stays `Card` unless a GC opts in).
+
+Remaining GC-side work for *full* reclamation (not a runtime limitation): recursive
+zero-count freeing needs `CGCDesc` field traversal, and cycles need the backup
+trace — both live entirely inside LXRGC.
 
 ---
 
-**Conclusion (per the original request): a runtime change is required — stopping
-here.** The scaffold demonstrates everything achievable without it; the
-field-logging write barrier is the one thing the standalone-GC ABI cannot
-provide.
+**Conclusion: the required runtime change is a small, generic, GC-agnostic
+pluggable write barrier — now implemented and verified.** LXR's defining
+field-logging barrier works end-to-end: real managed reference stores drive the
+coalescing reference-counting engine. What the *unmodified* standalone-GC ABI
+could not provide is now provided as a neutral primitive any GC can use.

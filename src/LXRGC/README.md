@@ -8,13 +8,20 @@ sibling to [ZeroGC](https://github.com/kkokosa/runtimelab/tree/feature/ZeroGC).
 
 ## TL;DR
 
-**It can't be done without a runtime change, and this repo shows exactly why
-and exactly how far you *can* get.** LXR is defined by its *field-logging
-(coalescing) reference-counting write barrier*, which must capture the **old**
-value of every mutated reference field. The CoreCLR standalone-GC ABI only lets
-a plug-in GC point the JIT's fixed **card-marking** barrier at a card table — it
-never surfaces the old value and never lets the GC inject its own barrier code.
-Full analysis with runtime citations and a proposed minimal runtime change:
+**Originally this could not be done without a runtime change — and this repo
+shows exactly why.** LXR is defined by its *field-logging (coalescing)
+reference-counting write barrier*, which must capture the **old** value of every
+mutated reference field. The stock CoreCLR standalone-GC ABI only lets a plug-in
+GC point the JIT's fixed **card-marking** barrier at a card table.
+
+**That wall has now been removed** by adding a small, generic, **GC-agnostic
+pluggable write barrier** to the runtime fork
+[`kkokosa/runtime` @ `feature/pluggable-write-barrier`] (gated behind
+`FEATURE_GC_CUSTOM_WRITE_BARRIER`). The runtime exposes a neutral
+`WriteBarrierKind::Callback` that captures the old value and hands
+`(slot, newValue, oldValue)` to a GC-registered callback — nothing LXR- or
+policy-specific enters the runtime. LXRGC selects it and its coalescing-RC engine
+is now genuinely driven by real managed field stores. Full analysis:
 **[FEASIBILITY.md](FEASIBILITY.md)**.
 
 ## What's here
@@ -40,14 +47,23 @@ src/LXRGC/
 - The **RC engine**: side-table reference counts, coalescing-RC replay,
   recursive zero-count freeing, backup-trace / sweep skeletons.
 
-## What's blocked
+## What's now unblocked (via the runtime's generic pluggable write barrier)
 
-- The **field-logging write barrier** that would feed the RC engine. It is
-  implemented (`LXRCollector::LogModifiedField`) but **unreachable**: no
-  standalone-ABI mechanism routes managed field writes to it, and the old value
-  is destroyed by the store before the only observable side effect (a card
-  dirty bit). Consequently the RC/collection machinery is present but dormant,
-  so in practice LXRGC allocates and never reclaims. See FEASIBILITY.md §3.
+- The **field-logging write barrier** that feeds the RC engine. LXRGC selects
+  the runtime's neutral `WriteBarrierKind::Callback` in `LXRGCHeap::Initialize`;
+  the runtime captures the overwritten value and calls
+  `LXRWriteBarrierCallback(slot, newValue, oldValue)` →
+  `LXRCollector::LogModifiedField`. At `GC.Collect()`, `ProcessModifiedBuffers`
+  runs the coalescing RC (increment new referent, decrement old). Verified: a
+  managed run captured thousands of real field-store log entries and performed
+  real RC increments/decrements. Requires the runtime fork branch
+  `feature/pluggable-write-barrier` (see FEASIBILITY.md §5).
+
+## What still remains (GC-side, not an ABI limitation)
+
+- Recursive zero-count freeing needs `CGCDesc` field traversal, and cycle
+  collection needs the backup trace — both live entirely inside LXRGC and are
+  independent of the runtime facility.
 
 ## Build & run
 
