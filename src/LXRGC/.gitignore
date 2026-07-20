@@ -1,0 +1,9 @@
+# Build outputs
+obj/
+bin/
+*.dll
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
