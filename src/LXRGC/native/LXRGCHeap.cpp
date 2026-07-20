@@ -100,8 +100,24 @@ static volatile int64_t g_committedInUse = 0;
 // LXR_GC_TRIGGER_MB). This is what makes LXR behave like a real reclaiming GC
 // under load instead of only reclaiming on an explicit GC.Collect().
 static int64_t RunLXRCollection(int generation);
+static void RequestLXRCollection(bool wait);
+static void LXRCollectorThreadProc(void*);
 static volatile int64_t g_gcTriggerBytes = -1; // -1 = uninitialized; resolved lazily
+static volatile int64_t g_gcGrowthPct = 50;    // adaptive budget: % of live heap
 static volatile LONG g_inCollection = 0;       // reentrancy guard for RunLXRCollection
+
+// Dedicated collector thread. Driving SuspendEE from a random cooperative-mode
+// allocating thread deadlocks under high concurrency (the initiator can end up
+// waiting on threads that are in turn waiting on it). Real LXR runs its trace on
+// its own GC threads; we do the same: a single non-suspendable GC thread owns
+// every stop-the-world cycle, and allocation/GC.Collect just post a request to
+// it. Because the collector thread is created with is_suspendable=false it is
+// never itself a suspension target, so SuspendEE from it is deadlock-free.
+static HANDLE g_collectRequestEvent = nullptr; // auto-reset: wake the collector
+static HANDLE g_collectDoneEvent = nullptr;    // auto-reset: pulsed after each cycle
+static volatile LONG g_collectPending = 0;     // coalesces repeated alloc triggers
+static volatile int64_t g_collectCompletedSeq = 0; // ++ after each completed cycle
+static volatile LONG g_collectorShutdown = 0;
 
 // ===========================================================================
 //   Parseable allocation-region registry (enables sweep + interior pointers)
@@ -721,6 +737,23 @@ HRESULT LXRGCHeap::Initialize()
     for (int i = 0; i < MAX_FROZEN_SEGMENTS; i++)
         g_frozenSegments[i].InUse = false;
 
+    // Bring up the dedicated collector thread so every stop-the-world cycle runs
+    // on a single non-suspendable GC thread (see RequestLXRCollection). Created
+    // via the runtime's GC-thread facility with is_suspendable=false, exactly as
+    // the built-in Server/Background GC threads are.
+    if (g_theGCToCLR != nullptr && g_collectRequestEvent == nullptr)
+    {
+        g_collectRequestEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_collectDoneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_theGCToCLR->CreateThread(&LXRCollectorThreadProc, nullptr, /*is_suspendable*/ false, ".NET LXR GC"))
+        {
+            // If the runtime refused to create the thread, fall back to inline
+            // collection (correctness over the concurrency optimization).
+            CloseHandle(g_collectRequestEvent); g_collectRequestEvent = nullptr;
+            CloseHandle(g_collectDoneEvent);    g_collectDoneEvent = nullptr;
+        }
+    }
+
     return S_OK;
 }
 
@@ -744,22 +777,31 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
 
     ThreadHeapState& th = t_threadHeap;
 
-    // Allocation-triggered collection policy: once committed-in-use has grown by
-    // the configured threshold since the last cycle, run a full STW LXR
-    // collection before servicing this allocation. This is what turns LXR into a
-    // real reclaiming GC under sustained load (the built-in GC triggers on its
-    // own budget heuristics; a standalone GC must decide for itself).
+    // Allocation-triggered collection policy: run a full STW LXR collection once
+    // committed-in-use has grown by an adaptive budget since the last cycle. The
+    // budget is max(LXR_GC_TRIGGER_MB floor, LXR_GC_GROWTH_PCT % of the live heap
+    // retained after the previous cycle). Making the budget scale with the live
+    // heap is what a real generational/region GC does (allocation budget is a
+    // fraction of survivors); a fixed delta would collect every N MiB even for a
+    // multi-GB live heap, making each O(heap) trace+sweep fire constantly and
+    // driving overall cost quadratic. This keeps collection overhead amortized.
     if (g_gcTriggerBytes < 0)
     {
         const char* e = getenv("LXR_GC_TRIGGER_MB");
-        int64_t mb = e ? _atoi64(e) : 64; // default: collect every +64 MiB
+        int64_t mb = e ? _atoi64(e) : 32; // floor: collect at least every +32 MiB of growth
         g_gcTriggerBytes = mb * (int64_t)1024 * 1024;
+        const char* pctEnv = getenv("LXR_GC_GROWTH_PCT");
+        g_gcGrowthPct = pctEnv ? _atoi64(pctEnv) : 50; // grow the heap by 50% before collecting
     }
     if (g_theGCToCLR != nullptr && g_gcTriggerBytes > 0 && g_inCollection == 0)
     {
-        int64_t grown = g_committedInUse - g_lxrCounters.LastCollectCommitted;
-        if (grown >= g_gcTriggerBytes)
-            RunLXRCollection(-1);
+        int64_t live = g_lxrCounters.LastCollectCommitted;
+        int64_t budget = g_gcTriggerBytes;
+        int64_t adaptive = (live * g_gcGrowthPct) / 100;
+        if (adaptive > budget) budget = adaptive;
+        int64_t grown = g_committedInUse - live;
+        if (grown >= budget)
+            RequestLXRCollection(/*wait*/ false);
     }
 
     // Retire the context chunk this thread was filling: its high-water mark is
@@ -1002,10 +1044,58 @@ static int64_t RunLXRCollection(int generation)
     return reclaimedNow - reclaimedBefore;
 }
 
+// Body of the dedicated, non-suspendable GC thread: wait for a request, run one
+// full collection, then publish completion so synchronous waiters (GC.Collect)
+// can observe it.
+static void LXRCollectorThreadProc(void*)
+{
+    for (;;)
+    {
+        WaitForSingleObject(g_collectRequestEvent, INFINITE);
+        if (g_collectorShutdown)
+            break;
+        InterlockedExchange(&g_collectPending, 0);
+        RunLXRCollection(-1);
+        InterlockedIncrement64(&g_collectCompletedSeq);
+        SetEvent(g_collectDoneEvent);
+    }
+}
+
+// Post a collection request to the dedicated collector thread. When wait==true
+// (explicit GC.Collect) block until a cycle that started after this request has
+// finished; otherwise (allocation trigger) fire-and-forget, coalescing repeated
+// requests so the allocator never blocks or drives SuspendEE itself.
+static void RequestLXRCollection(bool wait)
+{
+    if (g_collectRequestEvent == nullptr)
+    {
+        // Collector thread not up yet (very early startup): fall back to a direct
+        // synchronous collection on the calling thread (single-threaded at this
+        // point, so the concurrency hazard does not apply).
+        RunLXRCollection(-1);
+        return;
+    }
+
+    if (wait)
+    {
+        int64_t before = g_collectCompletedSeq;
+        SetEvent(g_collectRequestEvent);
+        while (g_collectCompletedSeq <= before)
+            WaitForSingleObject(g_collectDoneEvent, 50);
+        return;
+    }
+
+    // Fire-and-forget: only arm the collector once until it consumes the request.
+    if (InterlockedCompareExchange(&g_collectPending, 1, 0) == 0)
+        SetEvent(g_collectRequestEvent);
+}
+
 HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
 {
     InterlockedIncrement64(&g_lxrCounters.InducedCollectRequests);
-    int64_t reclaimed = RunLXRCollection(generation);
+    int64_t before = g_lxrCollector.ReclaimedBytes();
+    RequestLXRCollection(/*wait*/ true);
+    int64_t reclaimed = g_lxrCollector.ReclaimedBytes() - before;
     fprintf(stderr,
             "LXRGC: GC(gen=%d) -> RC inc=%lld dec=%lld, backupTraces=%lld, collections=%lld, reclaimed this GC=%lld bytes (total=%lld)\n",
             generation,
