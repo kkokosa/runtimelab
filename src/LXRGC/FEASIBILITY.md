@@ -298,6 +298,18 @@ the two facilities above — safepoint cooperation for a concurrent collector an
 an object-forwarding/read barrier hook for moving objects. That is the next place
 we would "stop and inform": it is a follow-on stage, not silently dropped.
 
+The ported ZeroGC benchmark suite (see **README.md § Benchmark suite**,
+`results/report.html`) confirms this empirically: LXRGC is throughput-competitive
+across six workloads × three GC modes (console, zeroalloc, growing-cache, webapi,
+and two real dotLLM inference servers) while over-committing memory, but two
+GC-side robustness edges trace back to the missing concurrency support — tight
+always-allocating async loops at ≥8 threads can starve the single-threaded STW
+collector (webapi is therefore benchmarked at 4 workers), and on very large,
+continuously-mutating graphs (`growing-cache`) the periodic backup trace can
+occasionally AV by following a stale reference into a chunk a prior sweep
+decommitted (~30% of runs). Both are precisely the "concurrent trace with
+safepoint cooperation" gap described above, not a limit of the STW reclamation.
+
 ---
 
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,

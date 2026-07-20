@@ -33,7 +33,17 @@ param(
     [string]$DotLlmModelFile = "$env:USERPROFILE\.dotllm\models\QuantFactory\SmolLM-135M-GGUF\SmolLM-135M.Q4_K_M.gguf",
     [int]$DotLlmPort = 8099,
     [string]$DotLlmLargeModelFile = "$env:USERPROFILE\.dotllm\models\Qwen\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf",
-    [int]$DotLlmLargePort = 8100
+    [int]$DotLlmLargePort = 8100,
+    # Assembled DOTNET_ROOT that lets the external dotLLM tool run on the
+    # custom pluggable-write-barrier runtime (so LXRGC can actually load)
+    # while still resolving its net10 ASP.NET dependency via roll-forward.
+    # It contains: the custom-barrier Microsoft.NETCore.App (+ LXRGC.dll)
+    # and a stock net11 Microsoft.AspNetCore.App, both exposed as 11.0.0.
+    # When present, ALL THREE GC modes launch dotLLM via
+    # "<root>\dotnet.exe DotLLM.Cli.dll ..." on this same runtime for a fair
+    # comparison. When empty/missing, dotllm falls back to its installed
+    # apphost (LXRGC mode then cannot load - workstation/server only).
+    [string]$DotLlmDotnetRoot = "C:\temp\lxr-dotnetroot"
 )
 
 $ErrorActionPreference = "Stop"
@@ -78,6 +88,27 @@ if ($Scenarios -contains "dotllm-serve" -or $Scenarios -contains "dotllm-serve-1
     $dotLlmAppDll = Get-ChildItem (Join-Path $env:USERPROFILE ".dotnet\tools\.store\dotllm.cli") -Recurse -Filter "DotLLM.Cli.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($dotLlmAppDll) {
         Copy-Item $gcDll -Destination $dotLlmAppDll.DirectoryName -Force
+    }
+
+    # Full-fidelity launch path: if an assembled DOTNET_ROOT is available,
+    # run dotLLM as "<root>\dotnet.exe DotLLM.Cli.dll ..." on the custom
+    # pluggable-write-barrier runtime so LXRGC actually loads. This is the
+    # ONLY way to run the external (net10, ASP.NET-dependent) dotLLM tool on
+    # the ABI-bumped net11 barrier runtime. All three GC modes use it for a
+    # fair, apples-to-apples comparison. Refresh LXRGC.dll in the assembled
+    # NETCore.App so it matches the just-built native GC.
+    $dotLlmUseAssembledRoot = $false
+    if ($DotLlmDotnetRoot -and (Test-Path (Join-Path $DotLlmDotnetRoot "dotnet.exe")) -and $dotLlmAppDll) {
+        $rootDotnet = Join-Path $DotLlmDotnetRoot "dotnet.exe"
+        $rootNetCore = Join-Path $DotLlmDotnetRoot "shared\Microsoft.NETCore.App\11.0.0"
+        if (Test-Path $rootNetCore) {
+            Copy-Item $gcDll -Destination $rootNetCore -Force
+            $dotLlmUseAssembledRoot = $true
+            Write-Host "dotLLM will run on assembled custom runtime: $DotLlmDotnetRoot" -ForegroundColor Green
+        }
+    }
+    if (-not $dotLlmUseAssembledRoot) {
+        Write-Host "WARNING: assembled DOTNET_ROOT not found - dotLLM LXRGC mode cannot load the custom GC; only workstation/server are meaningful." -ForegroundColor Yellow
     }
 }
 
@@ -474,6 +505,7 @@ foreach ($scenarioId in $Scenarios) {
         $csvBase = Join-Path $rawDir $label
         $runStart = Get-Date
 
+        try {
         switch ($scenario.Kind) {
             "console" {
                 $publishDir = Join-Path $root "samples\ConsoleApp\publish"
@@ -580,8 +612,16 @@ foreach ($scenarioId in $Scenarios) {
                 $reqBody = '{"model":"SmolLM-135M.Q4_K_M.gguf","prompt":"The capital of France is","max_tokens":16}'
                 $baseUrl = "http://localhost:$DotLlmPort/v1/completions"
                 $env2 = @{} + $gcMode.Env
-                $svrRun = Invoke-MonitoredServerRun -ExePath $dotLlmExe -WorkingDirectory $root `
-                    -Arguments "serve `"$DotLlmModelFile`" --port $DotLlmPort --no-browser --no-ui" `
+                $serveArgs = "serve `"$DotLlmModelFile`" --port $DotLlmPort --no-browser --no-ui"
+                if ($dotLlmUseAssembledRoot) {
+                    $exePath = $rootDotnet
+                    $serveArgs = "`"$($dotLlmAppDll.FullName)`" $serveArgs"
+                    $env2["DOTNET_ROOT"] = $DotLlmDotnetRoot
+                    $env2["DOTNET_ROLL_FORWARD"] = "LatestMajor"
+                }
+                else { $exePath = $dotLlmExe }
+                $svrRun = Invoke-MonitoredServerRun -ExePath $exePath -WorkingDirectory $root `
+                    -Arguments $serveArgs `
                     -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase `
                     -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds
                 $run = [pscustomobject]@{ Series = $svrRun.Series }
@@ -617,10 +657,18 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
                 $reqBody = (@{ model = "qwen2.5-1.5b-instruct-q4_k_m.gguf"; prompt = $longPrompt; max_tokens = 64 } | ConvertTo-Json -Compress)
                 $baseUrl = "http://localhost:$DotLlmLargePort/v1/completions"
                 $env2 = @{} + $gcMode.Env
-                $svrRun = Invoke-MonitoredServerRun -ExePath $dotLlmExe -WorkingDirectory $root `
-                    -Arguments "serve `"$DotLlmLargeModelFile`" --port $DotLlmLargePort --no-browser --no-ui" `
+                $serveArgs = "serve `"$DotLlmLargeModelFile`" --port $DotLlmLargePort --no-browser --no-ui"
+                if ($dotLlmUseAssembledRoot) {
+                    $exePath = $rootDotnet
+                    $serveArgs = "`"$($dotLlmAppDll.FullName)`" $serveArgs"
+                    $env2["DOTNET_ROOT"] = $DotLlmDotnetRoot
+                    $env2["DOTNET_ROLL_FORWARD"] = "LatestMajor"
+                }
+                else { $exePath = $dotLlmExe }
+                $svrRun = Invoke-MonitoredServerRun -ExePath $exePath -WorkingDirectory $root `
+                    -Arguments $serveArgs `
                     -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase `
-                    -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds
+                    -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds -ReadyTimeoutSeconds 300
                 $run = [pscustomobject]@{ Series = $svrRun.Series }
                 $summary = [ordered]@{
                     OperationsTotal      = $svrRun.TotalOps
@@ -729,6 +777,13 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
 
         # Save incrementally so a crash partway through doesn't lose earlier runs.
         $allRuns | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $OutDir "results-full.json") -Encoding UTF8
+        }
+        catch {
+            Write-Host ("  !! run '{0}' failed and was skipped: {1}" -f $label, $_.Exception.Message) -ForegroundColor Red
+            # Best-effort cleanup of any orphaned server/app process for this run.
+            Get-Process dotnet -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "C:\temp\lxr-dotnetroot\*" } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
+            continue
+        }
     }
 }
 

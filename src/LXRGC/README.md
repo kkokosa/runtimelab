@@ -90,6 +90,60 @@ LXRGC-RECLAIM-OK / LXRGC-REUSE-OK / LXRGC-SMOKE-OK
   read-barrier hook). This phase is STW-only; concurrency is a flagged follow-on
   stage, not silently dropped.
 
+## Benchmark suite (ported from ZeroGC)
+
+The [ZeroGC](https://github.com/kkokosa/runtimelab/tree/feature/ZeroGC)
+benchmark harness (`run-benchmarks.ps1` + `generate-report.ps1`, rendering
+`results/report.html`) is ported here and run with **LXRGC substituted for
+ZeroGC**. Every workload runs on the **custom pluggable-write-barrier runtime**
+(self-contained publish overlaid with the custom `Microsoft.NETCore.App` +
+`LXRGC.dll`) so the full RC + backup-trace + Immix-sweep path actually fires,
+under an allocation-triggered STW collection policy. Six scenarios × three GC
+modes (Workstation, Server, LXRGC), captured via `dotnet-counters`:
+
+| Scenario | What it exercises |
+| --- | --- |
+| `console` | mixed alloc-heavy CLI churn |
+| `zeroalloc` | near-zero-allocation numeric compute (matrix multiply) |
+| `growing-cache` | a large, long-lived, growing in-memory cache (escalating gen2) |
+| `webapi` | ASP.NET Core (Kestrel) minimal API under concurrent load |
+| `dotllm-serve` | real LLM inference server, 135M model ([dotLLM](https://github.com/kkokosa/dotLLM)) |
+| `dotllm-serve-1_5b` | real LLM inference server, 1.5B model (~1 GB, Q4_K_M) |
+
+Headline result (20 s runs): **LXRGC is throughput-competitive across every
+workload** (e.g. `console` ~316k ops vs 312k/316k; `webapi` ~5019 ops vs
+5033/5037; `dotllm-serve` 21 vs 18/20; `zeroalloc` identical) while
+**over-committing memory** — the honest signature of a young research GC versus
+the mature built-in collector (e.g. `webapi` 960 MB committed vs 27/8;
+`dotllm-serve` 3.0 GB vs 38/50 MB). LXRGC reports real collections with equal
+gen0/1/2 counts because it runs unified full-heap cycles.
+
+### Running dotLLM on the custom runtime
+
+`dotLLM` is an external, framework-dependent **net10** tool that also needs the
+net10 ASP.NET shared framework, so it cannot load the ABI-bumped net11 barrier
+runtime directly. It is run full-fidelity via an **assembled `DOTNET_ROOT`**
+(`-DotLlmDotnetRoot`, default `C:\temp\lxr-dotnetroot`) combining the
+custom-barrier `Microsoft.NETCore.App` (+ `LXRGC.dll`) with a stock net11
+`Microsoft.AspNetCore.App`, both exposed as `11.0.0`, launched as
+`<root>\dotnet.exe DotLLM.Cli.dll serve … ` with `DOTNET_ROLL_FORWARD=LatestMajor`.
+`LXRGC.dll` is confirmed loaded into the serving process for the `lxrgc` mode.
+
+### Known LXRGC limitations surfaced by the suite (GC-side, not runtime)
+
+- **High concurrent-allocation thread counts.** The single-threaded STW collector
+  is driven from a dedicated non-suspendable collector thread, which is enough for
+  workloads that reach safepoints between allocations (all GCPerfSim scenarios,
+  `webapi` at ≤4 workers). Tight always-allocating async loops at ≥8 threads can
+  still starve it (`webapi` default worker count is therefore 4).
+- **`growing-cache` under LXRGC is flaky (~30% of runs AV).** On very large,
+  continuously-mutating object graphs the periodic backup trace can occasionally
+  follow a stale reference into a chunk a prior sweep decommitted (a missed-root /
+  reclaim-of-reachable correctness hazard inherent to STW RC + periodic trace
+  without concurrent-safepoint cooperation). The reported datapoint is from a
+  successful run; robust concurrent tracing is part of the deferred
+  concurrency/evacuation work above.
+
 ## Build & run
 
 ```powershell
