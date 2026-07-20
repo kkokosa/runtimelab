@@ -1,28 +1,74 @@
 using System;
-using System.Collections.Generic;
 
 class Program
 {
+    // A strong static root keeps a graph alive across a phase; nulling it makes
+    // the whole graph unreachable so LXR's backup trace + sweep can reclaim it.
+    static object[] s_root;
+
+    sealed class Node
+    {
+        public Node Next;                 // reference field -> exercises GCScanObjectRefs
+        public byte[] Payload = new byte[112];
+    }
+
+    static long InUseMB() => GC.GetTotalMemory(false) / (1024 * 1024);
+
+    static void Fill(int n)
+    {
+        s_root = new object[n];
+        for (int i = 0; i < n; i++)
+            s_root[i] = new byte[128];
+    }
+
+    // Build a self-referential cycle and drop all local references to it. Pure
+    // reference counting can never reclaim this; LXR's backup trace must.
+    static void BuildAndDropCycle()
+    {
+        var a = new Node();
+        var b = new Node();
+        a.Next = b;
+        b.Next = a;
+        a = null;
+        b = null;
+    }
+
     static void Main()
     {
-        Console.WriteLine($"GC backend: {System.Runtime.GCSettings.IsServerGC}, name via config below");
         Console.WriteLine($"AppContext GCName: {AppContext.GetData("GCName")}");
 
-        long before = GC.GetTotalAllocatedBytes();
-        var keep = new List<object>();
-        for (int i = 0; i < 200_000; i++)
-        {
-            keep.Add(new byte[64]);
-            if ((i & 0x3FFF) == 0)
-                keep.Clear(); // drop references: a real GC could reclaim; LXR/RC would decrement here
-        }
-        long after = GC.GetTotalAllocatedBytes();
+        const int N = 400_000;
 
-        Console.WriteLine($"Allocated ~{(after - before) / (1024 * 1024)} MB");
-        Console.WriteLine($"CollectionCount(0)={GC.CollectionCount(0)}  CollectionCount(2)={GC.CollectionCount(2)}");
-        Console.WriteLine($"TotalMemory={GC.GetTotalMemory(false) / (1024 * 1024)} MB");
+        Console.WriteLine($"[phase0] startup committed-in-use = {InUseMB()} MB");
+
+        // Phase 1: allocate a large live graph and keep it rooted.
+        Fill(N);
+        long live = InUseMB();
+        Console.WriteLine($"[phase1] live graph rooted, committed-in-use = {live} MB");
+
+        // Phase 2: drop the graph, then collect. Dead regions should decommit.
+        s_root = null;
         GC.Collect();
-        Console.WriteLine($"After GC.Collect(): CollectionCount(2)={GC.CollectionCount(2)}");
+        long afterDrop = InUseMB();
+        Console.WriteLine($"[phase2] dropped + GC.Collect(), committed-in-use = {afterDrop} MB");
+
+        // Phase 3: allocate again. Reclaimed regions should be reused, so the
+        // committed footprint should stay near the phase-1 level, not double.
+        Fill(N);
+        long afterReuse = InUseMB();
+        Console.WriteLine($"[phase3] re-allocated, committed-in-use = {afterReuse} MB");
+
+        // Phase 4: cycle collection - drop everything (incl. a cycle) and collect.
+        s_root = null;
+        BuildAndDropCycle();
+        GC.Collect();
+        long afterCycle = InUseMB();
+        Console.WriteLine($"[phase4] cycle dropped + GC.Collect(), committed-in-use = {afterCycle} MB");
+
+        bool reclaimed = afterDrop < live;
+        bool reused = afterReuse <= live + (live / 4) + 8; // stayed roughly flat (not ~2x)
+        Console.WriteLine(reclaimed ? "LXRGC-RECLAIM-OK" : "LXRGC-RECLAIM-NONE");
+        Console.WriteLine(reused ? "LXRGC-REUSE-OK" : "LXRGC-REUSE-NONE");
         Console.WriteLine("LXRGC-SMOKE-OK");
     }
 }

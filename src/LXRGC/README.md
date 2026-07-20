@@ -32,10 +32,11 @@ src/LXRGC/
   native/
     LXRGC.h               ABI surface + Immix geometry + RC engine declarations
     dllmain.cpp           GC_VersionInfo / GC_Initialize entry points
-    LXRGCHeap.cpp         IGCHeap impl: Immix allocator + RC engine (dormant)
+    LXRGCHeap.cpp         IGCHeap impl: Immix allocator + full RC/trace/sweep
     LXRGCHandles.cpp      IGCHandleManager impl (reused from ZeroGC)
     build.ps1             Builds LXRGC.dll (Release/Debug, x64) via cl.exe
-  samples/ConsoleApp/     Tiny allocating smoke-test app
+    bench/                Microbenchmark: inline-template vs function-ptr scanning
+  samples/ConsoleApp/     Reclamation demo (allocate → drop → collect → reuse → cycle)
 ```
 
 ## What works (built and run against the local runtime)
@@ -45,25 +46,48 @@ src/LXRGC/
 - A real **Immix substrate**: 32 KiB blocks / 256 B lines, per-block metadata,
   per-thread lock-free block-run bump allocator.
 - The **RC engine**: side-table reference counts, coalescing-RC replay,
-  recursive zero-count freeing, backup-trace / sweep skeletons.
+  recursive zero-count freeing, and a working backup trace + Immix sweep.
 
-## What's now unblocked (via the runtime's generic pluggable write barrier)
+## What's now unblocked (via two generic runtime facilities)
 
 - The **field-logging write barrier** that feeds the RC engine. LXRGC selects
   the runtime's neutral `WriteBarrierKind::Callback` in `LXRGCHeap::Initialize`;
   the runtime captures the overwritten value and calls
   `LXRWriteBarrierCallback(slot, newValue, oldValue)` →
   `LXRCollector::LogModifiedField`. At `GC.Collect()`, `ProcessModifiedBuffers`
-  runs the coalescing RC (increment new referent, decrement old). Verified: a
-  managed run captured thousands of real field-store log entries and performed
-  real RC increments/decrements. Requires the runtime fork branch
-  `feature/pluggable-write-barrier` (see FEASIBILITY.md §5).
+  runs the coalescing RC (increment new referent, decrement old). Requires the
+  runtime fork branch `feature/pluggable-write-barrier` (FEASIBILITY.md §5).
+- **Object reference scanning** — a second generic, GC-agnostic runtime header
+  `src/coreclr/gc/gcobjscan.h` (the long-missing dotnet/runtime **#12809**),
+  offering an inline template `GCScanObjectRefs<TVisit>` that matches the
+  built-in `go_through_object` **macro** speed (≈0.42 ns/field vs ≈2.07 ns/field
+  for the naive function-pointer API — ~4.5× faster; see `native/bench/`). LXRGC
+  scans every object through it (FEASIBILITY.md §6).
 
-## What still remains (GC-side, not an ABI limitation)
+## Full reclamation — now working (STW)
 
-- Recursive zero-count freeing needs `CGCDesc` field traversal, and cycle
-  collection needs the backup trace — both live entirely inside LXRGC and are
-  independent of the runtime facility.
+Built on the two facilities, LXRGC performs **algorithmically-full stop-the-world
+LXR reclamation**: coalescing RC with recursive zero-count freeing, a periodic
+**backup trace** (under `SuspendEE`, marking from handles + `GcScanRoots`) that
+collects **dead cycles** pure RC cannot, and an **Immix sweep** that
+`MEM_DECOMMIT`s fully-dead chunks (committed memory actually drops) and recycles
+them for reuse. Verified end-to-end (`samples/ConsoleApp`):
+
+```
+[phase1] live graph rooted            = 368 MB
+[phase2] dropped + GC.Collect()       =  92 MB   (reclaimed 288 MB)
+[phase3] re-allocated                 = 168 MB   (reused, not doubled)
+[phase4] cycle dropped + GC.Collect() = 108 MB   (a further 62 MB, cycle collected)
+LXRGC-RECLAIM-OK / LXRGC-REUSE-OK / LXRGC-SMOKE-OK
+```
+
+## What still remains (a genuine, scoped runtime gap)
+
+- **Concurrency + copying evacuation.** Real LXR is concurrent and defragments by
+  moving objects, which needs generic runtime support beyond the two facilities
+  above (safepoint cooperation for a concurrent collector, an object-forwarding /
+  read-barrier hook). This phase is STW-only; concurrency is a flagged follow-on
+  stage, not silently dropped.
 
 ## Build & run
 

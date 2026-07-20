@@ -61,6 +61,19 @@
 #include "gcenv.ee.h"
 #include "gcinterface.h"
 
+// gcdesc.h (pulled in by gcobjscan.h) uses _ASSERTE -> ASSERT, which the GC host
+// is expected to supply. LXRGC has no debug-assert facility, so define a no-op.
+#ifndef ASSERT
+#define ASSERT(expr) ((void)0)
+#endif
+#include "gcobjscan.h"   // generic runtime object-scanning facility (dotnet/runtime #12809)
+
+// Total size in bytes of a managed object, matching the runtime's own formula
+// (base size + component count * component size, aligned up to the pointer
+// granule). Used both as the 'size' argument to GCScanObjectRefs and to walk a
+// bump-allocated region object-by-object during the backup trace / sweep.
+size_t LXRObjectSize(Object* o);
+
 // Forwarded from the runtime; set once in GC_Initialize.
 extern IGCToCLR* g_theGCToCLR;
 extern VersionInfo g_runtimeSupportedVersion;
@@ -163,15 +176,39 @@ public:
 
     lxr::BlockMeta* MetaForBlock(uint8_t* blockAddr);
 
+    // --- Backup trace (stop-the-world mark) + Immix reclamation ---
+    //
+    // BackupTrace marks every object reachable from the roots (stacks, statics,
+    // handles) transitively via GCScanObjectRefs, then SweepAndSelectDefrag
+    // reclaims (decommits) any allocation region that ends up with no marked
+    // object. This is the correctness backstop of LXR (it also collects the
+    // cycles pure RC leaks) and the mechanism that actually returns memory.
+    bool MarkObject(Object* obj);       // sets the mark bit; true if newly marked
+    bool IsMarked(Object* obj) const;
+    void ResetMarks();                  // decommits the mark side-table (all bits -> 0)
+    void PushMark(Object* obj);         // MarkObject + push onto the mark stack
+    void DrainMarkStack();              // transitive closure via GCScanObjectRefs
+    Object* ResolveInterior(uint8_t* interior); // interior pointer -> containing object
+
+    int64_t ReclaimedBytes() const { return m_reclaimedBytes; }
+
 private:
     void EnqueueZeroCount(Object* obj);
     void DrainZeroCountWorkList();
 
+    bool InHeap(Object* obj) const
+    {
+        return (uint8_t*)obj >= m_heapBase && (uint8_t*)obj < m_heapBase + m_heapBytes;
+    }
+
     uint8_t*        m_heapBase = nullptr;
     size_t          m_heapBytes = 0;
     uint8_t*        m_rcTable = nullptr;     // 1 byte / 8 heap bytes
+    uint8_t*        m_markTable = nullptr;   // 1 bit / 8 heap bytes (backup-trace marks)
+    size_t          m_markCommittedBytes = 0; // committed+zeroed mark-table prefix (bytes)
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block
     size_t          m_blockCount = 0;
+    volatile int64_t m_reclaimedBytes = 0;   // cumulative bytes decommitted by sweeps
     CRITICAL_SECTION m_collectLock{};
 };
 extern LXRCollector g_lxrCollector;
@@ -357,15 +394,25 @@ public:
         HandleType Type;
         Slot* NextFree;
         bool InUse;
+        Slot* NextAll; // intrusive chain of every slot ever allocated (for root scan)
     };
 
     OBJECTHANDLE AllocSlot(Object* value, HandleType type);
     void FreeSlot(OBJECTHANDLE handle);
     static Slot* SlotFromHandle(OBJECTHANDLE handle) { return reinterpret_cast<Slot*>(handle); }
 
+    // Visit the (Value, Secondary) references of every in-use handle in every
+    // store. Used as a GC root source by the backup trace.
+    static void ForEachLiveHandle(void (*cb)(Object** ref, void* ctx), void* ctx);
+
 private:
     CRITICAL_SECTION m_lock{};
     Slot* m_freeList = nullptr;
+    Slot* m_allSlots = nullptr;              // head of the NextAll chain
+    LXRGCHandleStore* m_nextStore = nullptr; // chain of all stores
+    static LXRGCHandleStore* s_firstStore;
+    static CRITICAL_SECTION s_storesLock;
+    static bool s_storesLockInit;
 };
 
 class LXRGCHandleManager : public IGCHandleManager

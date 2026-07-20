@@ -11,14 +11,51 @@
 //
 #include "LXRGC.h"
 
+LXRGCHandleStore* LXRGCHandleStore::s_firstStore = nullptr;
+CRITICAL_SECTION LXRGCHandleStore::s_storesLock;
+bool LXRGCHandleStore::s_storesLockInit = false;
+
 LXRGCHandleStore::LXRGCHandleStore()
 {
     InitializeCriticalSection(&m_lock);
+
+    // Register this store so the backup trace can enumerate its handles.
+    if (!s_storesLockInit)
+    {
+        InitializeCriticalSection(&s_storesLock);
+        s_storesLockInit = true;
+    }
+    EnterCriticalSection(&s_storesLock);
+    m_nextStore = s_firstStore;
+    s_firstStore = this;
+    LeaveCriticalSection(&s_storesLock);
 }
 
 LXRGCHandleStore::~LXRGCHandleStore()
 {
     DeleteCriticalSection(&m_lock);
+}
+
+void LXRGCHandleStore::ForEachLiveHandle(void (*cb)(Object** ref, void* ctx), void* ctx)
+{
+    if (!s_storesLockInit)
+        return;
+    EnterCriticalSection(&s_storesLock);
+    for (LXRGCHandleStore* store = s_firstStore; store != nullptr; store = store->m_nextStore)
+    {
+        EnterCriticalSection(&store->m_lock);
+        for (Slot* slot = store->m_allSlots; slot != nullptr; slot = slot->NextAll)
+        {
+            if (!slot->InUse)
+                continue;
+            if (slot->Value != nullptr)
+                cb(&slot->Value, ctx);
+            if (slot->Secondary != nullptr)
+                cb(&slot->Secondary, ctx);
+        }
+        LeaveCriticalSection(&store->m_lock);
+    }
+    LeaveCriticalSection(&s_storesLock);
 }
 
 void LXRGCHandleStore::Uproot() { }
@@ -41,6 +78,12 @@ OBJECTHANDLE LXRGCHandleStore::AllocSlot(Object* value, HandleType type)
     else
     {
         slot = new (nothrow) Slot();
+        if (slot != nullptr)
+        {
+            // Link into the never-shrinking all-slots chain for root scanning.
+            slot->NextAll = m_allSlots;
+            m_allSlots = slot;
+        }
     }
 
     LeaveCriticalSection(&m_lock);
