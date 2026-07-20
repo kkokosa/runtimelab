@@ -128,6 +128,9 @@ struct LXRCounters
     volatile int64_t RCDecrements;
     volatile int64_t ModifiedBufferEntries; // field-log entries observed
     volatile int64_t BackupTraces;          // cycle-collection passes run
+    volatile int64_t Collections;           // total STW collections performed
+    volatile int64_t TotalPauseMicros;      // cumulative STW pause time (us)
+    volatile int64_t LastCollectCommitted;  // committed-in-use at last GC (bytes)
 };
 extern LXRCounters g_lxrCounters;
 

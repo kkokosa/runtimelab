@@ -95,6 +95,14 @@ static uint32_t g_pageSize = 4096;
 // GC.GetTotalMemory() visibly drops when LXR reclaims.
 static volatile int64_t g_committedInUse = 0;
 
+// Allocation-triggered collection: run a STW LXR cycle once committed-in-use has
+// grown by this many bytes since the last collection (0 disables; overridable via
+// LXR_GC_TRIGGER_MB). This is what makes LXR behave like a real reclaiming GC
+// under load instead of only reclaiming on an explicit GC.Collect().
+static int64_t RunLXRCollection(int generation);
+static volatile int64_t g_gcTriggerBytes = -1; // -1 = uninitialized; resolved lazily
+static volatile LONG g_inCollection = 0;       // reentrancy guard for RunLXRCollection
+
 // ===========================================================================
 //   Parseable allocation-region registry (enables sweep + interior pointers)
 // ===========================================================================
@@ -736,6 +744,24 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
 
     ThreadHeapState& th = t_threadHeap;
 
+    // Allocation-triggered collection policy: once committed-in-use has grown by
+    // the configured threshold since the last cycle, run a full STW LXR
+    // collection before servicing this allocation. This is what turns LXR into a
+    // real reclaiming GC under sustained load (the built-in GC triggers on its
+    // own budget heuristics; a standalone GC must decide for itself).
+    if (g_gcTriggerBytes < 0)
+    {
+        const char* e = getenv("LXR_GC_TRIGGER_MB");
+        int64_t mb = e ? _atoi64(e) : 64; // default: collect every +64 MiB
+        g_gcTriggerBytes = mb * (int64_t)1024 * 1024;
+    }
+    if (g_theGCToCLR != nullptr && g_gcTriggerBytes > 0 && g_inCollection == 0)
+    {
+        int64_t grown = g_committedInUse - g_lxrCounters.LastCollectCommitted;
+        if (grown >= g_gcTriggerBytes)
+            RunLXRCollection(-1);
+    }
+
     // Retire the context chunk this thread was filling: its high-water mark is
     // the exhausted context's alloc_ptr. This makes [Start, UsedEnd) a
     // parseable run of complete objects for the trace/sweep.
@@ -897,7 +923,12 @@ int LXRGCHeap::WaitForFullGCApproach(int millisecondsTimeout) { return wait_full
 int LXRGCHeap::WaitForFullGCComplete(int millisecondsTimeout) { return wait_full_gc_na; }
 
 unsigned LXRGCHeap::WhichGeneration(Object* obj) { return 0; }
-int LXRGCHeap::CollectionCount(int generation, int get_bgc_fgc_coutn) { return 0; }
+int LXRGCHeap::CollectionCount(int generation, int get_bgc_fgc_coutn)
+{
+    // LXR runs unified full-heap STW cycles; report the same count for every
+    // requested generation so runtime GC counters reflect real collections.
+    return (int)g_lxrCounters.Collections;
+}
 int LXRGCHeap::StartNoGCRegion(uint64_t totalSize, bool lohSizeKnown, uint64_t lohSize, bool disallowFullBlockingGC) { return start_no_gc_success; }
 int LXRGCHeap::EndNoGCRegion() { return end_no_gc_success; }
 
@@ -908,21 +939,22 @@ size_t LXRGCHeap::GetTotalBytesInUse()
 }
 uint64_t LXRGCHeap::GetTotalAllocatedBytes() { return (uint64_t)g_lxrCounters.TotalAllocatedBytes; }
 
-HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
+// Runs one LXR collection cycle: replay coalescing-RC modified buffers, then
+// (for a full collection) a stop-the-world backup trace + Immix sweep that
+// actually reclaims memory. Reentrancy-guarded so an allocation-triggered
+// collection can never re-enter (the collection path itself must not recurse
+// into another collect). Returns bytes reclaimed this cycle.
+static int64_t RunLXRCollection(int generation)
 {
-    InterlockedIncrement64(&g_lxrCounters.InducedCollectRequests);
-    // An explicit GC.Collect() runs one LXR cycle: replay the coalescing-RC
-    // modified buffers, then (for a full collection) a stop-the-world backup
-    // trace + Immix sweep that actually reclaims memory. The world is suspended
-    // for the whole cycle so root scanning and the linear heap sweep observe a
-    // quiescent, parseable heap.
-    bool fullGC = (generation < 0 || generation >= (int)GetMaxGeneration());
+    if (InterlockedCompareExchange(&g_inCollection, 1, 0) != 0)
+        return 0; // a collection is already in progress on another/this thread
+
+    bool fullGC = (generation < 0 || generation >= 2);
     int64_t reclaimedBefore = g_lxrCollector.ReclaimedBytes();
 
-    fprintf(stderr,
-            "LXRGC: GarbageCollect(gen=%d) captured field-log entries this epoch = %lld\n",
-            generation,
-            (long long)g_lxrCounters.ModifiedBufferEntries);
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
 
     bool suspended = false;
     if (g_theGCToCLR != nullptr)
@@ -958,16 +990,31 @@ HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
 
     if (suspended)
         g_theGCToCLR->RestartEE(true);
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted\n"); fflush(stderr); }
+    QueryPerformanceCounter(&t1);
+    int64_t pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+    InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
+    InterlockedIncrement64(&g_lxrCounters.Collections);
+    g_lxrCounters.LastCollectCommitted = g_committedInUse;
+    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (pause=%lldus)\n", (long long)pauseMicros); fflush(stderr); }
 
     int64_t reclaimedNow = g_lxrCollector.ReclaimedBytes();
+    InterlockedExchange(&g_inCollection, 0);
+    return reclaimedNow - reclaimedBefore;
+}
+
+HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
+{
+    InterlockedIncrement64(&g_lxrCounters.InducedCollectRequests);
+    int64_t reclaimed = RunLXRCollection(generation);
     fprintf(stderr,
-            "LXRGC: after cycle -> RC inc=%lld dec=%lld, backupTraces=%lld, reclaimed this GC=%lld bytes (total reclaimed=%lld)\n",
+            "LXRGC: GC(gen=%d) -> RC inc=%lld dec=%lld, backupTraces=%lld, collections=%lld, reclaimed this GC=%lld bytes (total=%lld)\n",
+            generation,
             (long long)g_lxrCounters.RCIncrements,
             (long long)g_lxrCounters.RCDecrements,
             (long long)g_lxrCounters.BackupTraces,
-            (long long)(reclaimedNow - reclaimedBefore),
-            (long long)reclaimedNow);
+            (long long)g_lxrCounters.Collections,
+            (long long)reclaimed,
+            (long long)g_lxrCollector.ReclaimedBytes());
     fflush(stderr);
     return S_OK;
 }
