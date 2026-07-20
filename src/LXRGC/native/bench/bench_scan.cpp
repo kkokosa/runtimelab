@@ -21,7 +21,7 @@ struct Desc {
     uint32_t      numSeries;
 };
 
-// ---- variant A/C: inlined template visitor (macro-equivalent codegen) --------
+// ---- variant A: inlined template visitor (near-macro codegen, generic) -------
 template <typename TVisit>
 static inline void ScanTemplate(uint8_t* obj, const Desc* d, TVisit visit)
 {
@@ -36,6 +36,25 @@ static inline void ScanTemplate(uint8_t* obj, const Desc* d, TVisit visit)
         }
     }
 }
+
+// ---- variant C: hand-written MACRO, textual per-field body (go_through_object)
+// This is the mechanism the built-in GC uses: the loop is a macro and the
+// per-field action {body} is pasted in textually at the call site, so there is
+// no call and the body inlines by construction. This is the baseline the inline
+// template is claimed to match.
+#define SCAN_MACRO(obj, d, body)                                             \
+    do {                                                                     \
+        for (uint32_t s_ = 0; s_ < (d)->numSeries; s_++)                     \
+        {                                                                    \
+            uint8_t** p = (uint8_t**)((obj) + (d)->series[s_].offset);       \
+            uint8_t** end = p + (d)->series[s_].count;                       \
+            while (p < end)                                                  \
+            {                                                                \
+                { body }                                                     \
+                p++;                                                         \
+            }                                                                \
+        }                                                                    \
+    } while (0)
 
 // ---- variant B: per-field function-pointer callback (the #12809 API) --------
 typedef void (*RefFn)(uint8_t** ref, void* ctx);
@@ -81,6 +100,21 @@ int main()
         slots[i] = (uint8_t*)(uintptr_t)(i * 8 + 8);
 
     const uint64_t totalFields = (uint64_t)kObjs * kFieldsPerObj * kReps;
+
+    // ---- Macro (textual per-field body, the go_through_object mechanism) ----
+    {
+        uint64_t acc = 0;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int r = 0; r < kReps; r++)
+            for (uint32_t o = 0; o < kObjs; o++)
+                SCAN_MACRO(heap + (size_t)o * objBytes, &desc,
+                           acc += (uint64_t)(uintptr_t)(*p););
+        auto t1 = std::chrono::high_resolution_clock::now();
+        g_sink += acc;
+        double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        printf("macro (go_through)   : %.3f ns/field  (acc=%llu)\n",
+               ns / totalFields, (unsigned long long)acc);
+    }
 
     // ---- Template (inlined lambda) ----
     {

@@ -228,19 +228,25 @@ addition, not an LXR-specific one:
 Object scanning is the hottest loop in RC decrements and the backup trace. A
 per-field **function-pointer** callback (the literal #12809 API shape) defeats
 inlining and regresses badly; the built-in GC uses a *macro* precisely so the
-per-field body inlines. The header-only **template** recovers macro-level codegen
-(the visitor inlines at every slot) while staying generic and type-safe.
+per-field body inlines. The header-only **template** recovers near-macro-level
+codegen (the visitor inlines at every slot) while staying generic and type-safe.
 
 Measured (`native/bench/bench_scan.cpp`, MSVC `/O2`, x64), ns per reference field
-over a 200k-object synthetic graph, isolating the inlining effect:
+over a 200k-object synthetic graph, isolating the inlining effect (all three
+variants share the identical descriptor-walk control flow):
 
 | Variant | ns/field |
 |---|---|
-| inline template (`GCScanObjectRefs<TVisit>`) | **~0.42–0.48** |
-| opaque function pointer (literal #12809 API) | ~2.07 |
+| hand-written **macro** (`go_through_object` mechanism) | **~0.29** |
+| inline **template** (`GCScanObjectRefs<TVisit>`) | ~0.41 |
+| opaque **function pointer** (literal #12809 API) | ~2.04 |
 
-≈ **4.5× faster** — confirming the template matches the macro and the naive
-function-pointer API would be the wrong default. LXRGC therefore scans via the
+The template is within ~1.4× of the raw macro (the small residual is the
+by-reference visitor spilling its accumulator, which the plain-local macro keeps
+in a register) and ≈ **5× faster** than the function pointer. So the generic,
+type-safe template lands right next to the macro and nowhere near the naive
+function-pointer API — confirming it is the right default and that #12809's
+literal callback shape would be the wrong one. LXRGC therefore scans via the
 template everywhere (`ProcessModifiedBuffers`/recursive free, `BackupTrace`,
 `ResolveInterior`).
 

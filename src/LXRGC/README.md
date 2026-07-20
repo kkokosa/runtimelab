@@ -59,9 +59,10 @@ src/LXRGC/
   runtime fork branch `feature/pluggable-write-barrier` (FEASIBILITY.md §5).
 - **Object reference scanning** — a second generic, GC-agnostic runtime header
   `src/coreclr/gc/gcobjscan.h` (the long-missing dotnet/runtime **#12809**),
-  offering an inline template `GCScanObjectRefs<TVisit>` that matches the
-  built-in `go_through_object` **macro** speed (≈0.42 ns/field vs ≈2.07 ns/field
-  for the naive function-pointer API — ~4.5× faster; see `native/bench/`). LXRGC
+  offering an inline template `GCScanObjectRefs<TVisit>` that lands near the
+  built-in `go_through_object` **macro** speed (macro ≈0.29 ns/field, template
+  ≈0.41 ns/field, opaque function-pointer API ≈2.04 ns/field — template ~1.4× of
+  the macro but ~5× faster than the function pointer; see `native/bench/`). LXRGC
   scans every object through it (FEASIBILITY.md §6).
 
 ## Full reclamation — now working (STW)
