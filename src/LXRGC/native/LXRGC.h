@@ -140,6 +140,12 @@ struct LXRCounters
     volatile int64_t SurvivalPctEwma;       // EWMA of survivor % across traces (0..100)
     volatile int64_t RCPausePauseMicros;    // cumulative light-pause time (us)
     volatile int64_t TracePausePauseMicros; // cumulative full-pause time (us)
+
+    // P2 barrier extensions: SATB deletion barrier + remembered sets.
+    volatile int64_t SatbEntries;           // old referents logged to SATB buffers
+    volatile int64_t SatbMarks;             // SATB entries consumed (marked) by a trace
+    volatile int64_t RemsetEntries;         // inter-block pointer slots logged
+    volatile int64_t RemsetFixups;          // remset slots rewritten during evacuation
 };
 extern LXRCounters g_lxrCounters;
 
@@ -164,18 +170,41 @@ public:
     // --- Coalescing / field-logging write barrier support ---
     //
     // LogModifiedField is the LXR write-barrier slow path. It MUST be called
-    // by mutator reference-field writes, BEFORE the slot is overwritten, with
-    // the value currently in the slot (the "old" value). It records the pair
-    // into the calling thread's modified buffer for replay at GC time.
+    // by mutator reference-field writes, with the OLD value the slot held (for
+    // coalescing RC + the SATB deletion barrier) and the NEW value being stored
+    // (for the remembered set). It records into the calling thread's buffers for
+    // replay/consumption at GC time.
     //
     // *** Under the CoreCLR standalone-GC ABI there is no way to make the
     //     runtime call this on ordinary field writes. See FEASIBILITY.md. ***
-    void LogModifiedField(Object** slot, Object* oldValue);
+    void LogModifiedField(Object** slot, Object* oldValue, Object* newValue);
 
     // Replays every mutator's modified buffer: increment new referents,
     // decrement old referents, then process the resulting zero-count work
     // list (recursive decrements). This is coalescing RC.
     void ProcessModifiedBuffers();
+
+    // --- SATB (snapshot-at-the-beginning) deletion barrier (P2) ---
+    //
+    // While a (future concurrent, P4) trace window is open, the barrier logs the
+    // overwritten referent so a Yuasa snapshot cannot miss an object unlinked
+    // mid-trace. SetSatbActive opens/closes that window; DrainSatbBuffers marks
+    // every logged referent (over-retention within one cycle is always safe) and
+    // empties the buffers.
+    void SetSatbActive(bool active);
+    bool IsSatbActive() const;
+    void DrainSatbBuffers();
+
+    // --- Remembered sets: inter-block pointer slots (P2), for evacuation (P3) ---
+    //
+    // While enabled, the barrier records slots that come to hold a pointer into a
+    // different Immix block, so evacuation can find and rewrite references into a
+    // moved block without a full-heap scan. EnumerateRemsetSlots visits every
+    // recorded slot (evacuation re-reads each to filter stale/duplicate entries).
+    void SetRemsetActive(bool active);
+    bool IsRemsetActive() const;
+    void EnumerateRemsetSlots(void (*visit)(Object** slot, void* ctx), void* ctx);
+    void ResetRemsets();
 
     // Periodic mark-sweep over the whole heap to reclaim dead cycles that RC
     // leaks. Uses IGCToCLR root/stack enumeration (which the ABI *does*

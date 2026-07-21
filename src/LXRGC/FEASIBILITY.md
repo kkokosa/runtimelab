@@ -339,6 +339,30 @@ under the console workload, cheap RC pauses (~0.1–1 ms) interleave with occasi
 traces (paced by the predictor) and the app completes cleanly. This is entirely
 GC-side.
 
+### P2 — SATB deletion buffers + remembered sets (done; no runtime change)
+
+The single field-logging barrier now feeds three jobs (as in the paper) instead of
+one. Beyond the coalescing-RC modified buffer it also populates:
+
+- **SATB deletion buffers** — while a trace window is open, the overwritten
+  referent (the barrier's *old* value) is logged into per-thread snapshot buffers
+  and marked by the trace (`DrainSatbBuffers`), so a concurrent marker (P4) cannot
+  miss an object a mutator unlinks mid-trace (Yuasa snapshot-at-the-beginning).
+- **Remembered sets** — slots that come to hold a pointer into a *different* Immix
+  block (the barrier's *new* value in a different block than the slot) are recorded
+  per-thread, giving evacuation (P3) the reference sources to fix up when a block
+  is moved, without a full-heap scan.
+
+Both extensions are gated (off by default → zero added barrier cost) and driven by
+their consumers: SATB by the concurrent trace (P4), remsets by evacuation (P3).
+Env knobs `LXR_SATB=1` / `LXR_REMSET=1` exercise them under the STW path today.
+New counters (`SatbEntries`, `SatbMarks`, `RemsetEntries`, `RemsetFixups`) are on
+`LXRCounters`. Verified: with both enabled under the console workload the barrier
+logs SATB referents that the trace fully consumes (`satbMarks == satbEntries`) and
+records thousands of inter-block remset slots, with reclamation and clean exit
+preserved. Entirely GC-side (the existing pluggable-barrier callback already
+surfaces both old and new values).
+
 ---
 
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,

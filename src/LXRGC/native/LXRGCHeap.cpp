@@ -76,6 +76,42 @@ static thread_local ModifiedBuffer* t_modifiedBuffer = nullptr;
 static ModifiedBuffer* g_registeredBuffers = nullptr;
 static CRITICAL_SECTION g_buffersLock;
 
+// --- SATB (snapshot-at-the-beginning) deletion buffers (P2) ----------------
+// While a trace window is open (g_satbActive), the field-logging barrier
+// appends every overwritten referent here. A trace consumes them via
+// DrainSatbBuffers so a concurrent marker (P4) cannot miss an object that a
+// mutator unlinks mid-trace. Persist across RC epochs (unlike the RC modified
+// buffer) until a trace drains them.
+struct SatbBuffer
+{
+    static const size_t kCapacity = 4096;
+    Object* Entries[kCapacity];
+    size_t Count = 0;
+    SatbBuffer* NextRegistered = nullptr;
+};
+static thread_local SatbBuffer* t_satbBuffer = nullptr;
+static SatbBuffer* g_registeredSatbBuffers = nullptr;
+static CRITICAL_SECTION g_satbLock;
+static volatile LONG g_satbActive = 0; // logging gate: open while a trace window is live
+
+// --- Remembered sets: inter-block pointer slots (P2) -----------------------
+// While enabled (g_remsetActive), the barrier records slots that come to hold a
+// pointer into a different Immix block than the slot's own block. Evacuation
+// (P3) walks these to fix up references into a moved block. Entries persist
+// (a remembered set must retain a slot until its target region is collected);
+// stale/duplicate entries are filtered at evacuation by re-reading the slot.
+struct RemsetBuffer
+{
+    static const size_t kCapacity = 4096;
+    Object** Entries[kCapacity];
+    size_t Count = 0;
+    RemsetBuffer* NextRegistered = nullptr;
+};
+static thread_local RemsetBuffer* t_remsetBuffer = nullptr;
+static RemsetBuffer* g_registeredRemsetBuffers = nullptr;
+static CRITICAL_SECTION g_remsetLock;
+static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation is enabled
+
 // A tiny zero-count work list used by recursive decrements. In a full LXR
 // this is a bounded work packet processed incrementally; here it is a simple
 // growable stack (the engine is dormant, so simplicity beats scalability).
@@ -283,7 +319,15 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
 
     InitializeCriticalSection(&m_collectLock);
     InitializeCriticalSection(&g_buffersLock);
+    InitializeCriticalSection(&g_satbLock);
+    InitializeCriticalSection(&g_remsetLock);
     InitializeCriticalSection(&g_chunkLock);
+
+    // P2 barrier-extension gates. Off by default (zero barrier overhead); SATB is
+    // driven by the concurrent trace (P4) and remsets by evacuation (P3). Env
+    // knobs let the STW path exercise them now: LXR_SATB=1, LXR_REMSET=1.
+    if (getenv("LXR_SATB") != nullptr)   g_satbActive = 1;
+    if (getenv("LXR_REMSET") != nullptr) g_remsetActive = 1;
     return true;
 }
 
@@ -329,8 +373,9 @@ bool LXRCollector::RCDecrement(Object* obj)
 // LXR write-barrier slow path. Reached from the runtime's generic Callback
 // write barrier (WriteBarrierKind::Callback) on every in-heap reference-field
 // store, carrying the OLD value the runtime just overwrote.
-void LXRCollector::LogModifiedField(Object** slot, Object* oldValue)
+void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* newValue)
 {
+    // (1) Coalescing-RC modified buffer: record (slot, oldValue) on mutation.
     ModifiedBuffer* buf = t_modifiedBuffer;
     if (buf == nullptr)
     {
@@ -352,6 +397,105 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue)
     }
     // A production LXR flushes a full buffer into a shared queue; omitted here.
     // Once full we simply stop recording further entries this epoch.
+
+    // (2) SATB deletion barrier (Yuasa): while a trace window is open, retain the
+    //     overwritten referent so a concurrent marker (P4) cannot miss an object
+    //     unlinked mid-trace. Over-retention for one cycle is always safe.
+    if (g_satbActive && oldValue != nullptr && InHeap(oldValue))
+    {
+        SatbBuffer* sb = t_satbBuffer;
+        if (sb == nullptr)
+        {
+            sb = new (nothrow) SatbBuffer();
+            if (sb != nullptr)
+            {
+                t_satbBuffer = sb;
+                EnterCriticalSection(&g_satbLock);
+                sb->NextRegistered = g_registeredSatbBuffers;
+                g_registeredSatbBuffers = sb;
+                LeaveCriticalSection(&g_satbLock);
+            }
+        }
+        if (sb != nullptr && sb->Count < SatbBuffer::kCapacity)
+        {
+            sb->Entries[sb->Count++] = oldValue;
+            InterlockedIncrement64(&g_lxrCounters.SatbEntries);
+        }
+    }
+
+    // (3) Remembered set: record slots that now hold an inter-block pointer, so
+    //     evacuation (P3) can locate and rewrite references into a moved block.
+    if (g_remsetActive && newValue != nullptr && InHeap(newValue) && InHeap((Object*)slot))
+    {
+        uintptr_t sblk = (uintptr_t)slot     & ~(lxr::kBlockSize - 1);
+        uintptr_t tblk = (uintptr_t)newValue & ~(lxr::kBlockSize - 1);
+        if (sblk != tblk)
+        {
+            RemsetBuffer* rb = t_remsetBuffer;
+            if (rb == nullptr)
+            {
+                rb = new (nothrow) RemsetBuffer();
+                if (rb != nullptr)
+                {
+                    t_remsetBuffer = rb;
+                    EnterCriticalSection(&g_remsetLock);
+                    rb->NextRegistered = g_registeredRemsetBuffers;
+                    g_registeredRemsetBuffers = rb;
+                    LeaveCriticalSection(&g_remsetLock);
+                }
+            }
+            if (rb != nullptr && rb->Count < RemsetBuffer::kCapacity)
+            {
+                rb->Entries[rb->Count++] = slot;
+                InterlockedIncrement64(&g_lxrCounters.RemsetEntries);
+            }
+        }
+    }
+}
+
+void LXRCollector::SetSatbActive(bool active) { InterlockedExchange(&g_satbActive, active ? 1 : 0); }
+bool LXRCollector::IsSatbActive() const { return g_satbActive != 0; }
+
+// Mark every SATB-logged referent (over-retention within a cycle is safe) and
+// empty the buffers. Called under STW today; drivable from a concurrent marker
+// in P4. Assumes the mark stack is being (or will be) drained by the caller.
+void LXRCollector::DrainSatbBuffers()
+{
+    EnterCriticalSection(&g_satbLock);
+    for (SatbBuffer* sb = g_registeredSatbBuffers; sb != nullptr; sb = sb->NextRegistered)
+    {
+        for (size_t i = 0; i < sb->Count; i++)
+        {
+            Object* o = sb->Entries[i];
+            if (o != nullptr)
+            {
+                PushMark(o);
+                InterlockedIncrement64(&g_lxrCounters.SatbMarks);
+            }
+        }
+        sb->Count = 0;
+    }
+    LeaveCriticalSection(&g_satbLock);
+}
+
+void LXRCollector::SetRemsetActive(bool active) { InterlockedExchange(&g_remsetActive, active ? 1 : 0); }
+bool LXRCollector::IsRemsetActive() const { return g_remsetActive != 0; }
+
+void LXRCollector::EnumerateRemsetSlots(void (*visit)(Object** slot, void* ctx), void* ctx)
+{
+    EnterCriticalSection(&g_remsetLock);
+    for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+        for (size_t i = 0; i < rb->Count; i++)
+            visit(rb->Entries[i], ctx);
+    LeaveCriticalSection(&g_remsetLock);
+}
+
+void LXRCollector::ResetRemsets()
+{
+    EnterCriticalSection(&g_remsetLock);
+    for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+        rb->Count = 0;
+    LeaveCriticalSection(&g_remsetLock);
 }
 
 void LXRCollector::EnqueueZeroCount(Object* obj)
@@ -592,6 +736,13 @@ void LXRCollector::BackupTrace()
     const int maxgen = 2;
     g_theGCToCLR->GcScanRoots(&LXRPromoteRoot, maxgen, maxgen, &sc);
 
+    // 2b. SATB deletion set: while a trace window is open, referents unlinked by
+    //     mutators since the snapshot must be kept live for this trace (Yuasa).
+    //     Under STW this is a no-op unless LXR_SATB exercises it; P4 drives it
+    //     from a concurrent marker.
+    if (g_satbActive)
+        DrainSatbBuffers();
+
     // 3. Transitive closure over reachable objects.
     DrainMarkStack();
 }
@@ -665,9 +816,9 @@ LXRGCHeap* LXRGCHeap::CreateAndInitialize()
 // GC ABI could not previously surface (see FEASIBILITY.md). Runs in cooperative
 // mode from the barrier, so it stays leaf-like: it only appends to the calling
 // thread's modified buffer.
-static void LXRWriteBarrierCallback(Object** slot, Object* /*newValue*/, Object* oldValue)
+static void LXRWriteBarrierCallback(Object** slot, Object* newValue, Object* oldValue)
 {
-    g_lxrCollector.LogModifiedField(slot, oldValue);
+    g_lxrCollector.LogModifiedField(slot, oldValue, newValue);
 }
 
 HRESULT LXRGCHeap::Initialize()
@@ -1131,9 +1282,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     if (phase == LXRPhase::TracePause)
         InterlockedIncrement64(&g_lxrCounters.Collections);
 
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%%)\n",
+    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%% satbEntries=%lld satbMarks=%lld remsetEntries=%lld)\n",
                            phase == LXRPhase::TracePause ? "trace" : "rc",
-                           (long long)pauseMicros, (long long)g_lxrCounters.SurvivalPctEwma); fflush(stderr); }
+                           (long long)pauseMicros, (long long)g_lxrCounters.SurvivalPctEwma,
+                           (long long)g_lxrCounters.SatbEntries, (long long)g_lxrCounters.SatbMarks,
+                           (long long)g_lxrCounters.RemsetEntries); fflush(stderr); }
 
     int64_t reclaimedNow = g_lxrCollector.ReclaimedBytes();
     InterlockedExchange(&g_inCollection, 0);
