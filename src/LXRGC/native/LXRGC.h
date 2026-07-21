@@ -276,6 +276,7 @@ public:
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs
     void ParallelDrainMarkStack(int workers); // P5: parallel transitive closure
+    void DrainClosure();                // parallel or serial closure per LXR_GC_THREADS
     Object* ResolveInterior(uint8_t* interior); // interior pointer -> containing object
 
     int64_t ReclaimedBytes() const { return m_reclaimedBytes; }

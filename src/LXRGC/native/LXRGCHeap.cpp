@@ -716,6 +716,17 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
         t.join();
 }
 
+// Drain the current grey set (already in g_markStack) using the parallel closure
+// when LXR_GC_THREADS>1, else the serial one. Shared by the STW backup trace and
+// the concurrent trace's drain/finish so all three compose with parallel marking.
+void LXRCollector::DrainClosure()
+{
+    if (g_gcThreads > 1)
+        ParallelDrainMarkStack(g_gcThreads);
+    else
+        DrainMarkStack();
+}
+
 // Resolve an interior pointer to the object that contains it by parsing the
 // enclosing allocation region. Returns nullptr if it cannot be resolved (the
 // caller then keeps the region conservatively live).
@@ -841,10 +852,7 @@ void LXRCollector::BackupTrace()
         DrainSatbBuffers();
 
     // 3. Transitive closure over reachable objects.
-    if (g_gcThreads > 1)
-        ParallelDrainMarkStack(g_gcThreads);
-    else
-        DrainMarkStack();
+    DrainClosure();
 }
 
 // --- Concurrent SATB backup trace (P4) -------------------------------------
@@ -911,9 +919,9 @@ void LXRCollector::ConcurrentTraceDrain()
     for (int round = 0; round < kMaxRounds; round++)
     {
         size_t before = g_lxrCounters.SatbMarks;
-        DrainMarkStack();       // scan everything currently grey
+        DrainClosure();         // scan everything currently grey (parallel if enabled)
         DrainSatbBuffers();     // pull in deletions logged since last pass
-        DrainMarkStack();       // scan those too
+        DrainClosure();         // scan those too
         bool moreSatb = (size_t)g_lxrCounters.SatbMarks != before;
         if (g_markTop == 0 && !moreSatb)
             break;              // quiescent (mutators may still trickle; finish mops up)
@@ -930,7 +938,7 @@ void LXRCollector::ConcurrentTraceFinish()
 {
     // Residual deletions logged between the last concurrent pass and the pause.
     DrainSatbBuffers();
-    DrainMarkStack();
+    DrainClosure();
 
     // Allocate-black: mark objects born during the window. Extend the mark table
     // to cover new allocations, then for each committed region mark every object
@@ -1731,14 +1739,20 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         int64_t drainMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent drain done (%lldus off-pause)\n", (long long)drainMicros); fflush(stderr); }
 
-        // --- Finish pause (STW): residual SATB, allocate-black, sweep ---
+        // --- Finish pause (STW): residual SATB, allocate-black, evac, sweep ---
         QueryPerformanceCounter(&a0);
         g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
         g_lxrCollector.ConcurrentTraceFinish();
-        // Evacuation is intentionally not run in the concurrent path this cycle:
-        // allocate-black objects are not scanned, so their fields could reference
-        // a moved object without being fixed up. Evacuation stays an STW-trace
-        // feature; the two are independently gated.
+        // Evacuation is safe here: ConcurrentTraceFinish has completed marking
+        // (including allocate-black), so Evacuate's fix-up pass forwards the
+        // fields of EVERY marked object (allocate-black included), and the finish
+        // pause pins all roots (covering references mutators cached during the
+        // window). Runs in the same STW pause, before the sweep.
+        if (g_evacActive)
+        {
+            g_lxrCollector.Evacuate();
+            if (verbose) { fprintf(stderr, "LXRGC: [stage] Evacuate (concurrent finish) done\n"); fflush(stderr); }
+        }
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
         g_theGCToCLR->RestartEE(true);

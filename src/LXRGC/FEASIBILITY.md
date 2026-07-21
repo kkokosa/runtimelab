@@ -429,12 +429,10 @@ single-writer append cursor (`Count`) and a collector-only drain cursor (`Draine
 so mutators log lock-free while the collector marks concurrently; recursive RC
 frees never run during the window (memory stays stable for the marker); and block
 reuse is suppressed for the window so allocate-black region snapshots stay valid.
-Evacuation (P3) is not combined with a concurrent trace in the same cycle (an
-allocate-black object's fields are not scanned, so they cannot be forwarded) — the
-two remain independently gated. New counters: `ConcurrentTraces`, `ConcAllocBlack`,
-`ConcSnapshotMicros`, `ConcFinishMicros`, `ConcDrainMicros`. Verified: repeated and
-extended (15 s) runs mark off-pause, retain hundreds of mid-trace objects via
-allocate-black, reclaim memory, and exit cleanly with no access violation.
+New counters: `ConcurrentTraces`, `ConcAllocBlack`, `ConcSnapshotMicros`,
+`ConcFinishMicros`, `ConcDrainMicros`. Verified: repeated and extended (15 s) runs
+mark off-pause, retain hundreds of mid-trace objects via allocate-black, reclaim
+memory, and exit cleanly with no access violation.
 
 This closes gap 1.
 
@@ -461,9 +459,16 @@ GC-internal refinement.)
 triggering (P1), a single barrier feeding RC + SATB + remembered sets (P2), STW
 copying evacuation (P3), a concurrent SATB backup trace (P4), and parallel marking
 (P5) — **with no further runtime change beyond the two generic facilities** (the
-pluggable write barrier and the object-scan header). The remaining work is depth
-and hardening (finer parallel work-stealing, concurrent+copying in one cycle,
-broader benchmark coverage), not new runtime dependencies.
+pluggable write barrier and the object-scan header). They also **compose into one
+unified collector**: with `LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1
+LXR_GC_THREADS=N` the backup trace marks off-pause with `N` parallel workers
+(`DrainClosure` routes the concurrent drain/finish and the STW trace through the
+same parallel/serial closure), and copying evacuation runs in the concurrent finish
+pause — safe because that pause has completed marking (allocate-black included, so
+`Evacuate`'s fix-up forwards every marked object's fields) and pins all roots
+(covering references mutators cached during the window). The remaining work is depth
+and hardening (finer parallel work-stealing, broader benchmark coverage), not new
+runtime dependencies.
 
 ---
 
