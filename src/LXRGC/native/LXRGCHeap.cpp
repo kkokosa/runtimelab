@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <thread>
 
 // GCScanObjectRefs' collectible-class branch calls this EE up-call. LXRGC does
 // not compile the standalone gcenv.ee inline forwarders, so provide the single
@@ -127,6 +128,7 @@ static volatile LONG g_traceWindowOpen  = 0;  // a concurrent trace window is li
 static std::vector<uint8_t*>* g_snapUsedEnd = nullptr; // per-region snapshot high-water
 static size_t   g_snapChunkCount = 0;
 static uint8_t* g_concWatermark  = nullptr;   // heap high-water at snapshot
+static int g_gcThreads = 1; // P5: parallel mark worker count (env LXR_GC_THREADS)
 
 // A tiny zero-count work list used by recursive decrements. In a full LXR
 // this is a bounded work packet processed incrementally; here it is a simple
@@ -354,6 +356,15 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // pauses + off-pause marking). The SATB window is opened per-trace, so
     // g_satbActive is NOT forced on here.
     if (getenv("LXR_CONCURRENT") != nullptr) g_concurrentEnabled = 1;
+    // P5: parallel mark worker count. Clamped to [1, 64]; 1 keeps the verified
+    // single-threaded closure.
+    if (const char* t = getenv("LXR_GC_THREADS"))
+    {
+        int n = atoi(t);
+        if (n < 1) n = 1;
+        if (n > 64) n = 64;
+        g_gcThreads = n;
+    }
     return true;
 }
 
@@ -601,12 +612,11 @@ bool LXRCollector::MarkObject(Object* obj)
     size_t byteIdx = granule >> 3;
     if (byteIdx >= m_markCommittedBytes)
         return false; // beyond the reset range (above heap high-water) -> nothing to mark
-    uint8_t* byte = &m_markTable[byteIdx];
-    uint8_t bit = (uint8_t)(1u << (granule & 7));
-    if (*byte & bit)
-        return false; // already marked
-    *byte |= bit;
-    return true;
+    char bit = (char)(1u << (granule & 7));
+    // Atomic set so parallel mark workers (P5) never lose a bit racing on the
+    // same byte; the returned previous value tells us if WE were the marker.
+    char prev = _InterlockedOr8((volatile char*)&m_markTable[byteIdx], bit);
+    return (prev & bit) == 0;
 }
 
 void LXRCollector::ResetMarks()
@@ -659,6 +669,51 @@ void LXRCollector::DrainMarkStack()
             PushMark(*ref);
         });
     }
+}
+
+// Parallel transitive closure (P5). The seed set already sits in g_markStack
+// (each entry marked by PushMark). Partition it round-robin across `workers`
+// threads; each drains its own local stack to completion. Correctness rests on
+// the atomic mark bit (MarkObject): an object is claimed by exactly one worker,
+// so no object is scanned twice and no shared mark stack / termination protocol
+// is needed. Runs inside the STW trace pause, where no managed code executes, so
+// transient worker threads may read object memory without runtime registration.
+void LXRCollector::ParallelDrainMarkStack(int workers)
+{
+    if (workers < 2 || g_markTop == 0)
+    {
+        DrainMarkStack();
+        return;
+    }
+
+    size_t n = g_markTop;
+    std::vector<std::vector<Object*>> slices((size_t)workers);
+    for (size_t i = 0; i < n; i++)
+        slices[i % (size_t)workers].push_back(g_markStack[i]);
+    g_markTop = 0; // consumed into the per-worker slices
+
+    auto run = [this](std::vector<Object*>* local)
+    {
+        while (!local->empty())
+        {
+            Object* o = local->back();
+            local->pop_back();
+            GCScanObjectRefs(o, LXRObjectSize(o), [this, local](Object** ref)
+            {
+                Object* c = *ref;
+                if (c != nullptr && MarkObject(c)) // atomic claim
+                    local->push_back(c);
+            });
+        }
+    };
+
+    std::vector<std::thread> ts;
+    ts.reserve((size_t)workers - 1);
+    for (int w = 1; w < workers; w++)
+        ts.emplace_back(run, &slices[(size_t)w]);
+    run(&slices[0]);
+    for (auto& t : ts)
+        t.join();
 }
 
 // Resolve an interior pointer to the object that contains it by parsing the
@@ -786,7 +841,10 @@ void LXRCollector::BackupTrace()
         DrainSatbBuffers();
 
     // 3. Transitive closure over reachable objects.
-    DrainMarkStack();
+    if (g_gcThreads > 1)
+        ParallelDrainMarkStack(g_gcThreads);
+    else
+        DrainMarkStack();
 }
 
 // --- Concurrent SATB backup trace (P4) -------------------------------------

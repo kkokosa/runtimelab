@@ -275,6 +275,7 @@ public:
     void ResetMarks();                  // decommits the mark side-table (all bits -> 0)
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs
+    void ParallelDrainMarkStack(int workers); // P5: parallel transitive closure
     Object* ResolveInterior(uint8_t* interior); // interior pointer -> containing object
 
     int64_t ReclaimedBytes() const { return m_reclaimedBytes; }
