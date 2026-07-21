@@ -464,12 +464,116 @@ pluggable write barrier and the object-scan header). They also **compose into on
 unified collector**: with `LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1
 LXR_GC_THREADS=N` the backup trace marks off-pause with `N` parallel workers
 (`DrainClosure` routes the concurrent drain/finish and the STW trace through the
-same parallel/serial closure), and copying evacuation runs in the concurrent finish
-pause — safe because that pause has completed marking (allocate-black included, so
-`Evacuate`'s fix-up forwards every marked object's fields) and pins all roots
-(covering references mutators cached during the window). The remaining work is depth
-and hardening (finer parallel work-stealing, broader benchmark coverage), not new
-runtime dependencies.
+same parallel/serial closure), while copying evacuation runs on a **dedicated
+periodic STW trace+evac cycle** interleaved with the concurrent-only marking
+cycles (every `kEvacEveryN`-th trace takes the full STW `BackupTrace` +
+`Evacuate` + sweep path). Keeping evacuation on its own complete-precise-trace
+STW pause — rather than in the concurrent finish — matches the paper (LXR "copies
+only during stop-the-world pauses") and guarantees `Evacuate`'s fix-up forwards
+every marked object's field against a fully-marked heap with all roots pinned.
+The remaining work is depth and hardening (finer parallel work-stealing, broader
+benchmark coverage), not new runtime dependencies.
+
+#### Resolved bug — null MethodTable in the linear heap parse (concurrent+evac)
+
+Under the full unified config, WebApi occasionally access-violated at `0x0`
+inside `ResolveInterior`/`LXRObjectSize` (fault-diag RVA resolved to
+`ResolveInterior+0xD7`). Root cause: a mutator suspended mid fast-path allocation
+has bumped its `alloc_ptr` but **not yet written the object's MethodTable**,
+leaving a zeroed tail granule (`MT == 0`) at the end of its owned region. The
+linear block-parse loops guarded on `if (sz == 0) break`, but the size is
+computed *inside* `LXRObjectSize`, which dereferenced the MT with no null check —
+so the AV happened before the guard could fire. **Fix:** `LXRObjectSize` now
+validates the MethodTable (`m == 0 || (m & 7) || m < 0x10000 ||
+m > 0x00007FFFFFFFFFFF → return 0`) and the three scan sites
+(`DrainZeroCountWorkList`, `DrainMarkStack`, `ParallelDrainMarkStack`) skip a
+zero-size object. On x64 TSO the zeroed granule is only ever the region tail, so
+stopping the parse there loses nothing.
+
+#### Resolved bug — SATB snapshot must never drop an overwritten value
+
+A rarer managed `AccessViolationException` (e.g. in `Utf8JsonWriter.Grow`, a
+*live-object-corrupted* signature) traced to `LogModifiedField` silently
+**dropping** the overwritten old value once a per-thread SATB buffer filled
+(`if (Count < kCapacity)`). Dropping a Yuasa snapshot-at-beginning entry breaks
+soundness: the concurrent marker never reaches that referent, so the following
+sweep/evac reclaims a still-reachable object. **Fix (partial):** the barrier now
+never drops — a large pre-sized per-thread buffer plus a global `g_satbOverflow`
+flag; on overflow the STW finish pause falls back to a full from-roots closure.
+Buffer registration onto the global registry is **lock-free** (a
+`RegisterSatbBuffer` CAS-prepend), because taking a lock in the write barrier —
+which runs in cooperative GC mode — can deadlock against `SuspendEE` (a mutator
+stalled on the lock never reaches a safepoint); an earlier lock-based version
+intermittently hung mid-run.
+
+> **NOTE (superseded — see "Soundness status under real webapi load" below).**
+> The SATB deletion barrier is *fundamentally incomplete* over the current
+> pluggable write barrier, so this fix does NOT make concurrent tracing sound.
+> An earlier claim here that "16 × 120 s full-config WebApi runs complete with no
+> AV and no hang" was **wrong** and has been removed.
+
+#### Soundness status under the real WebApi workload (evidence-based)
+
+Extensive stress testing (`samples/WebApi`, 120 s Kestrel+JSON load, many repeats,
+faults captured with `cdb` + `LXR_FAULT_DIAG`) shows the collector is **not sound
+under a realistic workload in any configuration**. Four distinct, independent
+defects, in increasing order of how fundamental they are:
+
+1. **Parallel mark is unstable (P5).** `LXR_GC_THREADS=16` hangs in `SuspendEE`
+   and occasionally mark-races to a crash — *even in the pure-STW path*
+   (`LXR_CONCURRENT=0`): 12-run stress saw 2 hangs + 1 crash. The GC thread spins
+   in `SuspendAllThreads` while every mutator is parked. Cause: `ParallelDrainMarkStack`
+   spawns raw `std::thread` workers that are **not registered with the runtime**;
+   creating/tearing them down every drain perturbs suspension. Serial mark
+   (`LXR_GC_THREADS=1`) does not hang. Fix needs a **persistent, runtime-registered
+   worker pool** (`IGCToCLR::CreateThread`), not per-drain `std::thread`.
+
+2. **Concurrent SATB tracing is unsound (P4).** `LXR_CONCURRENT=1` (serial) AVs as
+   a managed `AccessViolationException` in `Microsoft.AspNetCore.PinnedBlockMemoryPool.Rent`
+   — the sweep decommitted a still-reachable pooled pinned buffer. Root cause: the
+   fork's pluggable **write barrier only intercepts single-slot `JIT_WriteBarrier`**;
+   **bulk/byref ref stores** (`Array.Copy`, struct/span copies, `memmoveGCRefs`,
+   the `JIT_ByRefWriteBarrier` copy loop) **bypass the callback**, so their
+   overwritten old values are never logged → SATB misses deletions → a
+   snapshot-reachable object is left unmarked → swept. **Proof:** forcing the
+   concurrent finish pause to re-mark the whole graph from roots under STW
+   (`LXR_CONC_FINISH_FULLTRACE=1`, added this cycle) made 6/6 runs clean. A *truly*
+   concurrent SATB trace therefore requires **completing the write barrier to
+   capture old values on every ref-store form — a runtime-fork change** (the
+   `JIT_CheckedWriteBarrier` path is already covered because it delegates via
+   `jmp [JIT_WriteBarrier_Loc]`; only `JIT_ByRefWriteBarrier` / bulk copy helpers
+   remain).
+
+3. **STW evacuation has an interior-pointer fix-up gap (P3).** `LXR_EVAC=1` (serial,
+   STW) crashes ~1/11 with a managed `NullReferenceException` deep in the new
+   **runtime-async** state machine (`AsyncHelpers.RuntimeAsyncTask.HandleSuspended`,
+   whose state is passed by `ref`/byref). `Evacuate` step 4 forwards **object-start**
+   references of every marked object, but a managed **interior/byref pointer** into
+   a moved object (matched only at object-start in the `forwarding` map) is not
+   updated → dangling. Correct moving-GC fix-up must forward interior pointers too.
+
+4. **Even non-moving STW sweep-only is unsound (base).** The simplest config
+   (`LXR_CONCURRENT=0 LXR_EVAC=0 LXR_GC_THREADS=1`) still AVs ~1/5, and the fault
+   handler catches it **inside the GC**: `LXRCollector::ResolveInterior+0x82`
+   dereferencing memory in state `RESERVE` (decommitted). `ResolveInterior` maps a
+   `GC_CALL_INTERIOR` root (again, runtime-async byrefs) to its base object by
+   linear-parsing the containing chunk with `LXRObjectSize`; a parse desync (or a
+   chunk whose pages the sweep decommitted while its `Committed` flag stayed set)
+   makes it either fail to resolve — so the object is not marked and gets swept
+   while a live byref still points at it — or read the decommitted region directly.
+   This is the deepest issue: **safe, complete handling of managed interior
+   pointers** (byrefs), which .NET runtime-async exercises heavily.
+
+**Conclusion.** Defects 2 and 4 (and to a large extent 3) come down to the same
+theme the project flagged from the start as the likely "stop and inform" boundary:
+a standalone RC/SATB/moving GC needs the runtime to (a) surface the **old value on
+*all* ref stores** and (b) let it **completely and safely enumerate interior
+pointers**. The current single-slot pluggable barrier and the ad-hoc
+`ResolveInterior` heap-parse are not sufficient under a demanding, interior-pointer-
+heavy workload. **No configuration is currently valid to benchmark.** The
+Phase-2 STW reclamation demo remained clean only because the ConsoleApp workload
+had no bulk ref copies, no runtime-async byrefs, and no pinned-pool churn.
+
 
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 

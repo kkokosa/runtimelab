@@ -144,6 +144,7 @@ struct LXRCounters
     // P2 barrier extensions: SATB deletion barrier + remembered sets.
     volatile int64_t SatbEntries;           // old referents logged to SATB buffers
     volatile int64_t SatbMarks;             // SATB entries consumed (marked) by a trace
+    volatile int64_t SatbOverflowRetraces;  // finish-pause full re-traces due to SATB overflow
     volatile int64_t RemsetEntries;         // inter-block pointer slots logged
     volatile int64_t RemsetFixups;          // remset slots rewritten during evacuation
 

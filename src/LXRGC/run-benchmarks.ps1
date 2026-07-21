@@ -777,6 +777,13 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
 
         # Save incrementally so a crash partway through doesn't lose earlier runs.
         $allRuns | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $OutDir "results-full.json") -Encoding UTF8
+        # Regenerate the human-readable report after every scenario so results
+        # are viewable as they go, not only at the end of the (multi-hour) suite.
+        try {
+            & "$root\generate-report.ps1" -ResultsJson (Join-Path $OutDir "results-full.json") -OutHtml (Join-Path $OutDir "report.html") | Out-Null
+        } catch {
+            Write-Host ("  (incremental report regen skipped: {0})" -f $_.Exception.Message) -ForegroundColor DarkYellow
+        }
         }
         catch {
             Write-Host ("  !! run '{0}' failed and was skipped: {1}" -f $label, $_.Exception.Message) -ForegroundColor Red
