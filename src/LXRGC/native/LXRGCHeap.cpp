@@ -99,12 +99,27 @@ static volatile int64_t g_committedInUse = 0;
 // grown by this many bytes since the last collection (0 disables; overridable via
 // LXR_GC_TRIGGER_MB). This is what makes LXR behave like a real reclaiming GC
 // under load instead of only reclaiming on an explicit GC.Collect().
-static int64_t RunLXRCollection(int generation);
-static void RequestLXRCollection(bool wait);
+static int64_t RunLXRCollection(int generation, bool forceTrace);
+static void RequestLXRCollection(bool wait, bool forceTrace);
 static void LXRCollectorThreadProc(void*);
 static volatile int64_t g_gcTriggerBytes = -1; // -1 = uninitialized; resolved lazily
 static volatile int64_t g_gcGrowthPct = 50;    // adaptive budget: % of live heap
 static volatile LONG g_inCollection = 0;       // reentrancy guard for RunLXRCollection
+
+// --- LXR phase model (P1) -------------------------------------------------
+// Real LXR does frequent *light* RC pauses and only *occasionally* a full
+// backup trace + sweep, pacing the cadence with a survival-rate prediction. We
+// mirror that: an allocation trigger normally runs a cheap RC pause (replay the
+// coalescing-RC modified buffers, no trace, no decommit); the collector escalates
+// to a full TracePause (backup trace + Immix sweep, the only phase that actually
+// returns memory and reclaims dead cycles) when either enough RC epochs have
+// elapsed or committed memory has grown past a trace budget since the last trace.
+enum class LXRPhase { RCPause, TracePause };
+static volatile LONG g_requestTrace = 0;          // sticky: next cycle must be a full trace
+static volatile int64_t g_epochsSinceTrace = 0;   // RC epochs since the last full trace
+static volatile int64_t g_lastTraceCommitted = 0; // committed-in-use right after the last trace
+static volatile int64_t g_traceBudgetBytes = -1;  // -1 = uninitialized; growth before forcing a trace
+static volatile int64_t g_traceEveryEpochs = -1;  // force a trace at least every N epochs (0 = off)
 
 // Dedicated collector thread. Driving SuspendEE from a random cooperative-mode
 // allocating thread deadlocks under high concurrency (the initiator can end up
@@ -801,7 +816,7 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
         if (adaptive > budget) budget = adaptive;
         int64_t grown = g_committedInUse - live;
         if (grown >= budget)
-            RequestLXRCollection(/*wait*/ false);
+            RequestLXRCollection(/*wait*/ false, /*forceTrace*/ false);
     }
 
     // Retire the context chunk this thread was filling: its high-water mark is
@@ -981,18 +996,68 @@ size_t LXRGCHeap::GetTotalBytesInUse()
 }
 uint64_t LXRGCHeap::GetTotalAllocatedBytes() { return (uint64_t)g_lxrCounters.TotalAllocatedBytes; }
 
-// Runs one LXR collection cycle: replay coalescing-RC modified buffers, then
-// (for a full collection) a stop-the-world backup trace + Immix sweep that
-// actually reclaims memory. Reentrancy-guarded so an allocation-triggered
-// collection can never re-enter (the collection path itself must not recurse
-// into another collect). Returns bytes reclaimed this cycle.
-static int64_t RunLXRCollection(int generation)
+// Resolve the phase-policy env knobs once. LXR_TRACE_BUDGET_MB caps committed
+// growth between full traces; LXR_TRACE_EVERY_EPOCHS caps RC epochs between full
+// traces (0 disables the epoch cap and paces traces purely by growth).
+static void EnsureTracePolicy()
+{
+    if (g_traceBudgetBytes < 0)
+    {
+        const char* e = getenv("LXR_TRACE_BUDGET_MB");
+        int64_t mb = e ? _atoi64(e) : 128;
+        g_traceBudgetBytes = mb * (int64_t)1024 * 1024;
+    }
+    if (g_traceEveryEpochs < 0)
+    {
+        const char* e = getenv("LXR_TRACE_EVERY_EPOCHS");
+        g_traceEveryEpochs = e ? _atoi64(e) : 8;
+    }
+}
+
+// Decide whether this epoch is a light RC pause or a full backup-trace pause.
+// A trace is forced on induced/gen2 collection; otherwise it escalates when the
+// RC-epoch cap is reached or committed growth since the last trace exceeds the
+// trace budget. The epoch cap is scaled by the survival-rate EWMA: when a high
+// fraction of the heap survives each trace, floating garbage accrues slowly, so
+// traces can be rarer; when survival is low (churny short-lived cycles) trace
+// sooner.
+static LXRPhase DecidePhase(bool forceTrace)
+{
+    EnsureTracePolicy();
+    if (forceTrace)
+        return LXRPhase::TracePause;
+
+    int64_t epochCap = g_traceEveryEpochs;
+    if (epochCap > 0 && g_lxrCounters.SurvivalPctEwma >= 0)
+    {
+        // survival 0% -> 0.5x cap, 100% -> 1.5x cap.
+        epochCap = (epochCap * (50 + g_lxrCounters.SurvivalPctEwma)) / 100;
+        if (epochCap < 1) epochCap = 1;
+    }
+    if (g_traceEveryEpochs > 0 && g_epochsSinceTrace >= epochCap)
+        return LXRPhase::TracePause;
+
+    int64_t growth = g_committedInUse - g_lastTraceCommitted;
+    if (g_traceBudgetBytes > 0 && growth >= g_traceBudgetBytes)
+        return LXRPhase::TracePause;
+
+    return LXRPhase::RCPause;
+}
+
+// Runs one LXR epoch. Every epoch replays the coalescing-RC modified buffers (a
+// cheap RC pause). Occasionally - as decided by DecidePhase - the epoch is a full
+// TracePause that additionally runs a stop-the-world backup trace + Immix sweep,
+// the only phase that reclaims dead cycles and actually returns committed memory.
+// Reentrancy-guarded so an allocation-triggered epoch can never re-enter.
+// Returns bytes reclaimed this epoch.
+static int64_t RunLXRCollection(int generation, bool forceTrace)
 {
     if (InterlockedCompareExchange(&g_inCollection, 1, 0) != 0)
         return 0; // a collection is already in progress on another/this thread
 
-    bool fullGC = (generation < 0 || generation >= 2);
+    LXRPhase phase = DecidePhase(forceTrace);
     int64_t reclaimedBefore = g_lxrCollector.ReclaimedBytes();
+    int64_t committedBefore = g_committedInUse;
 
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
@@ -1005,7 +1070,8 @@ static int64_t RunLXRCollection(int generation)
         suspended = true;
     }
     bool verbose = getenv("LXR_VERBOSE") != nullptr;
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] suspended=%d\n", (int)suspended); fflush(stderr); }
+    if (verbose) { fprintf(stderr, "LXRGC: [stage] phase=%s suspended=%d\n",
+                           phase == LXRPhase::TracePause ? "trace" : "rc", (int)suspended); fflush(stderr); }
 
     bool doBuffers = getenv("LXR_NO_BUFFERS") == nullptr;
     bool doTrace   = getenv("LXR_NO_TRACE")   == nullptr;
@@ -1016,7 +1082,7 @@ static int64_t RunLXRCollection(int generation)
         g_lxrCollector.ProcessModifiedBuffers();
         if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done\n"); fflush(stderr); }
     }
-    if (fullGC)
+    if (phase == LXRPhase::TracePause)
     {
         if (doTrace)
         {
@@ -1035,9 +1101,39 @@ static int64_t RunLXRCollection(int generation)
     QueryPerformanceCounter(&t1);
     int64_t pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
-    InterlockedIncrement64(&g_lxrCounters.Collections);
+    InterlockedIncrement64(&g_lxrCounters.Epochs);
     g_lxrCounters.LastCollectCommitted = g_committedInUse;
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (pause=%lldus)\n", (long long)pauseMicros); fflush(stderr); }
+
+    if (phase == LXRPhase::TracePause)
+    {
+        InterlockedIncrement64(&g_lxrCounters.TracePauses);
+        InterlockedExchangeAdd64(&g_lxrCounters.TracePausePauseMicros, pauseMicros);
+        // Survival-rate prediction: fraction of committed memory that survived
+        // this trace, folded into an EWMA (7:1) to pace future trace cadence.
+        if (committedBefore > 0)
+        {
+            int64_t survivalPct = (g_committedInUse * 100) / committedBefore;
+            if (survivalPct > 100) survivalPct = 100;
+            int64_t prev = g_lxrCounters.SurvivalPctEwma;
+            g_lxrCounters.SurvivalPctEwma = (prev < 0) ? survivalPct : (prev * 7 + survivalPct) / 8;
+        }
+        g_lastTraceCommitted = g_committedInUse;
+        g_epochsSinceTrace = 0;
+    }
+    else
+    {
+        InterlockedIncrement64(&g_lxrCounters.RCPauses);
+        InterlockedExchangeAdd64(&g_lxrCounters.RCPausePauseMicros, pauseMicros);
+        InterlockedIncrement64(&g_epochsSinceTrace);
+    }
+    // Legacy "Collections" counter continues to count full reclaiming cycles so
+    // existing runtime GC counters / reports keep reporting real collections.
+    if (phase == LXRPhase::TracePause)
+        InterlockedIncrement64(&g_lxrCounters.Collections);
+
+    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%%)\n",
+                           phase == LXRPhase::TracePause ? "trace" : "rc",
+                           (long long)pauseMicros, (long long)g_lxrCounters.SurvivalPctEwma); fflush(stderr); }
 
     int64_t reclaimedNow = g_lxrCollector.ReclaimedBytes();
     InterlockedExchange(&g_inCollection, 0);
@@ -1055,7 +1151,8 @@ static void LXRCollectorThreadProc(void*)
         if (g_collectorShutdown)
             break;
         InterlockedExchange(&g_collectPending, 0);
-        RunLXRCollection(-1);
+        bool forceTrace = InterlockedExchange(&g_requestTrace, 0) != 0;
+        RunLXRCollection(-1, forceTrace);
         InterlockedIncrement64(&g_collectCompletedSeq);
         SetEvent(g_collectDoneEvent);
     }
@@ -1065,14 +1162,18 @@ static void LXRCollectorThreadProc(void*)
 // (explicit GC.Collect) block until a cycle that started after this request has
 // finished; otherwise (allocation trigger) fire-and-forget, coalescing repeated
 // requests so the allocator never blocks or drives SuspendEE itself.
-static void RequestLXRCollection(bool wait)
+static void RequestLXRCollection(bool wait, bool forceTrace)
 {
+    if (forceTrace)
+        InterlockedExchange(&g_requestTrace, 1);
+
     if (g_collectRequestEvent == nullptr)
     {
         // Collector thread not up yet (very early startup): fall back to a direct
         // synchronous collection on the calling thread (single-threaded at this
         // point, so the concurrency hazard does not apply).
-        RunLXRCollection(-1);
+        InterlockedExchange(&g_requestTrace, 0);
+        RunLXRCollection(-1, forceTrace);
         return;
     }
 
@@ -1094,7 +1195,7 @@ HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
 {
     InterlockedIncrement64(&g_lxrCounters.InducedCollectRequests);
     int64_t before = g_lxrCollector.ReclaimedBytes();
-    RequestLXRCollection(/*wait*/ true);
+    RequestLXRCollection(/*wait*/ true, /*forceTrace*/ true);
     int64_t reclaimed = g_lxrCollector.ReclaimedBytes() - before;
     fprintf(stderr,
             "LXRGC: GC(gen=%d) -> RC inc=%lld dec=%lld, backupTraces=%lld, collections=%lld, reclaimed this GC=%lld bytes (total=%lld)\n",

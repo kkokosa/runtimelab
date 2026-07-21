@@ -312,6 +312,35 @@ safepoint cooperation" gap described above, not a limit of the STW reclamation.
 
 ---
 
+## 7. Paper-fidelity roadmap (closing the 5 gaps)
+
+The STW engine above is a faithful *skeleton* of LXR but omits the moving parts
+that make it "LXR-in-motion." Five gaps vs. the paper (arXiv:2210.17175) are being
+closed in dependency/risk order (see `plan.md`): **(P1)** phase model + survival
+triggering, **(P2)** SATB deletion buffers + remembered sets, **(P3)** STW
+incremental evacuation, **(P4)** concurrent SATB trace + lazy decrements, **(P5)**
+parallelism + scale.
+
+### P1 — phase model + survival-rate triggering (done; no runtime change)
+
+The monolithic "one heavy full-heap cycle per trigger" is replaced by LXR's actual
+cadence: most allocation triggers now run a **light RC pause** (replay the
+coalescing-RC modified buffers only — no trace, no decommit), and the collector
+escalates to a full **trace pause** (backup trace + Immix sweep, the only phase
+that reclaims cycles and returns committed memory) only *occasionally*. Cadence is
+paced by a **survival-rate predictor**: after each trace the surviving fraction of
+committed memory is folded into an EWMA that scales the RC-epoch cap (high survival
+⇒ rarer traces; churny/low survival ⇒ trace sooner). Knobs:
+`LXR_TRACE_EVERY_EPOCHS` (RC epochs between forced traces, default 8) and
+`LXR_TRACE_BUDGET_MB` (committed growth between traces, default 128). Induced
+`GC.Collect()` still forces a trace. New per-phase counters (`RCPauses`,
+`TracePauses`, `Epochs`, `SurvivalPctEwma`) are exposed on `LXRCounters`. Verified:
+under the console workload, cheap RC pauses (~0.1–1 ms) interleave with occasional
+traces (paced by the predictor) and the app completes cleanly. This is entirely
+GC-side.
+
+---
+
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,
 generic, GC-agnostic runtime facilities** — a pluggable write barrier (§5,
 surfaces the old field value; #barrier) and an object-reference-scanning header

@@ -131,6 +131,15 @@ struct LXRCounters
     volatile int64_t Collections;           // total STW collections performed
     volatile int64_t TotalPauseMicros;      // cumulative STW pause time (us)
     volatile int64_t LastCollectCommitted;  // committed-in-use at last GC (bytes)
+
+    // LXR phase model (P1): most epochs are cheap RC pauses; a full backup
+    // trace + sweep runs only occasionally, paced by a survival-rate predictor.
+    volatile int64_t Epochs;                // total RC epochs (light + full)
+    volatile int64_t RCPauses;              // light epochs (ProcessModifiedBuffers only)
+    volatile int64_t TracePauses;           // full epochs (trace + sweep) == BackupTraces
+    volatile int64_t SurvivalPctEwma;       // EWMA of survivor % across traces (0..100)
+    volatile int64_t RCPausePauseMicros;    // cumulative light-pause time (us)
+    volatile int64_t TracePausePauseMicros; // cumulative full-pause time (us)
 };
 extern LXRCounters g_lxrCounters;
 
