@@ -894,7 +894,27 @@ void LXRCollector::DrainMarkStack()
         }
         size_t osz = LXRObjectSize(o);
         if (osz == 0)
-            continue; // null/half-init MethodTable: not scannable
+        {
+            // Not a valid object start. This is almost always an interior/byref
+            // value pushed as-is (runtime-async continuation captures, ref locals
+            // stored on the heap): GCScanObjectRefs cannot distinguish byref from
+            // objref slots, so *ref may point into an object's interior. Resolve
+            // it to the containing object's base so the target is scanned (its
+            // out-edges followed) - otherwise objects reachable only via a byref
+            // are never traced and get swept -> AV in e.g. DispatchContinuations.
+            if (InHeap(o))
+            {
+                Object* base = ResolveInterior((uint8_t*)o);
+                if (base != nullptr)
+                {
+                    o = base;
+                    osz = LXRObjectSize(o);
+                    MarkObject(o); // record the true base granule as marked
+                }
+            }
+            if (osz == 0)
+                continue; // genuinely not scannable
+        }
         GCScanObjectRefs(o, osz, [this, o, verify](Object** ref)
         {
             Object* child = *ref;
@@ -932,7 +952,27 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
         local.pop_back();
         size_t osz = LXRObjectSize(o);
         if (osz == 0)
-            continue; // null/half-init MethodTable: not scannable
+        {
+            // Interior/byref value (see DrainMarkStack): resolve to base so the
+            // target's out-edges are scanned. Claim the base atomically so two
+            // workers resolving different interiors into the same object don't
+            // both scan it.
+            if (InHeap(o))
+            {
+                Object* base = ResolveInterior((uint8_t*)o);
+                if (base != nullptr && MarkObject(base))
+                {
+                    o = base;
+                    osz = LXRObjectSize(o);
+                }
+                else
+                {
+                    continue; // unresolvable, or base already claimed/scanned
+                }
+            }
+            if (osz == 0)
+                continue;
+        }
         GCScanObjectRefs(o, osz, [this, &local](Object** ref)
         {
             Object* c = *ref;
@@ -1080,6 +1120,7 @@ static Object* ParseContainingObjectGuarded(uint8_t* start, uint8_t* usedEnd, ui
     __try
     {
         uint8_t* p = start;
+        uint8_t* lastObj = nullptr;
         while (p < usedEnd)
         {
             vp = p;
@@ -1089,8 +1130,18 @@ static Object* ParseContainingObjectGuarded(uint8_t* start, uint8_t* usedEnd, ui
                 break;
             if (interior >= p && interior < p + sz)
                 return o;
+            lastObj = p;
             p += sz;
         }
+        // One-past-the-end interior pointer (e.g. `ref array[array.Length]`, a
+        // span/loop terminator that runtime-async spills into heap continuation
+        // state). C# permits a byref one element past the end; it never resolves
+        // by the strict `interior < p+sz` test above. When `interior` lands
+        // exactly at the end of the parsed run, it is the one-past-end of the
+        // last object, so resolve to it - otherwise that object and its out-edges
+        // are never scanned and get swept -> AV (DispatchContinuations).
+        if (interior == p && lastObj != nullptr && interior == usedEnd)
+            return (Object*)lastObj;
     }
     __except (LXRParseFaultFilter(GetExceptionInformation(), start, usedEnd, (uint8_t*)vp, interior))
     {
@@ -1117,12 +1168,18 @@ Object* LXRCollector::ResolveInterior(uint8_t* interior)
         if (!c.Committed)
             continue;
         uint8_t* usedEnd = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-        if (interior >= c.Start && interior < usedEnd)
+        // Allow interior == usedEnd (one-past-the-end byref of the last object in
+        // this region); ParseContainingObjectGuarded resolves it to that object.
+        if (interior >= c.Start && interior <= usedEnd)
         {
             region = c;
             region.UsedEnd = usedEnd;
             found = true;
-            break;
+            // Prefer a region that strictly contains the pointer over one where
+            // it only touches the boundary, so an object-boundary byref between
+            // two adjacent regions binds to the region it is the end of.
+            if (interior < usedEnd)
+                break;
         }
     }
     LeaveCriticalSection(&g_chunkLock);
@@ -1875,6 +1932,27 @@ static void LXRWriteBarrierCallback(Object** slot, Object* newValue, Object* old
     g_lxrCollector.LogModifiedField(slot, oldValue, newValue);
 }
 
+// Generic pluggable *bulk* write-barrier callback (WriteBarrierKind::Callback).
+//
+// Bulk GC-reference moves (Array.Copy, span copies, struct block-copies lowered
+// to CORINFO_HELP_BULK_WRITEBARRIER) bypass the JIT single-slot write barrier, so
+// without this hook LXR would never see the old referents they overwrite nor the
+// new referents they install - the concrete unsoundness that let a concurrent
+// SATB trace free still-reachable objects. The runtime invokes this BEFORE the
+// copy overwrites the destination, so both dest[i] (old) and src[i] (new) are
+// still readable. We replay each slot through the same coalescing-RC + SATB +
+// remembered-set logging as the single-slot barrier. Leaf-like (no allocation
+// beyond the once-per-thread buffer first-touch, matching the single-slot path).
+static void LXRBulkWriteBarrierCallback(Object** dest, Object** src, size_t byteCount)
+{
+    size_t slots = byteCount / sizeof(Object*);
+    for (size_t i = 0; i < slots; i++)
+    {
+        // old = current dest[i] (about to be overwritten); new = src[i].
+        g_lxrCollector.LogModifiedField(&dest[i], dest[i], src[i]);
+    }
+}
+
 HRESULT LXRGCHeap::Initialize()
 {
     InitializeCriticalSection(&g_frozenSegmentsLock);
@@ -1947,6 +2025,12 @@ HRESULT LXRGCHeap::Initialize()
         cb.is_runtime_suspended = true;
         cb.write_barrier_kind = WriteBarrierKind::Callback;
         cb.write_barrier_callback = &LXRWriteBarrierCallback;
+        // Also observe bulk GC-ref moves (arrays/spans/struct copies) that bypass
+        // the single-slot JIT barrier - required for a complete SATB snapshot and
+        // correct coalescing RC under real workloads. Gated off by LXR_NO_BULK_BARRIER
+        // for A/B measurement of its cost/soundness contribution.
+        if (getenv("LXR_NO_BULK_BARRIER") == nullptr)
+            cb.write_barrier_bulk_callback = &LXRBulkWriteBarrierCallback;
         cb.lowest_address = m_heapBase;
         cb.highest_address = m_heapReservedEnd;
         cb.card_table = (uint32_t*)cardTableBiased;
