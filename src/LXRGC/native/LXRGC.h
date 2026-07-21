@@ -146,6 +146,14 @@ struct LXRCounters
     volatile int64_t SatbMarks;             // SATB entries consumed (marked) by a trace
     volatile int64_t RemsetEntries;         // inter-block pointer slots logged
     volatile int64_t RemsetFixups;          // remset slots rewritten during evacuation
+
+    // P3 STW evacuation (moving defragmentation).
+    volatile int64_t EvacPasses;            // evacuation phases run
+    volatile int64_t EvacRegions;           // fragmented regions evacuated
+    volatile int64_t EvacObjects;           // live objects relocated
+    volatile int64_t EvacBytesCopied;       // bytes relocated
+    volatile int64_t EvacFieldsForwarded;   // heap references rewritten to moved targets
+    volatile int64_t EvacPinnedSkipped;     // live objects left in place (root/handle-pinned)
 };
 extern LXRCounters g_lxrCounters;
 
@@ -206,6 +214,19 @@ public:
     void EnumerateRemsetSlots(void (*visit)(Object** slot, void* ctx), void* ctx);
     void ResetRemsets();
 
+    // --- STW incremental evacuation / copying (P3) ---
+    //
+    // Inside the stop-the-world trace pause (after BackupTrace has marked the
+    // live objects), relocate the live objects out of the most fragmented
+    // regions into fresh space and free those regions, defragmenting the heap.
+    // Because it runs fully STW no read barrier is needed: every reference to a
+    // moved object is fixed up within the pause. Root/handle referents are pinned
+    // (never moved) so only heap references need forwarding. Gated off by default
+    // (LXR_EVAC=1); driven from the trace pause.
+    void SetEvacActive(bool active);
+    bool IsEvacActive() const;
+    void Evacuate();
+
     // Periodic mark-sweep over the whole heap to reclaim dead cycles that RC
     // leaks. Uses IGCToCLR root/stack enumeration (which the ABI *does*
     // expose) plus per-object GCDesc traversal.
@@ -236,6 +257,11 @@ public:
 private:
     void EnqueueZeroCount(Object* obj);
     void DrainZeroCountWorkList();
+
+    // Extend the committed+zeroed mark-table prefix to cover [heapBase, addrEnd)
+    // without disturbing already-set bits, so marks can be set on freshly claimed
+    // evacuation-destination space that sits above the trace-time high-water.
+    void EnsureMarkCommitted(uint8_t* addrEnd);
 
     bool InHeap(Object* obj) const
     {
@@ -397,11 +423,14 @@ public:
     uint8_t* HeapHighWater() const { return min(m_heapNextFree, m_heapReservedEnd); }
     uint8_t* HeapReservedEnd() const { return m_heapReservedEnd; }
 
+    // Lock-free block-range claim from the reservation. Public so the collector's
+    // STW evacuation (P3) can claim fresh destination space.
+    uint8_t* ClaimBlocks(size_t bytes);
+
 private:
     LXRGCHeap() = default;
 
     Object* AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_t flags);
-    uint8_t* ClaimBlocks(size_t bytes); // lock-free block-range claim from reservation
 
     uint8_t* m_heapBase = nullptr;
     uint8_t* m_heapNextFree = nullptr;   // shared block-claim watermark

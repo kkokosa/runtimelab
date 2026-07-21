@@ -8,6 +8,9 @@
 //
 #include "LXRGC.h"
 #include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 // GCScanObjectRefs' collectible-class branch calls this EE up-call. LXRGC does
 // not compile the standalone gcenv.ee inline forwarders, so provide the single
@@ -111,6 +114,7 @@ static thread_local RemsetBuffer* t_remsetBuffer = nullptr;
 static RemsetBuffer* g_registeredRemsetBuffers = nullptr;
 static CRITICAL_SECTION g_remsetLock;
 static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation is enabled
+static volatile LONG g_evacActive = 0;   // STW evacuation gate (P3)
 
 // A tiny zero-count work list used by recursive decrements. In a full LXR
 // this is a bounded work packet processed incrementally; here it is a simple
@@ -328,6 +332,7 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // knobs let the STW path exercise them now: LXR_SATB=1, LXR_REMSET=1.
     if (getenv("LXR_SATB") != nullptr)   g_satbActive = 1;
     if (getenv("LXR_REMSET") != nullptr) g_remsetActive = 1;
+    if (getenv("LXR_EVAC") != nullptr)   g_evacActive = 1;
     return true;
 }
 
@@ -799,6 +804,263 @@ void LXRCollector::SweepAndSelectDefrag()
     LeaveCriticalSection(&g_chunkLock);
 }
 
+void LXRCollector::SetEvacActive(bool active) { InterlockedExchange(&g_evacActive, active ? 1 : 0); }
+bool LXRCollector::IsEvacActive() const { return g_evacActive != 0; }
+
+void LXRCollector::EnsureMarkCommitted(uint8_t* addrEnd)
+{
+    if (addrEnd <= m_heapBase)
+        return;
+    size_t usedBytes = (size_t)(addrEnd - m_heapBase);
+    size_t neededBytes = (usedBytes / lxr::kObjectGranule + 7) / 8;
+    neededBytes = (neededBytes + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
+    size_t cap = (m_heapBytes / lxr::kObjectGranule + 7) / 8;
+    if (neededBytes > cap)
+        neededBytes = cap;
+    if (neededBytes > m_markCommittedBytes)
+    {
+        uint8_t* from = m_markTable + m_markCommittedBytes;
+        size_t delta = neededBytes - m_markCommittedBytes;
+        VirtualAlloc(from, delta, MEM_COMMIT, PAGE_READWRITE);
+        memset(from, 0, delta);
+        m_markCommittedBytes = neededBytes;
+    }
+}
+
+// Pre-pass callbacks: pin every root/handle referent (never move it) so
+// evacuation only ever has to forward heap references, not roots or handles.
+static std::unordered_set<Object*>* g_evacPinned = nullptr;
+static void LXRPinRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
+{
+    Object* o = *ppObj;
+    if (o == nullptr)
+        return;
+    if (flags & GC_CALL_INTERIOR)
+    {
+        o = g_lxrCollector.ResolveInterior((uint8_t*)o);
+        if (o == nullptr)
+            return;
+    }
+    if (g_evacPinned != nullptr)
+        g_evacPinned->insert(o);
+}
+static void LXRPinHandle(Object** ref, void* ctx)
+{
+    Object* o = *ref;
+    if (o != nullptr)
+        ((std::unordered_set<Object*>*)ctx)->insert(o);
+}
+
+// STW incremental evacuation (P3). Runs inside the trace pause, after
+// BackupTrace has marked every live object. Relocates the live objects out of
+// the most fragmented regions into fresh space and frees those regions.
+void LXRCollector::Evacuate()
+{
+    if (g_lxrGCHeap == nullptr || g_theGCToCLR == nullptr)
+        return;
+    InterlockedIncrement64(&g_lxrCounters.EvacPasses);
+
+    bool verbose = getenv("LXR_VERBOSE") != nullptr;
+
+    // Policy knobs.
+    static int64_t s_fragPct = -1, s_budgetBytes = -1;
+    if (s_fragPct < 0)
+    {
+        const char* f = getenv("LXR_EVAC_FRAG_PCT");
+        s_fragPct = f ? _atoi64(f) : 50;              // evacuate regions >= this % dead
+        const char* b = getenv("LXR_EVAC_BUDGET_MB");
+        s_budgetBytes = (b ? _atoi64(b) : 32) * (int64_t)1024 * 1024; // copy at most this per pause
+    }
+
+    // 1. Pin all root/handle referents (interior roots resolve to their base).
+    std::unordered_set<Object*> pinned;
+    g_evacPinned = &pinned;
+    ScanContext sc; sc.promotion = true;
+    g_theGCToCLR->GcScanRoots(&LXRPinRoot, 2, 2, &sc);
+    g_evacPinned = nullptr;
+    LXRGCHandleStore::ForEachLiveHandle(&LXRPinHandle, &pinned);
+
+    // 2. Select fragmented regions within the copy budget. Snapshot first so
+    //    that registering destination chunks (which may realloc g_chunks) cannot
+    //    invalidate the source list. Indices stay valid across realloc.
+    struct EvacRegion { size_t index; uint8_t* start; uint8_t* usedEnd; };
+    std::vector<EvacRegion> evac;
+    int64_t liveBudget = s_budgetBytes;
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t i = 0; i < g_chunkCount && liveBudget > 0; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.Owner != nullptr || c.UsedEnd <= c.Start)
+            continue;
+        size_t total = 0, live = 0;
+        uint8_t* p = c.Start;
+        bool parseOk = true;
+        while (p < c.UsedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) { parseOk = false; break; }
+            total += sz;
+            if (IsMarked(o)) live += sz;
+            p += sz;
+        }
+        if (!parseOk || total == 0 || live == 0 || live == total)
+            continue; // unparseable, empty, fully dead (sweep handles), or fully live
+        int64_t deadPct = (int64_t)((total - live) * 100 / total);
+        if (deadPct < s_fragPct)
+            continue;
+        evac.push_back({ i, c.Start, c.UsedEnd });
+        liveBudget -= (int64_t)live;
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    if (evac.empty())
+    {
+        if (verbose) { fprintf(stderr, "LXRGC: [evac] no fragmented regions selected\n"); fflush(stderr); }
+        return;
+    }
+
+    // 3. Copy live, non-pinned objects into fresh destination chunks; record
+    //    forwarding old->new. Pinned live objects are left in place.
+    std::unordered_map<Object*, Object*> forwarding;
+    uint8_t* destPtr = nullptr;
+    uint8_t* destEnd = nullptr;
+    int      curDestIndex = -1;
+    auto evacAlloc = [&](size_t sz) -> uint8_t*
+    {
+        if (destPtr == nullptr || destPtr + sz > destEnd)
+        {
+            if (curDestIndex >= 0)
+                g_chunks[curDestIndex].UsedEnd = destPtr; // finalize previous dest run
+            size_t claim = (sz > CONTEXT_ALLOC_QUANTUM) ? sz : CONTEXT_ALLOC_QUANTUM;
+            claim = (claim + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
+            uint8_t* base = g_lxrGCHeap->ClaimBlocks(claim);
+            if (base == nullptr)
+                return nullptr;
+            size_t committed = CommitRange(base, claim);
+            InterlockedExchangeAdd64(&g_committedInUse, (int64_t)committed);
+            curDestIndex = RegisterChunk(base, claim, nullptr);
+            destPtr = base;
+            destEnd = base + claim;
+            EnsureMarkCommitted(destEnd);
+        }
+        uint8_t* r = destPtr;
+        destPtr += sz;
+        return r;
+    };
+
+    std::vector<size_t> freeableEvacIndices;
+    for (const EvacRegion& er : evac)
+    {
+        size_t skipped = 0, moved = 0;
+        uint8_t* p = er.start;
+        while (p < er.usedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0)
+                break;
+            p += sz;
+            if (!IsMarked(o))
+                continue; // dead: freed with the region
+            if (pinned.count(o) != 0)
+            {
+                skipped++; // live but pinned: must stay in place
+                continue;
+            }
+            uint8_t* d = evacAlloc(sz);
+            if (d == nullptr) { skipped++; continue; } // out of space: leave in place
+            memcpy(d, o, sz);
+            forwarding.emplace(o, (Object*)d);
+            MarkObject((Object*)d);
+            CommitPageFor(RCSlot((Object*)d));
+            CommitPageFor(RCSlot(o));
+            *RCSlot((Object*)d) = *RCSlot(o);
+            *RCSlot(o) = 0; // source granule retired
+            moved++;
+            InterlockedIncrement64(&g_lxrCounters.EvacObjects);
+            InterlockedExchangeAdd64(&g_lxrCounters.EvacBytesCopied, (int64_t)sz);
+        }
+        InterlockedExchangeAdd64(&g_lxrCounters.EvacPinnedSkipped, (int64_t)skipped);
+        if (moved > 0)
+            InterlockedIncrement64(&g_lxrCounters.EvacRegions);
+        if (skipped == 0 && moved > 0)
+            freeableEvacIndices.push_back(er.index);
+    }
+    if (curDestIndex >= 0)
+        g_chunks[curDestIndex].UsedEnd = destPtr; // finalize last dest run
+
+    // 4. Fix up every heap reference to a moved object. Roots/handles need no
+    //    fix-up (their referents were pinned). Walk all live objects (including
+    //    the freshly copied destinations) and forward their fields. Forwarded
+    //    source objects are dead and skipped.
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed)
+            continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < end)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0)
+                break;
+            p += sz;
+            if (forwarding.find(o) != forwarding.end())
+                continue; // dead source
+            if (!IsMarked(o))
+                continue; // unreachable garbage: sweep will handle
+            GCScanObjectRefs(o, sz, [&forwarding](Object** f)
+            {
+                auto it = forwarding.find(*f);
+                if (it != forwarding.end())
+                {
+                    *f = it->second;
+                    InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
+                }
+            });
+        }
+    }
+
+    // 5. Free fully-evacuated regions (no pinned/left-behind live object).
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t idx : freeableEvacIndices)
+    {
+        ChunkRegion& c = g_chunks[idx];
+        if (!c.Committed)
+            continue;
+        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
+        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
+        if (dend > dbeg)
+        {
+            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
+            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
+        }
+        c.Committed = false;
+        if (g_freeChunkTop == g_freeChunkCap)
+        {
+            size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
+            size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
+            if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
+        }
+        if (g_freeChunkTop < g_freeChunkCap)
+            g_freeChunks[g_freeChunkTop++] = idx;
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    if (verbose)
+    {
+        fprintf(stderr, "LXRGC: [evac] regions=%zu moved=%lld bytes=%lld pinnedSkipped=%lld fieldsForwarded=%lld freed=%zu\n",
+                evac.size(), (long long)g_lxrCounters.EvacObjects, (long long)g_lxrCounters.EvacBytesCopied,
+                (long long)g_lxrCounters.EvacPinnedSkipped, (long long)g_lxrCounters.EvacFieldsForwarded,
+                freeableEvacIndices.size());
+        fflush(stderr);
+    }
+}
+
 // ===========================================================================
 //                              LXRGCHeap
 // ===========================================================================
@@ -1239,6 +1501,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         {
             g_lxrCollector.BackupTrace();
             if (verbose) { fprintf(stderr, "LXRGC: [stage] BackupTrace done\n"); fflush(stderr); }
+        }
+        if (g_evacActive)
+        {
+            g_lxrCollector.Evacuate();
+            if (verbose) { fprintf(stderr, "LXRGC: [stage] Evacuate done\n"); fflush(stderr); }
         }
         if (doSweep)
         {

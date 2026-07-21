@@ -363,6 +363,43 @@ records thousands of inter-block remset slots, with reclamation and clean exit
 preserved. Entirely GC-side (the existing pluggable-barrier callback already
 surfaces both old and new values).
 
+### P3 — STW incremental evacuation / copying (done; no runtime change)
+
+LXR is not sweep-only: it defragments by *judiciously copying* live objects out of
+the most-fragmented blocks (evacuation sets) inside the STW pause. LXRGC now does
+this. During a trace pause, between `BackupTrace` (which marks live objects) and
+`SweepAndSelectDefrag`, `Evacuate()` runs:
+
+- **Select** — snapshot the committed regions and pick the most-fragmented ones
+  (dead-byte ratio ≥ `LXR_EVAC_FRAG_PCT`, default 30%) up to a per-pause copy
+  budget (`LXR_EVAC_BUDGET_MB`) — *incremental*, bounding pause time as the paper
+  requires.
+- **Copy** — claim fresh destination space above the trace-time high-water mark
+  (`ClaimBlocks` + `CommitRange` + `RegisterChunk`), copy each live, non-pinned
+  source object there, carry its RC slot across, and record the move in an
+  off-object forwarding map (`std::unordered_map<Object*,Object*>` — chosen over an
+  in-header forwarding word so the linear-walk metadata the sweep relies on, the
+  MethodTable at offset 0 and array length at offset 8, is never corrupted).
+- **Fix up** — walk every live object (via the §6 object-scan template) and rewrite
+  any field that points at a moved object to its forwarding target; destinations are
+  marked so the following sweep keeps them.
+- **Pin conservatively** — all root- and handle-reachable referents are pinned for
+  the pass (interior pointers resolved), so only heap fields need fix-up and no root
+  or handle update is required; a pinned object stays in place and its region is not
+  freed.
+- **Free** — regions fully drained by the copy are released back to the allocator.
+
+Gated by `LXR_EVAC=1` (off by default). New counters (`EvacPasses`, `EvacRegions`,
+`EvacObjects`, `EvacBytesCopied`, `EvacFieldsForwarded`, `EvacPinnedSkipped`) are on
+`LXRCounters`. Verified end-to-end on the console workload: evacuation runs each
+trace pause (objects moved, hundreds of heap fields forwarded, pinned objects
+skipped, drained regions freed), the app exits cleanly across repeated runs, and —
+the point of copying — **steady-state committed memory drops from ~168 MB
+(sweep-only) to ~88 MB (with evacuation)**, roughly halving the footprint by
+compacting fragmented blocks. No read barrier and no runtime change are needed
+because the copy happens entirely within the existing STW pause; concurrent copying
+(which *would* need a runtime forwarding/read-barrier hook) remains P4/future work.
+
 ---
 
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,
