@@ -302,6 +302,10 @@ static int RegisterChunk(uint8_t* start, size_t size, gc_alloc_context* owner)
 static uint8_t* ReuseChunk(gc_alloc_context* owner, int* outIndex)
 {
     uint8_t* start = nullptr;
+    static int noReuse = -1;
+    if (noReuse < 0) noReuse = (getenv("LXR_NO_REUSE") != nullptr) ? 1 : 0;
+    if (noReuse)
+        return nullptr;
     // While a concurrent trace window is open, do not recycle freed regions:
     // keeping region indices/starts stable lets the allocate-black snapshot match
     // regions by index, and forces mid-trace allocations above g_concWatermark.
@@ -314,6 +318,17 @@ static uint8_t* ReuseChunk(gc_alloc_context* owner, int* outIndex)
         if (idx >= g_chunkCount || g_chunks[idx].Committed)
             continue;
         ChunkRegion& c = g_chunks[idx];
+        // Only recycle standard-size regions on the small-alloc fast path. A
+        // reclaimed LARGE-object region (Size >> quantum) must NOT be handed out
+        // for a 128 KiB small chunk: doing so leaves the registry entry's Size
+        // at the multi-MB original, so the later sweep would MEM_DECOMMIT (and
+        // this reuse would memset/recommit) the entire multi-MB span while only
+        // the first quantum is tracked/used - the oversized decommit/zero then
+        // clobbers live objects carved into the same span, corrupting the heap
+        // (the growing-cache dictionary-resize AV). Leave large regions on the
+        // free list for a matching large request (or decommitted).
+        if (c.Size != CONTEXT_ALLOC_QUANTUM)
+            continue;
         size_t recommitted = CommitRange(c.Start, c.Size); // recommit the decommitted interior
         InterlockedExchangeAdd64(&g_committedInUse, (int64_t)recommitted);
         memset(c.Start, 0, c.Size);         // hand back zeroed memory like a fresh commit
@@ -639,7 +654,12 @@ bool LXRCollector::MarkObject(Object* obj)
     size_t granule = ((uint8_t*)obj - m_heapBase) / lxr::kObjectGranule;
     size_t byteIdx = granule >> 3;
     if (byteIdx >= m_markCommittedBytes)
-        return false; // beyond the reset range (above heap high-water) -> nothing to mark
+    {
+        // Live, in-heap object above the mark table's committed high-water; it
+        // cannot be marked. EnsureMarkCommitted covers the whole used heap
+        // before each trace, so this is not expected to fire.
+        return false;
+    }
     char bit = (char)(1u << (granule & 7));
     // Atomic set so parallel mark workers (P5) never lose a bit racing on the
     // same byte; the returned previous value tells us if WE were the marker.
@@ -978,7 +998,9 @@ void LXRCollector::BackupTrace()
     ScanContext sc;
     sc.promotion = true;
     const int maxgen = 2;
+    size_t rootsBefore = g_markTop;
     g_theGCToCLR->GcScanRoots(&LXRPromoteRoot, maxgen, maxgen, &sc);
+    size_t rootsPushed = g_markTop - rootsBefore;
 
     // 2b. SATB deletion set: while a trace window is open, referents unlinked by
     //     mutators since the snapshot must be kept live for this trace (Yuasa).
@@ -991,7 +1013,12 @@ void LXRCollector::BackupTrace()
     DrainClosure();
 
     if (getenv("LXR_VERIFY_TRACE") != nullptr)
+    {
+        fprintf(stderr, "LXRGC: [trace] rootsPushed=%llu heapNextFree=+%lldMB\n",
+                (unsigned long long)rootsPushed,
+                (long long)((g_lxrGCHeap ? (g_lxrGCHeap->HeapHighWater() - g_lxrGCHeap->HeapBase()) : 0) >> 20));
         VerifyTraceComplete();
+    }
 }
 
 // --- Concurrent SATB backup trace (P4) -------------------------------------
@@ -1148,6 +1175,37 @@ void LXRCollector::SweepAndSelectDefrag()
         bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd);
         if (anyLive)
             continue;
+
+        // Red-handed check (LXR_VERIFY_TRACE): AnyMarkedInRange says this chunk
+        // is dead. Linearly parse it and confirm no object carries a mark bit.
+        // If one does, the sweep is about to reclaim a live region (addressing
+        // or boundary bug); log it. If none does, the objects here are genuinely
+        // unmarked (a missed-root / trace-completeness gap upstream).
+        if (getenv("LXR_VERIFY_TRACE") != nullptr)
+        {
+            uint8_t* p = c.Start;
+            uint8_t* end = c.UsedEnd;
+            int parsedMarked = 0, parsedTotal = 0;
+            while (p < end && parsedTotal < 1000000)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0) break;
+                parsedTotal++;
+                if (IsMarked(o))
+                {
+                    parsedMarked++;
+                    if (parsedMarked <= 4)
+                        fprintf(stderr, "LXRGC: [sweep] RECLAIM chunk %p-%p size=%llu BUT marked obj at %p sz=%llu mt=%p\n",
+                                (void*)c.Start, (void*)c.UsedEnd, (unsigned long long)c.Size,
+                                (void*)o, (unsigned long long)sz, (void*)o->GetGCSafeMethodTable());
+                }
+                p += sz;
+            }
+            if (parsedMarked > 0)
+                fprintf(stderr, "LXRGC: [sweep] *** reclaiming chunk with %d/%d MARKED objects (AnyMarkedInRange=false) ***\n",
+                        parsedMarked, parsedTotal);
+        }
 
         // Decommit the page-aligned interior of the dead region (the <=1 page
         // fringe at each end may hold a neighbor's object header, so leave it).

@@ -301,14 +301,15 @@ we would "stop and inform": it is a follow-on stage, not silently dropped.
 The ported ZeroGC benchmark suite (see **README.md § Benchmark suite**,
 `results/report.html`) confirms this empirically: LXRGC is throughput-competitive
 across six workloads × three GC modes (console, zeroalloc, growing-cache, webapi,
-and two real dotLLM inference servers) while over-committing memory, but two
-GC-side robustness edges trace back to the missing concurrency support — tight
+and two real dotLLM inference servers) while over-committing memory. One remaining
+GC-side robustness edge traces back to the missing concurrency support: tight
 always-allocating async loops at ≥8 threads can starve the single-threaded STW
-collector (webapi is therefore benchmarked at 4 workers), and on very large,
-continuously-mutating graphs (`growing-cache`) the periodic backup trace can
-occasionally AV by following a stale reference into a chunk a prior sweep
-decommitted (~30% of runs). Both are precisely the "concurrent trace with
-safepoint cooperation" gap described above, not a limit of the STW reclamation.
+collector (webapi is therefore benchmarked at 4 workers). A separate
+`growing-cache` allocator bug — a reclaimed multi-MB large-object region being
+recycled for a 128 KiB small-alloc chunk while keeping its original oversized
+`Size`, so the later sweep decommitted/zeroed the whole span over live objects —
+has been **fixed** (small-alloc reuse now only recycles exact-quantum regions;
+see the known-limitation note below).
 
 ---
 
@@ -470,25 +471,36 @@ pause — safe because that pause has completed marking (allocate-black included
 and hardening (finer parallel work-stealing, broader benchmark coverage), not new
 runtime dependencies.
 
-#### Known limitation — multi-GB continuously-mutating graphs (growing-cache)
+#### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 
 On a continuously-growing multi-GB object graph containing very large reference
 arrays (the `growing-cache` benchmark: a `Dictionary` whose backing `Entry[]`
-reaches tens of MB while millions of small value objects churn), the STW backup
-trace deterministically leaves a band of *still-referenced* value objects unmarked;
-the subsequent sweep therefore reclaims and reuses their region, and the **next**
-trace access-violates when it follows the live array's now-dangling element slots
-into the reused memory (their MethodTable words read back as UTF-16 string data).
-This was root-caused this cycle: the fault is inside `DrainMarkStack` during
-`BackupTrace`; `LXR_NO_SWEEP=1` avoids it (no reclaim/reuse), the mark stack never
-overflows (`MarkStackDrops == 0`), and completed traces verify clean
-(`LXR_VERIFY_TRACE=1` → `offenders=0`) — so it is a **marking-completeness gap on
-large-array subtrees**, not a sweep or mark-stack bug. It is gated behind two
-diagnostics (`LXR_FAULT_DIAG`, `LXR_VERIFY_TRACE`) and does not affect the other
-workloads (console, web API, zero-alloc, GCPerfSim single/multi-thread, dotLLM
-inference all run the full unified collector cleanly). Fully closing it is scoped
-as prototype hardening; the benchmark harness tolerates it (each run is isolated,
-so only the LXR `growing-cache` cell is skipped).
+reaches tens of MB while millions of small value objects churn), an earlier
+build access-violated (~30% of runs) inside `DrainMarkStack`/`BackupTrace`: a
+live array's element slots read back as UTF-16 string data, i.e. still-referenced
+objects had been overwritten by fresh allocations.
+
+Root cause (fixed this cycle): the allocator's free list holds reclaimed regions
+of *any* size, including dead multi-MB large-object arrays (a `Dictionary` resize
+drops the old `Entry[]`). `ReuseChunk` popped such a region for a 128 KiB
+small-alloc request but left the registry entry's `Size` at the original
+multi-MB value. Only the first quantum was tracked/used, yet the later sweep
+`MEM_DECOMMIT`'d — and the next reuse `memset` + recommitted — the *entire*
+multi-MB span, clobbering live objects that had been carved into the same
+address range. It was **not** a marking-completeness gap: `LXR_VERIFY_TRACE`
+reported `offenders=0` and `MarkStackDrops == 0` precisely because the trace was
+correct; the corruption came from the allocator handing out live memory.
+
+The decisive experiments were `BENCH_PRESIZE` (pre-sizing the dictionary to
+avoid resize/large-array churn → clean at the same 4.2 GB size) and `LXR_NO_REUSE`
+(disable free-list recycling → clean), which together isolated the fault to
+large-chunk reuse. **Fix:** `ReuseChunk` now recycles a region on the small-alloc
+fast path only when its `Size == CONTEXT_ALLOC_QUANTUM`; reclaimed large-object
+regions stay decommitted (their committed footprint was already released by the
+sweep). Verified: the `growing-cache` workload (19.2 M entries, ~4.5 GB) now runs
+to `exit 0` with valid `##RESULT##` under pure-STW and under the full unified
+config (`LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_GC_THREADS=16`) across
+repeats. `LXR_NO_REUSE=1` remains available as a diagnostic knob.
 
 ---
 
