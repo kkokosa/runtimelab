@@ -470,6 +470,26 @@ pause — safe because that pause has completed marking (allocate-black included
 and hardening (finer parallel work-stealing, broader benchmark coverage), not new
 runtime dependencies.
 
+#### Known limitation — multi-GB continuously-mutating graphs (growing-cache)
+
+On a continuously-growing multi-GB object graph containing very large reference
+arrays (the `growing-cache` benchmark: a `Dictionary` whose backing `Entry[]`
+reaches tens of MB while millions of small value objects churn), the STW backup
+trace deterministically leaves a band of *still-referenced* value objects unmarked;
+the subsequent sweep therefore reclaims and reuses their region, and the **next**
+trace access-violates when it follows the live array's now-dangling element slots
+into the reused memory (their MethodTable words read back as UTF-16 string data).
+This was root-caused this cycle: the fault is inside `DrainMarkStack` during
+`BackupTrace`; `LXR_NO_SWEEP=1` avoids it (no reclaim/reuse), the mark stack never
+overflows (`MarkStackDrops == 0`), and completed traces verify clean
+(`LXR_VERIFY_TRACE=1` → `offenders=0`) — so it is a **marking-completeness gap on
+large-array subtrees**, not a sweep or mark-stack bug. It is gated behind two
+diagnostics (`LXR_FAULT_DIAG`, `LXR_VERIFY_TRACE`) and does not affect the other
+workloads (console, web API, zero-alloc, GCPerfSim single/multi-thread, dotLLM
+inference all run the full unified collector cleanly). Fully closing it is scoped
+as prototype hardening; the benchmark harness tolerates it (each run is isolated,
+so only the LXR `growing-cache` cell is skipped).
+
 ---
 
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,

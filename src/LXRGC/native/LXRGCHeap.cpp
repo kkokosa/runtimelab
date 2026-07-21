@@ -25,6 +25,33 @@ LXRCounters g_lxrCounters = {};
 LXRGCHeap* g_lxrGCHeap = nullptr;
 LXRCollector g_lxrCollector;
 
+// Diagnostic VEH (enabled via LXR_FAULT_DIAG=1): on an access violation, dump
+// the faulting instruction pointer + accessed address + whether that address is
+// committed, so we can localize the dangling-reference crash.
+static LONG CALLBACK LXRFaultDiag(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        void* accessed = (void*)ep->ExceptionRecord->ExceptionInformation[1];
+        void* rip = (void*)ep->ContextRecord->Rip;
+        HMODULE mod = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)rip, &mod);
+        wchar_t modName[MAX_PATH] = L"?";
+        if (mod) GetModuleFileNameW(mod, modName, MAX_PATH);
+        MEMORY_BASIC_INFORMATION mbi = {};
+        VirtualQuery(accessed, &mbi, sizeof(mbi));
+        const char* state = (mbi.State == MEM_COMMIT) ? "COMMIT" :
+                            (mbi.State == MEM_RESERVE) ? "RESERVE" : "FREE";
+        fprintf(stderr, "LXRGC: !!! AV accessing %p rip=%p (rip-off=+0x%llx in %ls) accessed-state=%s\n",
+                accessed, rip, mod ? (unsigned long long)((uint8_t*)rip - (uint8_t*)mod) : 0ull,
+                modName, state);
+        fflush(stderr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // One large reservation; blocks are carved out of it. Smaller than ZeroGC's
 // 64 GiB because LXR also reserves an RC side table proportional to heap size.
 static const size_t HEAP_RESERVE_SIZE = (size_t)16 << 30;   // 16 GiB
@@ -352,6 +379,7 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     if (getenv("LXR_SATB") != nullptr)   g_satbActive = 1;
     if (getenv("LXR_REMSET") != nullptr) g_remsetActive = 1;
     if (getenv("LXR_EVAC") != nullptr)   g_evacActive = 1;
+    if (getenv("LXR_FAULT_DIAG") != nullptr) AddVectoredExceptionHandler(1, &LXRFaultDiag);
     // P4: run the backup trace concurrently with the mutators (two brief STW
     // pauses + off-pause marking). The SATB window is opened per-trace, so
     // g_satbActive is NOT forced on here.
@@ -619,6 +647,80 @@ bool LXRCollector::MarkObject(Object* obj)
     return (prev & bit) == 0;
 }
 
+bool LXRCollector::AnyMarkedInRange(uint8_t* start, uint8_t* end) const
+{
+    if (start < m_heapBase) start = m_heapBase;
+    if (end <= start) return false;
+    size_t gStart = (size_t)(start - m_heapBase) / lxr::kObjectGranule;
+    size_t gEnd   = (size_t)(end - m_heapBase + lxr::kObjectGranule - 1) / lxr::kObjectGranule;
+    size_t maxGranule = m_markCommittedBytes * 8;
+    if (gEnd > maxGranule) gEnd = maxGranule;
+    for (size_t byteIdx = gStart >> 3; byteIdx < ((gEnd + 7) >> 3); byteIdx++)
+    {
+        uint8_t bits = m_markTable[byteIdx];
+        if (bits == 0) continue;
+        for (int b = 0; b < 8; b++)
+        {
+            size_t g = (byteIdx << 3) + (size_t)b;
+            if (g < gStart || g >= gEnd) continue;
+            if (bits & (1u << b)) return true;
+        }
+    }
+    return false;
+}
+
+// Diagnostic (LXR_VERIFY_TRACE=1): after marking, walk the whole heap and, for
+// every MARKED object, check that each of its in-heap referents is ALSO marked.
+// A marked object pointing at an unmarked in-heap object is a trace-completeness
+// bug: that referent will be swept/reused while still reachable, dangling the
+// pointer. Prints the first offenders (parent + child metadata) so we can
+// identify which object shape the field enumeration is missing.
+void LXRCollector::VerifyTraceComplete()
+{
+    EnterCriticalSection(&g_chunkLock);
+    int reported = 0;
+    int64_t offenders = 0;
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < end)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            if (IsMarked(o))
+            {
+                MethodTable* pmt = o->GetGCSafeMethodTable();
+                GCScanObjectRefs(o, sz, [this, o, pmt, &reported, &offenders](Object** ref)
+                {
+                    Object* child = *ref;
+                    if (child != nullptr && InHeap(child) && !IsMarked(child))
+                    {
+                        offenders++;
+                        if (reported < 12)
+                        {
+                            reported++;
+                            fprintf(stderr,
+                                "LXRGC: [verify] MARKED parent %p mt=%p base=%u comp=%d -> UNMARKED child %p (fieldoff=%lld)\n",
+                                (void*)o, (void*)pmt, (unsigned)pmt->GetBaseSize(),
+                                pmt->HasComponentSize() ? 1 : 0, (void*)child,
+                                (long long)((uint8_t*)ref - (uint8_t*)o));
+                        }
+                    }
+                });
+            }
+            p += sz;
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    fprintf(stderr, "LXRGC: [verify] trace-completeness offenders=%lld markStackDrops=%lld\n",
+            (long long)offenders, (long long)g_lxrCounters.MarkStackDrops);
+    fflush(stderr);
+}
+
 void LXRCollector::ResetMarks()
 {
     // Commit and zero exactly the mark-table prefix that covers the heap used so
@@ -652,7 +754,10 @@ void LXRCollector::PushMark(Object* obj)
         size_t newCap = g_markCap ? g_markCap * 2 : 4096;
         Object** grown = (Object**)realloc(g_markStack, newCap * sizeof(Object*));
         if (grown == nullptr)
+        {
+            InterlockedIncrement64(&g_lxrCounters.MarkStackDrops);
             return; // best-effort; a dropped push only risks over-retention via re-scan
+        }
         g_markStack = grown;
         g_markCap = newCap;
     }
@@ -661,11 +766,42 @@ void LXRCollector::PushMark(Object* obj)
 
 void LXRCollector::DrainMarkStack()
 {
+    int verify = (getenv("LXR_VERIFY_TRACE") != nullptr) ? 1 : 0;
     while (g_markTop > 0)
     {
         Object* o = g_markStack[--g_markTop];
-        GCScanObjectRefs(o, LXRObjectSize(o), [this](Object** ref)
+        if (verify)
         {
+            uintptr_t pm = (*(uintptr_t*)o) & ~(uintptr_t)7;
+            if (pm == 0 || (pm & 7) || pm < 0x10000ull || pm > 0x00007FFFFFFFFFFFull)
+            {
+                fprintf(stderr, "LXRGC: [verify] SCAN bad object %p mt=%p (skipped)\n",
+                        (void*)o, (void*)pm);
+                fflush(stderr);
+                continue; // don't dereference garbage MT
+            }
+        }
+        GCScanObjectRefs(o, LXRObjectSize(o), [this, o, verify](Object** ref)
+        {
+            Object* child = *ref;
+            if (verify && child != nullptr && InHeap(child))
+            {
+                uintptr_t cm = (*(uintptr_t*)child) & ~(uintptr_t)7;
+                if (cm == 0 || (cm & 7) || cm < 0x10000ull || cm > 0x00007FFFFFFFFFFFull)
+                {
+                    MethodTable* pmt = o->GetGCSafeMethodTable();
+                    size_t ncomp = pmt->HasComponentSize() ? (size_t)((ArrayBase*)o)->GetNumComponents() : 0;
+                    fprintf(stderr,
+                        "LXRGC: [verify] PARENT %p mt=%p base=%u compsz=%u ncomp=%llu size=%llu fieldoff=%lld -> BAD child %p mt=%p marked=%d\n",
+                        (void*)o, (void*)pmt, (unsigned)pmt->GetBaseSize(),
+                        (unsigned)pmt->RawGetComponentSize(), (unsigned long long)ncomp,
+                        (unsigned long long)LXRObjectSize(o),
+                        (long long)((uint8_t*)ref - (uint8_t*)o),
+                        (void*)child, (void*)cm, IsMarked(child) ? 1 : 0);
+                    fflush(stderr);
+                    return; // don't push garbage
+                }
+            }
             PushMark(*ref);
         });
     }
@@ -853,6 +989,9 @@ void LXRCollector::BackupTrace()
 
     // 3. Transitive closure over reachable objects.
     DrainClosure();
+
+    if (getenv("LXR_VERIFY_TRACE") != nullptr)
+        VerifyTraceComplete();
 }
 
 // --- Concurrent SATB backup trace (P4) -------------------------------------
@@ -997,16 +1136,16 @@ void LXRCollector::SweepAndSelectDefrag()
         if (!c.Committed || c.Owner != nullptr)
             continue; // uncommitted, or an active (still-allocating) region
 
-        bool anyLive = false;
-        uint8_t* p = c.Start;
-        while (p < c.UsedEnd)
-        {
-            Object* o = (Object*)p;
-            size_t sz = LXRObjectSize(o);
-            if (sz == 0) { anyLive = true; break; } // parse failure -> keep it
-            if (IsMarked(o)) { anyLive = true; break; }
-            p += sz;
-        }
+        // Region liveness via the mark bits directly (parse-independent). The
+        // old linear object walk depended on LXRObjectSize correctly parsing
+        // EVERY object from the region start; one misparse desynced the cursor
+        // and could step over a marked (live) object, wrongly reclaiming and
+        // reusing a live region - producing a dangling reference and a later
+        // access violation in the next trace (seen on multi-GB continuously-
+        // mutating graphs, e.g. the growing-cache workload). Mark bits are set
+        // only at granule-aligned live-object starts, so "any mark bit set in
+        // [Start,UsedEnd)" is an exact liveness test with no parsing.
+        bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd);
         if (anyLive)
             continue;
 

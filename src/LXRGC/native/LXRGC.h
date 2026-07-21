@@ -163,6 +163,8 @@ struct LXRCounters
     volatile int64_t ConcSnapshotMicros;    // cumulative STW snapshot-pause time (us)
     volatile int64_t ConcFinishMicros;      // cumulative STW finish-pause time (us)
     volatile int64_t ConcDrainMicros;       // cumulative concurrent (non-pause) drain time (us)
+
+    volatile int64_t MarkStackDrops;        // mark-stack pushes lost to allocation failure (0 == complete)
 };
 extern LXRCounters g_lxrCounters;
 
@@ -272,6 +274,10 @@ public:
     // cycles pure RC leaks) and the mechanism that actually returns memory.
     bool MarkObject(Object* obj);       // sets the mark bit; true if newly marked
     bool IsMarked(Object* obj) const;
+    // True if any mark bit is set at a granule-aligned start within [start,end).
+    // Parse-independent region liveness for the sweep (see SweepAndSelectDefrag).
+    bool AnyMarkedInRange(uint8_t* start, uint8_t* end) const;
+    void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
     void ResetMarks();                  // decommits the mark side-table (all bits -> 0)
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs

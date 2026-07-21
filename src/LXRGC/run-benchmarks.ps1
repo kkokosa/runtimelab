@@ -204,7 +204,7 @@ $allScenarios = @(
 $gcModeDefs = @(
     [pscustomobject]@{ Id = "workstation"; DisplayName = "Workstation GC"; Env = @{ DOTNET_gcServer = "0" }; RemoveEnv = @("DOTNET_GCName") },
     [pscustomobject]@{ Id = "server";      DisplayName = "Server GC";      Env = @{ DOTNET_gcServer = "1" }; RemoveEnv = @("DOTNET_GCName") },
-    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC";         Env = @{ DOTNET_GCName = "LXRGC.dll" }; RemoveEnv = @("DOTNET_gcServer") }
+    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_GC_THREADS = "16" }; RemoveEnv = @("DOTNET_gcServer") }
 )
 
 $scenarioMap = @{}
