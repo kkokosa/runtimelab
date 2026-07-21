@@ -961,6 +961,39 @@ void LXRCollector::DrainClosure()
         DrainMarkStack();
 }
 
+// Linear-parse [start,usedEnd) for the object containing `interior`. The walk
+// can desync (a suspended mid-allocation slot, or a wrong size from a
+// momentarily-inconsistent MethodTable) and step `p` onto an unmapped page; the
+// `*p` dereference then faults BEFORE LXRObjectSize's sentinel can reject it.
+// Guard the walk with SEH so such a fault is treated as "no object here"
+// (return nullptr) instead of crashing the GC. This is sound: an unmapped/RESERVE
+// page cannot hold a live object, so the interior simply does not resolve in this
+// region. No C++ objects with destructors may live in this frame (SEH rule) —
+// only POD locals are used.
+static Object* ParseContainingObjectGuarded(uint8_t* start, uint8_t* usedEnd, uint8_t* interior)
+{
+    __try
+    {
+        uint8_t* p = start;
+        while (p < usedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0)
+                break;
+            if (interior >= p && interior < p + sz)
+                return o;
+            p += sz;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        // Parse walked into unmapped memory: the region layout is inconsistent
+        // for this interior pointer; resolve it as "not found" rather than crash.
+    }
+    return nullptr;
+}
+
 // Resolve an interior pointer to the object that contains it by parsing the
 // enclosing allocation region. Returns nullptr if it cannot be resolved (the
 // caller then keeps the region conservatively live).
@@ -990,18 +1023,7 @@ Object* LXRCollector::ResolveInterior(uint8_t* interior)
     if (!found)
         return nullptr;
 
-    uint8_t* p = region.Start;
-    while (p < region.UsedEnd)
-    {
-        Object* o = (Object*)p;
-        size_t sz = LXRObjectSize(o);
-        if (sz == 0)
-            break;
-        if (interior >= p && interior < p + sz)
-            return o;
-        p += sz;
-    }
-    return nullptr;
+    return ParseContainingObjectGuarded(region.Start, region.UsedEnd, interior);
 }
 
 void LXRCollector::ProcessModifiedBuffers()

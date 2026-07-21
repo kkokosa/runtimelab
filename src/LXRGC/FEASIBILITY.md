@@ -515,9 +515,10 @@ intermittently hung mid-run.
 #### Soundness status under the real WebApi workload (evidence-based)
 
 Extensive stress testing (`samples/WebApi`, 120 s Kestrel+JSON load, many repeats,
-faults captured with `cdb` + `LXR_FAULT_DIAG`) shows the collector is **not sound
-under a realistic workload in any configuration**. Four distinct, independent
-defects, in increasing order of how fundamental they are:
+faults captured with `cdb` + `LXR_FAULT_DIAG`) surfaced **four distinct,
+independent defects**. The base (defect 4) is now **fixed and verified sound**;
+the three advanced features (defects 1–3) remain gated off. In increasing order of
+how fundamental they are:
 
 1. **Parallel mark is unstable (P5).** `LXR_GC_THREADS=16` hangs in `SuspendEE`
    and occasionally mark-races to a crash — *even in the pure-STW path*
@@ -552,27 +553,40 @@ defects, in increasing order of how fundamental they are:
    a moved object (matched only at object-start in the `forwarding` map) is not
    updated → dangling. Correct moving-GC fix-up must forward interior pointers too.
 
-4. **Even non-moving STW sweep-only is unsound (base).** The simplest config
-   (`LXR_CONCURRENT=0 LXR_EVAC=0 LXR_GC_THREADS=1`) still AVs ~1/5, and the fault
-   handler catches it **inside the GC**: `LXRCollector::ResolveInterior+0x82`
+4. **Non-moving STW sweep-only base AV — FIXED this cycle.** The simplest config
+   (`LXR_CONCURRENT=0 LXR_EVAC=0 LXR_GC_THREADS=1`) previously AV'd ~1/5, with the
+   fault handler catching it **inside the GC**: `LXRCollector::ResolveInterior+0x82`
    dereferencing memory in state `RESERVE` (decommitted). `ResolveInterior` maps a
-   `GC_CALL_INTERIOR` root (again, runtime-async byrefs) to its base object by
-   linear-parsing the containing chunk with `LXRObjectSize`; a parse desync (or a
-   chunk whose pages the sweep decommitted while its `Committed` flag stayed set)
-   makes it either fail to resolve — so the object is not marked and gets swept
-   while a live byref still points at it — or read the decommitted region directly.
-   This is the deepest issue: **safe, complete handling of managed interior
-   pointers** (byrefs), which .NET runtime-async exercises heavily.
+   `GC_CALL_INTERIOR` root (runtime-async byrefs) to its base object by
+   linear-parsing the containing chunk with `LXRObjectSize`; a parse **desync** (a
+   mutator suspended mid fast-path allocation leaves a partially-initialized slot,
+   or a momentarily-inconsistent `MethodTable` yields a wrong size) steps the walk
+   pointer onto an unmapped page, and the `*p` MethodTable read faults **before**
+   `LXRObjectSize`'s sentinel can reject it. **Fix:** the linear parse now runs
+   inside an SEH `__try/__except` guard (`ParseContainingObjectGuarded`): a fault
+   during the walk is treated as "no object resolves here" (return `nullptr`) rather
+   than crashing the GC. This is sound — an unmapped/`RESERVE` page cannot hold a
+   live object, and the guard can never return a *wrong* object. **Verified:**
+   10/10 clean 120 s WebApi runs in exactly the config that previously AV'd ~1/5
+   (`av=0 hang=0`). The **non-moving serial config is now sound** under the real
+   workload and is a legitimate (single-threaded, non-moving) LXR-reclamation GC:
+   coalescing RC + STW cyclic backup trace + Immix line/block sweep with real
+   decommit.
 
-**Conclusion.** Defects 2 and 4 (and to a large extent 3) come down to the same
-theme the project flagged from the start as the likely "stop and inform" boundary:
-a standalone RC/SATB/moving GC needs the runtime to (a) surface the **old value on
-*all* ref stores** and (b) let it **completely and safely enumerate interior
-pointers**. The current single-slot pluggable barrier and the ad-hoc
-`ResolveInterior` heap-parse are not sufficient under a demanding, interior-pointer-
-heavy workload. **No configuration is currently valid to benchmark.** The
-Phase-2 STW reclamation demo remained clean only because the ConsoleApp workload
-had no bulk ref copies, no runtime-async byrefs, and no pinned-pool churn.
+**Conclusion.** With defect 4 fixed, the **serial non-moving STW config is sound**
+under the real WebApi workload and is the first benchmarkable LXR configuration.
+The three remaining defects (1 parallel mark, 2 concurrent SATB, 3 evacuation) all
+converge on the theme the project flagged from the start as the likely "stop and
+inform" boundary: enabling *parallelism, concurrency, or copying* on top of the
+sound base needs the runtime to (a) surface the **old value on *all* ref stores**
+(defect 2 — a runtime-fork write-barrier completion) and (b) let the GC
+**completely and safely enumerate/forward interior pointers** while moving
+(defect 3), plus a **runtime-registered GC worker pool** for stable parallel mark
+(defect 1). Those are the remaining runtime-cooperation items to raise before
+turning the advanced features on. The Phase-2 STW reclamation demo stayed clean on
+ConsoleApp because that workload had no bulk ref copies, no runtime-async byrefs,
+and no pinned-pool churn; the sweep-only base now holds under a workload that has
+all three.
 
 
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
