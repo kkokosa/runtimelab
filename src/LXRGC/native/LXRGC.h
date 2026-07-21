@@ -285,6 +285,10 @@ public:
     void ParallelDrainMarkStack(int workers); // P5: parallel transitive closure
     void DrainClosure();                // parallel or serial closure per LXR_GC_THREADS
     Object* ResolveInterior(uint8_t* interior); // interior pointer -> containing object
+    // Conservative fallback when an in-heap interior/byref root cannot be
+    // resolved to its base object: keep the containing region alive this cycle so
+    // a live-byref object is never swept. Returns true if a keep-alive bit was set.
+    bool ConservativelyKeepAliveInterior(uint8_t* interior);
 
     int64_t ReclaimedBytes() const { return m_reclaimedBytes; }
 

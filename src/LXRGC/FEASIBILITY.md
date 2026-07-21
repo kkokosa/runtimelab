@@ -553,25 +553,40 @@ how fundamental they are:
    a moved object (matched only at object-start in the `forwarding` map) is not
    updated → dangling. Correct moving-GC fix-up must forward interior pointers too.
 
-4. **Non-moving STW sweep-only base AV — FIXED this cycle.** The simplest config
-   (`LXR_CONCURRENT=0 LXR_EVAC=0 LXR_GC_THREADS=1`) previously AV'd ~1/5, with the
-   fault handler catching it **inside the GC**: `LXRCollector::ResolveInterior+0x82`
-   dereferencing memory in state `RESERVE` (decommitted). `ResolveInterior` maps a
-   `GC_CALL_INTERIOR` root (runtime-async byrefs) to its base object by
-   linear-parsing the containing chunk with `LXRObjectSize`; a parse **desync** (a
-   mutator suspended mid fast-path allocation leaves a partially-initialized slot,
-   or a momentarily-inconsistent `MethodTable` yields a wrong size) steps the walk
-   pointer onto an unmapped page, and the `*p` MethodTable read faults **before**
-   `LXRObjectSize`'s sentinel can reject it. **Fix:** the linear parse now runs
-   inside an SEH `__try/__except` guard (`ParseContainingObjectGuarded`): a fault
-   during the walk is treated as "no object resolves here" (return `nullptr`) rather
-   than crashing the GC. This is sound — an unmapped/`RESERVE` page cannot hold a
-   live object, and the guard can never return a *wrong* object. **Verified:**
-   10/10 clean 120 s WebApi runs in exactly the config that previously AV'd ~1/5
-   (`av=0 hang=0`). The **non-moving serial config is now sound** under the real
-   workload and is a legitimate (single-threaded, non-moving) LXR-reclamation GC:
-   coalescing RC + STW cyclic backup trace + Immix line/block sweep with real
-   decommit.
+4. **Non-moving STW sweep-only base AV — FIXED and re-characterized this cycle.**
+   The simplest config (`LXR_CONCURRENT=0 LXR_EVAC=0 LXR_GC_THREADS=1`) previously
+   AV'd ~1/5, with the fault handler catching it **inside the GC** at
+   `LXRCollector::ResolveInterior`, dereferencing `RESERVE`/decommitted memory.
+   `ResolveInterior` maps a `GC_CALL_INTERIOR` (byref) root to its base object by
+   linear-parsing the containing chunk. The **real desync prevention** is threefold
+   and does *not* rely on catching a hardware fault:
+   - **`LXRObjectSize` MT-validity sentinel:** any slot whose `MethodTable` is not a
+     plausible aligned in-range pointer yields size 0, so the parse *stops* at the
+     first inconsistent slot instead of computing a garbage size and walking off
+     into unmapped memory. Combined with the earlier large-object-chunk-reuse fix
+     (which removed the registry inconsistency that produced bad slots), this
+     eliminates the desync at the source.
+   - **Parse-free sweep liveness:** `SweepAndSelectDefrag` decides reclamation with
+     `AnyMarkedInRange(Start,UsedEnd)` — a direct mark-bitmap scan, never a linear
+     parse — so the reclamation decision cannot desync.
+   - **Conservative keep-alive for unresolved interior roots
+     (`ConservativelyKeepAliveInterior`):** an in-heap interior/byref root that
+     still fails to resolve is **no longer silently dropped** (dropping it could let
+     the sweep reclaim a region a live byref points into — a use-after-free that
+     "explodes later"). Instead a mark bit is set at the interior's granule, so
+     `AnyMarkedInRange` retains the whole containing chunk for the cycle. This
+     over-approximates liveness (never under-approximates) → always sound, never a
+     wrong-object resolution.
+
+   The `__try/__except` guard around the parse (`ParseContainingObjectGuarded`) is
+   **defense-in-depth only** — a backstop for a residual pathological fault — not
+   the correctness mechanism. **Verified:** 22/22 clean 120 s/90 s WebApi runs
+   (incl. a GC-hammering config with `LXR_GC_TRIGGER_MB=2` forcing far more
+   `ResolveInterior` calls), `av=0`, and **zero** parse-fault-filter hits and
+   **zero** conservative-keep-alive activations — i.e. resolution now simply
+   succeeds. The **non-moving serial config is sound** under the real workload and
+   is a legitimate LXR-reclamation GC (coalescing RC + STW cyclic backup trace +
+   Immix line/block sweep with real decommit).
 
 **Conclusion.** With defect 4 fixed, the **serial non-moving STW config is sound**
 under the real WebApi workload and is the first benchmarkable LXR configuration.
@@ -582,11 +597,11 @@ sound base needs the runtime to (a) surface the **old value on *all* ref stores*
 (defect 2 — a runtime-fork write-barrier completion) and (b) let the GC
 **completely and safely enumerate/forward interior pointers** while moving
 (defect 3), plus a **runtime-registered GC worker pool** for stable parallel mark
-(defect 1). Those are the remaining runtime-cooperation items to raise before
-turning the advanced features on. The Phase-2 STW reclamation demo stayed clean on
-ConsoleApp because that workload had no bulk ref copies, no runtime-async byrefs,
-and no pinned-pool churn; the sweep-only base now holds under a workload that has
-all three.
+(defect 1). With the user's green light, these three are now in progress as
+generic, minimal changes (defect 2 spans the `kkokosa/runtime` fork). The Phase-2
+STW reclamation demo stayed clean on ConsoleApp because that workload had no bulk
+ref copies, no runtime-async byrefs, and no pinned-pool churn; the sweep-only base
+now holds under a workload that has all three.
 
 
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)

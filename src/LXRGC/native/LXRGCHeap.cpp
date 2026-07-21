@@ -961,22 +961,52 @@ void LXRCollector::DrainClosure()
         DrainMarkStack();
 }
 
+// Diagnostic filter: on a fault during the linear parse, dump the region bounds,
+// the walk pointer, and the committed-state of the faulting page vs. UsedEnd so
+// we can tell a stale-`Committed` decommit (UsedEnd beyond committed) apart from
+// an in-committed parse desync. Enabled via LXR_FAULT_DIAG. Returns
+// EXCEPTION_EXECUTE_HANDLER so the caller's __except still runs.
+static LONG LXRParseFaultFilter(EXCEPTION_POINTERS* ep, uint8_t* start, uint8_t* usedEnd,
+                                uint8_t* p, uint8_t* interior)
+{
+    static int diag = -1;
+    if (diag < 0) diag = (getenv("LXR_FAULT_DIAG") != nullptr) ? 1 : 0;
+    if (diag && ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        void* accessed = (void*)ep->ExceptionRecord->ExceptionInformation[1];
+        auto qstate = [](void* a) -> const char* {
+            MEMORY_BASIC_INFORMATION mbi = {};
+            VirtualQuery(a, &mbi, sizeof(mbi));
+            return (mbi.State == MEM_COMMIT) ? "COMMIT" : (mbi.State == MEM_RESERVE) ? "RESERVE" : "FREE";
+        };
+        fprintf(stderr,
+            "LXRGC: [ResolveInterior fault] interior=%p region=[%p,%p) walk_p=%p accessed=%p "
+            "accessed-state=%s usedEnd-1-state=%s p-state=%s p_off_from_start=%lld region_len=%lld\n",
+            interior, start, usedEnd, p, accessed,
+            qstate(accessed), qstate(usedEnd - 1), qstate(p),
+            (long long)(p - start), (long long)(usedEnd - start));
+        fflush(stderr);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // Linear-parse [start,usedEnd) for the object containing `interior`. The walk
 // can desync (a suspended mid-allocation slot, or a wrong size from a
 // momentarily-inconsistent MethodTable) and step `p` onto an unmapped page; the
 // `*p` dereference then faults BEFORE LXRObjectSize's sentinel can reject it.
-// Guard the walk with SEH so such a fault is treated as "no object here"
-// (return nullptr) instead of crashing the GC. This is sound: an unmapped/RESERVE
-// page cannot hold a live object, so the interior simply does not resolve in this
-// region. No C++ objects with destructors may live in this frame (SEH rule) —
-// only POD locals are used.
+// Guard the walk with SEH so such a fault is treated as "not resolved here"
+// instead of crashing the GC. `p` is volatile so the fault filter observes the
+// walk pointer's value at the faulting iteration. No C++ objects with destructors
+// may live in this frame (SEH rule) — only POD locals are used.
 static Object* ParseContainingObjectGuarded(uint8_t* start, uint8_t* usedEnd, uint8_t* interior)
 {
+    volatile uint8_t* vp = start;
     __try
     {
         uint8_t* p = start;
         while (p < usedEnd)
         {
+            vp = p;
             Object* o = (Object*)p;
             size_t sz = LXRObjectSize(o);
             if (sz == 0)
@@ -986,7 +1016,7 @@ static Object* ParseContainingObjectGuarded(uint8_t* start, uint8_t* usedEnd, ui
             p += sz;
         }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (LXRParseFaultFilter(GetExceptionInformation(), start, usedEnd, (uint8_t*)vp, interior))
     {
         // Parse walked into unmapped memory: the region layout is inconsistent
         // for this interior pointer; resolve it as "not found" rather than crash.
@@ -1026,6 +1056,37 @@ Object* LXRCollector::ResolveInterior(uint8_t* interior)
     return ParseContainingObjectGuarded(region.Start, region.UsedEnd, interior);
 }
 
+// Count of interior roots that could not be resolved and were handled by the
+// conservative keep-alive fallback (0 under all validated sweep-only runs).
+static volatile int64_t g_unresolvedInteriorRoots = 0;
+
+// Conservative fallback: an in-heap interior/byref root did not resolve to a base
+// object (e.g. a transient chunk-registry inconsistency). Rather than DROP the
+// root — which would let the sweep reclaim a region a live byref still points
+// into (a use-after-free that "explodes later") — set a mark bit at the
+// interior's own granule. The sweep's AnyMarkedInRange(Start,UsedEnd) test then
+// retains the whole containing chunk for this cycle. This over-approximates
+// liveness (never under-approximates), so it is always sound; it is never a
+// wrong-object resolution. The stray bit is not at an object start, so
+// object-start mark walks (evac, verify) never mis-read it as a live object.
+bool LXRCollector::ConservativelyKeepAliveInterior(uint8_t* interior)
+{
+    if (interior < m_heapBase || interior >= m_heapBase + m_heapBytes)
+        return false;
+    size_t granule = (size_t)(interior - m_heapBase) / lxr::kObjectGranule;
+    size_t byteIdx = granule >> 3;
+    if (byteIdx >= m_markCommittedBytes)
+        return false;
+    _InterlockedOr8((volatile char*)&m_markTable[byteIdx], (char)(1u << (granule & 7)));
+    int64_t n = InterlockedIncrement64(&g_unresolvedInteriorRoots);
+    static int diag = -1;
+    if (diag < 0) diag = (getenv("LXR_FAULT_DIAG") != nullptr) ? 1 : 0;
+    if (diag && n <= 16)
+        fprintf(stderr, "LXRGC: [interior] unresolved in-heap interior root %p -> region kept alive conservatively (total=%lld)\n",
+                (void*)interior, (long long)n);
+    return true;
+}
+
 void LXRCollector::ProcessModifiedBuffers()
 {
     // Coalescing reference counting (Levanoni-Petrank): for every logged
@@ -1060,8 +1121,8 @@ static void LXRMarkHandleRef(Object** ref, void* /*ctx*/)
 
 // promote_func for GcScanRoots: mark a stack/static/finalizer root. Interior
 // pointers are resolved to their containing object so nothing reachable is
-// missed; unresolvable interior roots are ignored (their region stays live via
-// any precise root, or is simply not reclaimed this cycle).
+// missed. An in-heap interior root that cannot be resolved is NOT dropped: its
+// containing region is kept alive conservatively so a live byref never dangles.
 static void LXRPromoteRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
 {
     Object* o = *ppObj;
@@ -1069,9 +1130,13 @@ static void LXRPromoteRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t f
         return;
     if (flags & GC_CALL_INTERIOR)
     {
-        o = g_lxrCollector.ResolveInterior((uint8_t*)o);
+        uint8_t* interior = (uint8_t*)o;
+        o = g_lxrCollector.ResolveInterior(interior);
         if (o == nullptr)
+        {
+            g_lxrCollector.ConservativelyKeepAliveInterior(interior);
             return;
+        }
     }
     g_lxrCollector.PushMark(o);
 }
