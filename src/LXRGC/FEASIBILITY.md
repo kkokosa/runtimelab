@@ -604,6 +604,75 @@ ref copies, no runtime-async byrefs, and no pinned-pool churn; the sweep-only ba
 now holds under a workload that has all three.
 
 
+#### Current status — defects 1/3 fixed, full-STW-LXR sound at scale; concurrency hits a runtime-async wall
+
+Following the green light to land generic, minimal runtime + GC changes for
+defects 1–3, the status of the four defects above is now:
+
+- **Defect 1 (parallel mark) — FIXED.** `ParallelDrainMarkStack` now uses a
+  **persistent worker pool** created once (instead of raw `std::thread` per drain).
+  The `SuspendEE` perturbation is gone: `LXR_GC_THREADS=16` in the pure-STW path
+  ran **8/8 clean** at 120 s WebApi load (was 2 hangs + 1 crash / 12).
+- **Defect 3 (evacuation interior fix-up) — FIXED.** `Evacuate` step 4 now sorts
+  the moved-object ranges and rebases **interior/byref** field values (binary
+  search on `movedRanges`, preserving offset) in addition to object-start
+  references; an interior *root* that fails to resolve during the pin pass skips
+  evacuation for that cycle rather than dangling. Serial STW evac: **11/11 clean**
+  (was ~1/11 NRE).
+- **Defect 2 (bulk write barrier) — runtime change LANDED (generic, minimal).**
+  A new **`write_barrier_bulk_callback`** was added to the standalone-GC ABI
+  (`gcinterface.h`, `WriteBarrierParameters`, minor version 9→10) and invoked from
+  the single convergence point of all bulk GC-ref moves,
+  `InlinedMemmoveGCRefsHelper` (`arraynative.inl`), **before** the copy overwrites
+  the destination — so `Array.Copy` / span / struct block-copies
+  (`CORINFO_HELP_BULK_WRITEBARRIER` → `Buffer.BulkMoveWithWriteBarrier`) now
+  surface their old+new referents. It is GC-agnostic: the runtime just hands the
+  GC `(dest, src, byteCount)`; LXR replays each slot through `LogModifiedField`.
+  Committed on `kkokosa/runtime@feature/pluggable-write-barrier` (85f97b668cf).
+- **Also fixed (helps STW evac + any trace):** interior/byref values pushed to the
+  mark stack are now resolved to their base object at pop time (a byref field's
+  `*ref` points into an object's interior; without resolution the target's
+  out-edges were never scanned → sweep → AV in `DispatchContinuations`); and
+  one-past-the-end byrefs (`ref array[array.Length]`) now resolve to the last
+  object instead of failing bounds.
+
+**Result: the full-STW-LXR configuration is sound at scale.** With RC + parallel
+mark (pool) + **STW copying evacuation** + backup trace + the bulk barrier + the
+interior fixes, `-GcThreads 16 -Concurrent 0 -Evac 1` ran **8/8 clean** at 120 s
+WebApi load. This is the paper-faithful shape for evacuation — LXR copies **only
+during stop-the-world pauses** (arXiv:2210.17175 §Design) — and is the first
+fully-featured benchmarkable LXR configuration.
+
+##### The remaining wall — concurrent SATB trace vs. .NET 11 runtime-async (stop-and-inform)
+
+Enabling the **concurrent** trace (`LXR_CONCURRENT=1`) still AVs intermittently,
+and the bulk barrier does **not** close it. Root cause, isolated this cycle: the
+crash reproduces with interior resolution succeeding (`unresolved=0`), always in
+`RuntimeAsyncTask.DispatchContinuations` / `PinnedBlockMemoryPool.Rent`. .NET 11
+**runtime-async** suspends an async method by spilling its live registers/locals —
+**including object refs and interior byrefs** — into a heap-allocated
+**continuation** object. Those spill stores bypass the JIT/pluggable write barrier
+(they are not lowered to `JIT_WriteBarrier` nor to the bulk helper), so LXR's SATB
+snapshot never logs them → the concurrent trace can miss a still-live
+continuation-referenced object → the sweep frees it → AV. STW configs are immune
+because `GcScanRoots` enumerates the **entire** stack root set at the safepoint,
+with zero dependence on the barrier.
+
+This is a genuine **runtime limit**, not a GC bug, and it is **not** closable by a
+generic, minimal ABI addition (unlike defect 2): it would require the runtime-async
+implementation to route its continuation-spill stores through the write barrier —
+a **targeted, non-generic change to a specific runtime subsystem**, exactly the
+"stop and inform" boundary flagged from the outset. The available options are:
+
+1. **Benchmark the sound full-STW-LXR** (RC + parallel-16 mark + STW evacuation +
+   backup trace + bulk barrier) — paper-faithful for copying, verified 8/8 clean.
+2. **Runtime-async barrier routing** — a targeted, non-generic runtime-fork change
+   so continuation spills log through the barrier; unblocks true concurrency but
+   crosses the stop-and-inform line.
+3. **`LXR_CONC_FINISH_FULLTRACE=1`** — a sound fallback that re-traces from roots
+   under STW at the concurrent finish pause (6/6 clean), but forfeits most of the
+   concurrency benefit (effectively "STW trace with extra steps").
+
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 
 On a continuously-growing multi-GB object graph containing very large reference
