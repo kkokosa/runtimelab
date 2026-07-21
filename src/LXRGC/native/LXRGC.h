@@ -154,6 +154,15 @@ struct LXRCounters
     volatile int64_t EvacBytesCopied;       // bytes relocated
     volatile int64_t EvacFieldsForwarded;   // heap references rewritten to moved targets
     volatile int64_t EvacPinnedSkipped;     // live objects left in place (root/handle-pinned)
+
+    // P4 concurrency: SATB backup trace whose transitive mark runs while the
+    // mutators execute, bracketed by two brief stop-the-world pauses.
+    volatile int64_t ConcurrentTraces;      // concurrent trace cycles run
+    volatile int64_t ConcMarkedObjects;     // objects marked during the concurrent drain
+    volatile int64_t ConcAllocBlack;        // objects retained by allocate-black (born mid-trace)
+    volatile int64_t ConcSnapshotMicros;    // cumulative STW snapshot-pause time (us)
+    volatile int64_t ConcFinishMicros;      // cumulative STW finish-pause time (us)
+    volatile int64_t ConcDrainMicros;       // cumulative concurrent (non-pause) drain time (us)
 };
 extern LXRCounters g_lxrCounters;
 
@@ -202,6 +211,22 @@ public:
     void SetSatbActive(bool active);
     bool IsSatbActive() const;
     void DrainSatbBuffers();
+
+    // --- Concurrent SATB backup trace (P4) ---
+    //
+    // The paper's backup trace marks concurrently with the mutators, bracketed by
+    // two brief stop-the-world pauses. ConcurrentTraceSnapshot (STW) resets the
+    // marks, opens the SATB window, seeds the mark stack from the roots and
+    // records a per-region allocation high-water so objects born mid-trace can be
+    // retained (allocate-black). ConcurrentTraceDrain runs OUTSIDE any pause,
+    // marking the transitive closure while mutators log deletions via the SATB
+    // barrier. ConcurrentTraceFinish (STW) consumes residual SATB, finishes the
+    // closure, and applies allocate-black. Correctness rests on the existing
+    // write-barrier old-value capture (no runtime read barrier is required).
+    void ConcurrentTraceSnapshot();
+    void ConcurrentTraceDrain();
+    void ConcurrentTraceFinish();
+    void ResetSatbBuffers(); // clear SATB buffers+cursors at end of a trace (STW)
 
     // --- Remembered sets: inter-block pointer slots (P2), for evacuation (P3) ---
     //

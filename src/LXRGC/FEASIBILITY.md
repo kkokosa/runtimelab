@@ -400,6 +400,47 @@ compacting fragmented blocks. No read barrier and no runtime change are needed
 because the copy happens entirely within the existing STW pause; concurrent copying
 (which *would* need a runtime forwarding/read-barrier hook) remains P4/future work.
 
+### P4 — concurrent SATB backup trace (done; no runtime change)
+
+The paper's backup trace runs *concurrently* with the mutators; ours was fully
+stop-the-world. LXRGC now performs the transitive mark off-pause, bracketed by two
+brief STW pauses (gated by `LXR_CONCURRENT=1`):
+
+1. **Snapshot pause (STW)** — replay the RC modified buffers, reset the mark
+   table, open the SATB deletion window, seed the mark stack from stacks / statics
+   / handles (`GcScanRoots` + handle scan, *without* draining), and record each
+   region's allocation high-water. Then RestartEE.
+2. **Concurrent drain (mutators running)** — the dedicated collector thread marks
+   the transitive closure (`DrainMarkStack`) while interleaving `DrainSatbBuffers`
+   to consume referents that mutators unlink mid-trace. The SATB (Yuasa
+   snapshot-at-the-beginning) invariant, carried by the existing write barrier's
+   *old-value* capture, guarantees no object live at the snapshot is missed even as
+   the graph mutates.
+3. **Finish pause (STW)** — drain residual SATB, finish the closure, then apply
+   **allocate-black**: every object born since the snapshot (at/above its region's
+   recorded high-water) is marked so the following sweep cannot free a live,
+   never-traced new object. Close the SATB window and sweep.
+
+Concurrency correctness needs **no runtime change and no read barrier**: SATB rides
+the pluggable write barrier we already have (§5), and `SuspendEE`/`RestartEE` plus a
+GC background thread (`IGCToCLR::CreateThread`) — all already exposed — suffice for
+the two safepoints. Supporting disciplines are all GC-internal: SATB buffers use a
+single-writer append cursor (`Count`) and a collector-only drain cursor (`Drained`)
+so mutators log lock-free while the collector marks concurrently; recursive RC
+frees never run during the window (memory stays stable for the marker); and block
+reuse is suppressed for the window so allocate-black region snapshots stay valid.
+Evacuation (P3) is not combined with a concurrent trace in the same cycle (an
+allocate-black object's fields are not scanned, so they cannot be forwarded) — the
+two remain independently gated. New counters: `ConcurrentTraces`, `ConcAllocBlack`,
+`ConcSnapshotMicros`, `ConcFinishMicros`, `ConcDrainMicros`. Verified: repeated and
+extended (15 s) runs mark off-pause, retain hundreds of mid-trace objects via
+allocate-black, reclaim memory, and exit cleanly with no access violation.
+
+This closes gap 1. The one remaining paper item is **parallelism / scale** (P5):
+running each phase across multiple GC threads and re-enabling the high-concurrency
+workloads. That too is GC-internal (thread-pool + work partitioning) with no
+foreseeable runtime dependency.
+
 ---
 
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,

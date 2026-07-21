@@ -89,7 +89,8 @@ struct SatbBuffer
 {
     static const size_t kCapacity = 4096;
     Object* Entries[kCapacity];
-    size_t Count = 0;
+    size_t Count = 0;     // written only by the owning mutator (append)
+    size_t Drained = 0;   // written only by the collector (mark cursor)
     SatbBuffer* NextRegistered = nullptr;
 };
 static thread_local SatbBuffer* t_satbBuffer = nullptr;
@@ -115,6 +116,17 @@ static RemsetBuffer* g_registeredRemsetBuffers = nullptr;
 static CRITICAL_SECTION g_remsetLock;
 static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation is enabled
 static volatile LONG g_evacActive = 0;   // STW evacuation gate (P3)
+
+// --- Concurrent SATB trace (P4) --------------------------------------------
+// While a concurrent trace window is open, block reuse is suppressed so region
+// indices/starts stay stable for the allocate-black snapshot, and any region
+// claimed sits above g_concWatermark. g_snapUsedEnd[i] records region i's fill
+// high-water at the snapshot pause; g_snapChunkCount is the region count then.
+static volatile LONG g_concurrentEnabled = 0; // env LXR_CONCURRENT: use concurrent backup trace
+static volatile LONG g_traceWindowOpen  = 0;  // a concurrent trace window is live
+static std::vector<uint8_t*>* g_snapUsedEnd = nullptr; // per-region snapshot high-water
+static size_t   g_snapChunkCount = 0;
+static uint8_t* g_concWatermark  = nullptr;   // heap high-water at snapshot
 
 // A tiny zero-count work list used by recursive decrements. In a full LXR
 // this is a bounded work packet processed incrementally; here it is a simple
@@ -261,6 +273,11 @@ static int RegisterChunk(uint8_t* start, size_t size, gc_alloc_context* owner)
 static uint8_t* ReuseChunk(gc_alloc_context* owner, int* outIndex)
 {
     uint8_t* start = nullptr;
+    // While a concurrent trace window is open, do not recycle freed regions:
+    // keeping region indices/starts stable lets the allocate-black snapshot match
+    // regions by index, and forces mid-trace allocations above g_concWatermark.
+    if (g_traceWindowOpen)
+        return nullptr;
     EnterCriticalSection(&g_chunkLock);
     while (g_freeChunkTop > 0)
     {
@@ -333,6 +350,10 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     if (getenv("LXR_SATB") != nullptr)   g_satbActive = 1;
     if (getenv("LXR_REMSET") != nullptr) g_remsetActive = 1;
     if (getenv("LXR_EVAC") != nullptr)   g_evacActive = 1;
+    // P4: run the backup trace concurrently with the mutators (two brief STW
+    // pauses + off-pause marking). The SATB window is opened per-trace, so
+    // g_satbActive is NOT forced on here.
+    if (getenv("LXR_CONCURRENT") != nullptr) g_concurrentEnabled = 1;
     return true;
 }
 
@@ -461,15 +482,18 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
 void LXRCollector::SetSatbActive(bool active) { InterlockedExchange(&g_satbActive, active ? 1 : 0); }
 bool LXRCollector::IsSatbActive() const { return g_satbActive != 0; }
 
-// Mark every SATB-logged referent (over-retention within a cycle is safe) and
-// empty the buffers. Called under STW today; drivable from a concurrent marker
-// in P4. Assumes the mark stack is being (or will be) drained by the caller.
+// Mark every not-yet-drained SATB-logged referent (over-retention within a cycle
+// is safe) and advance each buffer's drain cursor. Concurrency-safe: a mutator
+// only appends (writes Count); the collector only advances Drained. Both are
+// single-word, single-writer, so no mutator-side lock is needed. The final drain
+// under the STW finish pause guarantees no residual entry is missed.
 void LXRCollector::DrainSatbBuffers()
 {
     EnterCriticalSection(&g_satbLock);
     for (SatbBuffer* sb = g_registeredSatbBuffers; sb != nullptr; sb = sb->NextRegistered)
     {
-        for (size_t i = 0; i < sb->Count; i++)
+        size_t count = sb->Count; // snapshot the mutator's append cursor
+        for (size_t i = sb->Drained; i < count; i++)
         {
             Object* o = sb->Entries[i];
             if (o != nullptr)
@@ -478,7 +502,20 @@ void LXRCollector::DrainSatbBuffers()
                 InterlockedIncrement64(&g_lxrCounters.SatbMarks);
             }
         }
+        sb->Drained = count;
+    }
+    LeaveCriticalSection(&g_satbLock);
+}
+
+// Clear the SATB buffers and drain cursors at the end of a trace. Must be called
+// under STW (the finish pause) so no mutator is concurrently appending.
+void LXRCollector::ResetSatbBuffers()
+{
+    EnterCriticalSection(&g_satbLock);
+    for (SatbBuffer* sb = g_registeredSatbBuffers; sb != nullptr; sb = sb->NextRegistered)
+    {
         sb->Count = 0;
+        sb->Drained = 0;
     }
     LeaveCriticalSection(&g_satbLock);
 }
@@ -750,6 +787,133 @@ void LXRCollector::BackupTrace()
 
     // 3. Transitive closure over reachable objects.
     DrainMarkStack();
+}
+
+// --- Concurrent SATB backup trace (P4) -------------------------------------
+// Called under the STW *snapshot* pause. Resets marks, opens the SATB window,
+// seeds the mark stack from the roots/handles (without draining), and records a
+// per-region allocation high-water so objects born during the concurrent window
+// can be retained (allocate-black) at the finish pause.
+void LXRCollector::ConcurrentTraceSnapshot()
+{
+    if (g_theGCToCLR == nullptr)
+        return;
+    InterlockedIncrement64(&g_lxrCounters.BackupTraces);
+    InterlockedIncrement64(&g_lxrCounters.ConcurrentTraces);
+
+    g_markTop = 0;
+    ResetMarks();
+
+    // Open the SATB window BEFORE seeding roots so any mutator deletion that
+    // races the snapshot is captured (the mutators are suspended here, so this
+    // simply arms the barrier for after RestartEE).
+    ResetSatbBuffers();
+    SetSatbActive(true);
+
+    // Record the allocation high-water per region + overall, for allocate-black.
+    g_concWatermark = (g_lxrGCHeap != nullptr) ? g_lxrGCHeap->HeapHighWater()
+                                               : (m_heapBase + m_heapBytes);
+    if (g_snapUsedEnd == nullptr)
+        g_snapUsedEnd = new (std::nothrow) std::vector<uint8_t*>();
+    EnterCriticalSection(&g_chunkLock);
+    g_snapChunkCount = g_chunkCount;
+    if (g_snapUsedEnd != nullptr)
+    {
+        g_snapUsedEnd->clear();
+        g_snapUsedEnd->reserve(g_chunkCount);
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            uint8_t* used = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            g_snapUsedEnd->push_back(used);
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    // Suppress block reuse for the duration of the window (see ReuseChunk).
+    InterlockedExchange(&g_traceWindowOpen, 1);
+
+    // Seed the grey set from the roots/handles; do NOT drain here (that is the
+    // concurrent phase's job).
+    LXRGCHandleStore::ForEachLiveHandle(&LXRMarkHandleRef, nullptr);
+    ScanContext sc;
+    sc.promotion = true;
+    g_theGCToCLR->GcScanRoots(&LXRPromoteRoot, 2, 2, &sc);
+}
+
+// Runs OUTSIDE any pause: marks the transitive closure while the mutators run and
+// log deletions through the SATB barrier. Bounded, best-effort: the STW finish
+// pass is the correctness guarantee, so this only needs to offload the bulk.
+void LXRCollector::ConcurrentTraceDrain()
+{
+    // Interleave marking the grey set with consuming freshly-logged SATB
+    // deletions, until a full pass adds no new work or the iteration budget is
+    // hit. Only this (single) collector thread touches the mark stack.
+    const int kMaxRounds = 64;
+    for (int round = 0; round < kMaxRounds; round++)
+    {
+        size_t before = g_lxrCounters.SatbMarks;
+        DrainMarkStack();       // scan everything currently grey
+        DrainSatbBuffers();     // pull in deletions logged since last pass
+        DrainMarkStack();       // scan those too
+        bool moreSatb = (size_t)g_lxrCounters.SatbMarks != before;
+        if (g_markTop == 0 && !moreSatb)
+            break;              // quiescent (mutators may still trickle; finish mops up)
+        Sleep(0);               // yield so mutators make progress / accrue SATB work
+    }
+}
+
+// Called under the STW *finish* pause. Consumes residual SATB, finishes the
+// closure, then applies allocate-black: every object allocated since the
+// snapshot (at/above its region's snapshot high-water) is retained this cycle so
+// the following sweep cannot free a live, never-marked new object. Closes the
+// SATB window.
+void LXRCollector::ConcurrentTraceFinish()
+{
+    // Residual deletions logged between the last concurrent pass and the pause.
+    DrainSatbBuffers();
+    DrainMarkStack();
+
+    // Allocate-black: mark objects born during the window. Extend the mark table
+    // to cover new allocations, then for each committed region mark every object
+    // at/above the region's snapshot high-water (or all objects for regions that
+    // did not exist at snapshot time).
+    uint8_t* highWater = (g_lxrGCHeap != nullptr) ? g_lxrGCHeap->HeapHighWater()
+                                                  : (m_heapBase + m_heapBytes);
+    EnsureMarkCommitted(highWater);
+
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed)
+            continue;
+        uint8_t* floor = c.Start; // regions born mid-trace: everything is new
+        if (i < g_snapChunkCount && g_snapUsedEnd != nullptr && i < g_snapUsedEnd->size())
+            floor = (*g_snapUsedEnd)[i];
+        uint8_t* usedEnd = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < usedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0)
+                break;
+            if (p >= floor)
+            {
+                if (MarkObject(o))
+                    InterlockedIncrement64(&g_lxrCounters.ConcAllocBlack);
+            }
+            p += sz;
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    // Close the window: stop logging deletions, allow block reuse again, clear
+    // the SATB buffers for the next cycle (safe: still STW here).
+    SetSatbActive(false);
+    InterlockedExchange(&g_traceWindowOpen, 0);
+    ResetSatbBuffers();
 }
 
 void LXRCollector::SweepAndSelectDefrag()
@@ -1474,50 +1638,107 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
 
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-
-    bool suspended = false;
-    if (g_theGCToCLR != nullptr)
-    {
-        g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
-        suspended = true;
-    }
     bool verbose = getenv("LXR_VERBOSE") != nullptr;
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] phase=%s suspended=%d\n",
-                           phase == LXRPhase::TracePause ? "trace" : "rc", (int)suspended); fflush(stderr); }
 
     bool doBuffers = getenv("LXR_NO_BUFFERS") == nullptr;
     bool doTrace   = getenv("LXR_NO_TRACE")   == nullptr;
     bool doSweep   = getenv("LXR_NO_SWEEP")   == nullptr;
 
-    if (doBuffers)
-    {
-        g_lxrCollector.ProcessModifiedBuffers();
-        if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done\n"); fflush(stderr); }
-    }
-    if (phase == LXRPhase::TracePause)
-    {
-        if (doTrace)
-        {
-            g_lxrCollector.BackupTrace();
-            if (verbose) { fprintf(stderr, "LXRGC: [stage] BackupTrace done\n"); fflush(stderr); }
-        }
-        if (g_evacActive)
-        {
-            g_lxrCollector.Evacuate();
-            if (verbose) { fprintf(stderr, "LXRGC: [stage] Evacuate done\n"); fflush(stderr); }
-        }
-        if (doSweep)
-        {
-            g_lxrCollector.SweepAndSelectDefrag();
-            if (verbose) { fprintf(stderr, "LXRGC: [stage] SweepAndSelectDefrag done\n"); fflush(stderr); }
-        }
-    }
+    // Concurrent SATB backup trace (P4): only the two brief STW pauses count as
+    // pause time; the transitive mark runs while the mutators execute. Falls back
+    // to the single-pause STW trace when concurrency is disabled or unavailable.
+    bool useConcurrent = (phase == LXRPhase::TracePause) && doTrace &&
+                         g_concurrentEnabled && g_theGCToCLR != nullptr;
 
-    if (suspended)
+    int64_t pauseMicros = 0;
+
+    if (useConcurrent)
+    {
+        LARGE_INTEGER a0, a1;
+        // --- Snapshot pause (STW): mod buffers, reset marks, seed roots ---
+        QueryPerformanceCounter(&a0);
+        g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+        if (doBuffers)
+            g_lxrCollector.ProcessModifiedBuffers();
+        g_lxrCollector.ConcurrentTraceSnapshot();
         g_theGCToCLR->RestartEE(true);
-    QueryPerformanceCounter(&t1);
-    int64_t pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+        QueryPerformanceCounter(&a1);
+        int64_t snapMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent snapshot done (pause=%lldus)\n", (long long)snapMicros); fflush(stderr); }
+
+        // --- Concurrent drain (mutators running) ---
+        QueryPerformanceCounter(&a0);
+        g_lxrCollector.ConcurrentTraceDrain();
+        QueryPerformanceCounter(&a1);
+        int64_t drainMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent drain done (%lldus off-pause)\n", (long long)drainMicros); fflush(stderr); }
+
+        // --- Finish pause (STW): residual SATB, allocate-black, sweep ---
+        QueryPerformanceCounter(&a0);
+        g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+        g_lxrCollector.ConcurrentTraceFinish();
+        // Evacuation is intentionally not run in the concurrent path this cycle:
+        // allocate-black objects are not scanned, so their fields could reference
+        // a moved object without being fixed up. Evacuation stays an STW-trace
+        // feature; the two are independently gated.
+        if (doSweep)
+            g_lxrCollector.SweepAndSelectDefrag();
+        g_theGCToCLR->RestartEE(true);
+        QueryPerformanceCounter(&a1);
+        int64_t finMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
+
+        pauseMicros = snapMicros + finMicros;
+        InterlockedExchangeAdd64(&g_lxrCounters.ConcSnapshotMicros, snapMicros);
+        InterlockedExchangeAdd64(&g_lxrCounters.ConcFinishMicros, finMicros);
+        InterlockedExchangeAdd64(&g_lxrCounters.ConcDrainMicros, drainMicros);
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent finish done (pause=%lldus allocBlack=%lld)\n",
+                               (long long)finMicros, (long long)g_lxrCounters.ConcAllocBlack); fflush(stderr); }
+    }
+    else
+    {
+        QueryPerformanceCounter(&t0);
+        bool suspended = false;
+        if (g_theGCToCLR != nullptr)
+        {
+            g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+            suspended = true;
+        }
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] phase=%s suspended=%d\n",
+                               phase == LXRPhase::TracePause ? "trace" : "rc", (int)suspended); fflush(stderr); }
+
+        if (doBuffers)
+        {
+            g_lxrCollector.ProcessModifiedBuffers();
+            if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done\n"); fflush(stderr); }
+        }
+        if (phase == LXRPhase::TracePause)
+        {
+            if (doTrace)
+            {
+                g_lxrCollector.BackupTrace();
+                if (verbose) { fprintf(stderr, "LXRGC: [stage] BackupTrace done\n"); fflush(stderr); }
+            }
+            if (g_evacActive)
+            {
+                g_lxrCollector.Evacuate();
+                if (verbose) { fprintf(stderr, "LXRGC: [stage] Evacuate done\n"); fflush(stderr); }
+            }
+            if (doSweep)
+            {
+                g_lxrCollector.SweepAndSelectDefrag();
+                if (verbose) { fprintf(stderr, "LXRGC: [stage] SweepAndSelectDefrag done\n"); fflush(stderr); }
+            }
+            // Clear SATB buffers accumulated by a STW SATB exercise (LXR_SATB),
+            // safe here under the pause.
+            if (g_lxrCollector.IsSatbActive())
+                g_lxrCollector.ResetSatbBuffers();
+        }
+
+        if (suspended)
+            g_theGCToCLR->RestartEE(true);
+        QueryPerformanceCounter(&t1);
+        pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+    }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     InterlockedIncrement64(&g_lxrCounters.Epochs);
     g_lxrCounters.LastCollectCommitted = g_committedInUse;
