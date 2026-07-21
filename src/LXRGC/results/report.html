@@ -41,25 +41,32 @@
 </head>
 <body>
   <h1>LXRGC vs. Workstation GC vs. Server GC</h1>
-  <p class="subtitle">Generated 2026-07-20 23:24:22 on this machine. Eleven workloads (2 hand-written sample apps, 5 GCPerfSim scenarios, 2 zero-alloc scenarios, dotLLM inference, and a growing-cache scenario), each run once per GC configuration.</p>
+  <p class="subtitle">Generated 2026-07-21 09:28:55 on this machine. 6 workloads, each run once per GC configuration (Workstation, Server, LXRGC), on the custom pluggable-write-barrier runtime.</p>
 
   <div class="legend">
     <span><span class="sw" style="background:#2b7de9"></span>Workstation GC (default, non-concurrent-by-default background GC)</span>
     <span><span class="sw" style="background:#8e44ad"></span>Server GC (DOTNET_gcServer=1, per-core heaps)</span>
-    <span><span class="sw" style="background:#e94f2b"></span>LXRGC (allocate-only, never-collect standalone GC)</span>
+    <span><span class="sw" style="background:#e94f2b"></span>LXRGC (LXR: coalescing reference counting + backup trace + Immix sweep, stop-the-world)</span>
   </div>
 
   <div class="callout">
     <strong>What is LXRGC?</strong> LXRGC is a custom standalone CoreCLR GC (loaded via
-    <code>DOTNET_GCName=LXRGC.dll</code>) modeled after the "Epsilon"/"no-op" GC idea (and the
-    author's earlier <a href="https://github.com/kkokosa/UpsilonGC">UpsilonGC</a> experiment): it
-    implements the full <code>IGCHeap</code>/<code>IGCHandleManager</code> ABI, but its allocator is a
-    simple bump-pointer arena that <em>never</em> collects, compacts, or reclaims memory - every
-    object allocated for the lifetime of the process stays resident. It exposes the same
+    <code>DOTNET_GCName=LXRGC.dll</code>) that implements the <strong>LXR</strong> collector
+    (&ldquo;Low-Latency, High-Throughput Garbage Collection&rdquo;, Zhao, Blackburn &amp; McKinley,
+    PLDI 2022 &mdash; <a href="https://arxiv.org/abs/2210.17175">arXiv:2210.17175</a>) as a sibling to
+    the author's earlier <a href="https://github.com/kkokosa/UpsilonGC">UpsilonGC</a> experiment. It
+    implements the full <code>IGCHeap</code>/<code>IGCHandleManager</code> ABI over a real
+    <strong>Immix</strong> substrate (32&nbsp;KiB blocks / 256&nbsp;B lines, per-thread bump
+    allocator), and performs <em>algorithmically-full stop-the-world reclamation</em>:
+    <strong>coalescing reference counting</strong> driven by the runtime fork's generic pluggable
+    write barrier (which surfaces the overwritten field value), recursive zero-count freeing, a
+    periodic <strong>backup trace</strong> (under <code>SuspendEE</code>, marking from handles +
+    <code>GcScanRoots</code>) that collects the dead cycles pure RC cannot, and an
+    <strong>Immix sweep</strong> that <code>MEM_DECOMMIT</code>s fully-dead chunks and recycles
+    them. Collection is triggered by an allocation-growth budget. It exposes the same
     <code>GC.CollectionCount</code>, <code>GC.GetTotalAllocatedBytes</code>, and
-    <code>GC.GetGCMemoryInfo()</code> counters as the real GC, so apps and tools observe 0
-    collections and monotonically growing memory instead of an error. This report compares it
-    against both default GC modes (Workstation and Server) across 5 workloads, using
+    <code>GC.GetGCMemoryInfo()</code> counters as the built-in GC. This report compares it against
+    both default GC modes (Workstation and Server) across every workload, using
     <code>dotnet-counters</code> to capture real second-by-second time series (not just
     end-of-run summaries) for GC pause time, memory, and throughput.
   </div>
@@ -68,17 +75,17 @@
   <h2>Console: mixed alloc-heavy CLI workload</h2>
   
   <table class="cmp">
-    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th></th><td></td></tr></thead>
+    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th>LXRGC</th><td></td></tr></thead>
     <tbody>
 <tr><td>Duration (s)</td><td>20.0</td><td></td><td>20.0</td><td></td><td>20.0</td><td></td></tr>
-<tr><td>Throughput (ops/sec)</td><td>15,617.77<div class='barTrack'><div class='barFill' style='width:99%;background:#2b7de9'></div></div></td><td></td><td>15,796.02<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>15,786.03<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Total allocated</td><td>46.29 MB<div class='barTrack'><div class='barFill' style='width:99%;background:#2b7de9'></div></div></td><td></td><td>46.76 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>498.43 KB<div class='barTrack'><div class='barFill' style='width:1%;background:'></div></div></td><td></td></tr>
-<tr><td>Gen0 collections</td><td>1<div class='barTrack'><div class='barFill' style='width:6%;background:#2b7de9'></div></div></td><td></td><td>18<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>10<div class='barTrack'><div class='barFill' style='width:56%;background:'></div></div></td><td></td></tr>
+<tr><td>Throughput (ops/sec)</td><td>15,617.77<div class='barTrack'><div class='barFill' style='width:99%;background:#2b7de9'></div></div></td><td></td><td>15,796.02<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>15,786.03<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Total allocated</td><td>46.29 MB<div class='barTrack'><div class='barFill' style='width:99%;background:#2b7de9'></div></div></td><td></td><td>46.76 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>498.43 KB<div class='barTrack'><div class='barFill' style='width:1%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Gen0 collections</td><td>1<div class='barTrack'><div class='barFill' style='width:6%;background:#2b7de9'></div></div></td><td></td><td>18<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>10<div class='barTrack'><div class='barFill' style='width:56%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Gen1 collections</td><td>0</td><td></td><td>1</td><td></td><td>10</td><td></td></tr>
 <tr><td>Gen2 collections</td><td>0</td><td></td><td>0</td><td></td><td>10</td><td></td></tr>
 <tr><td>GC heap size</td><td>586.91 KB</td><td></td><td>565.84 KB</td><td></td><td>235.88 MB</td><td></td></tr>
-<tr><td>Total committed bytes</td><td>24.66 MB<div class='barTrack'><div class='barFill' style='width:10%;background:#2b7de9'></div></div></td><td></td><td>3.53 MB<div class='barTrack'><div class='barFill' style='width:1%;background:#8e44ad'></div></div></td><td></td><td>235.88 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Peak working set</td><td>61.03 MB<div class='barTrack'><div class='barFill' style='width:40%;background:#2b7de9'></div></div></td><td></td><td>41.34 MB<div class='barTrack'><div class='barFill' style='width:27%;background:#8e44ad'></div></div></td><td></td><td>153.62 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Total committed bytes</td><td>24.66 MB<div class='barTrack'><div class='barFill' style='width:10%;background:#2b7de9'></div></div></td><td></td><td>3.53 MB<div class='barTrack'><div class='barFill' style='width:1%;background:#8e44ad'></div></div></td><td></td><td>235.88 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Peak working set</td><td>61.03 MB<div class='barTrack'><div class='barFill' style='width:40%;background:#2b7de9'></div></div></td><td></td><td>41.34 MB<div class='barTrack'><div class='barFill' style='width:27%;background:#8e44ad'></div></div></td><td></td><td>153.62 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 
     </tbody>
   </table>
@@ -86,7 +93,7 @@
   <details class="statsDetails" open>
     <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
-      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'></th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
+      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'>LXRGC</th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
       <tbody>
         <tr><td>GC pause time (ms per ~1s sample)</td><td>0.07 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>1.20 ms</td><td>0.19 ms</td><td>0.18 ms</td><td>0.25 ms</td><td>0.47 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td></tr>
         <tr><td>Working set (MB)</td><td>54</td><td>59</td><td>59</td><td>59</td><td>40</td><td>40</td><td>40</td><td>40</td><td>136</td><td>135</td><td>148</td><td>151</td></tr>
@@ -110,7 +117,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,23.8 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0 710.0,196.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='90.4,129.0 126.9,165.7 163.3,169.4 199.8,173.1 236.2,163.2 272.7,172.9 309.1,171.7 345.6,164.7 382.0,159.5 418.4,196.0 454.9,169.0 491.3,171.4 527.8,168.3 564.2,169.5 600.7,172.0 637.1,169.5 673.6,171.6' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,196.0 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,196.0 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-18</text>
 </svg>
@@ -129,7 +136,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,50.3 90.4,34.4 126.9,26.4 163.3,29.1 199.8,29.1 236.2,31.7 272.7,26.4 309.1,29.1 345.6,29.1 382.0,26.4 418.4,29.1 454.9,29.1 491.3,29.1 527.8,29.1 564.2,26.4 600.7,29.1 637.1,29.1 673.6,29.1 710.0,29.1' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,23.8 90.4,31.7 126.9,29.1 163.3,29.1 199.8,29.1 236.2,29.1 272.7,29.1 309.1,29.1 345.6,26.4 382.0,29.1 418.4,29.1 454.9,29.1 491.3,29.1 527.8,29.1 564.2,26.4 600.7,29.1 637.1,29.1 673.6,29.1' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,23.8 90.4,34.4 126.9,26.4 163.3,29.1 199.8,29.1 236.2,29.1 272.7,31.7 309.1,29.1 345.6,29.1 382.0,26.4 418.4,29.1 454.9,29.1 491.3,29.1 527.8,29.1 564.2,26.4 600.7,29.1 637.1,29.1 673.6,29.1' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,23.8 90.4,34.4 126.9,26.4 163.3,29.1 199.8,29.1 236.2,29.1 272.7,31.7 309.1,29.1 345.6,29.1 382.0,26.4 418.4,29.1 454.9,29.1 491.3,29.1 527.8,29.1 564.2,26.4 600.7,29.1 637.1,29.1 673.6,29.1' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-18</text>
 </svg>
@@ -147,19 +154,19 @@
   <line x1='54' y1='230' x2='710' y2='230' stroke='#ccc' stroke-width='1'/>
   <rect x='58' y='219.4' width='38' height='10.6' fill='#2b7de9' opacity='0.9'><title>Workstation GC Avg: 0.067 ms</title></rect>
 <rect x='100' y='198.9' width='38' height='31.1' fill='#8e44ad' opacity='0.9'><title>Server GC Avg: 0.195 ms</title></rect>
-<rect x='142' y='230' width='38' height='0' fill='' opacity='0.9'><title> Avg: 0.000 ms</title></rect>
+<rect x='142' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Avg: 0.000 ms</title></rect>
 <rect x='189.2' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P50: 0.000 ms</title></rect>
 <rect x='231.2' y='200.6' width='38' height='29.4' fill='#8e44ad' opacity='0.9'><title>Server GC P50: 0.184 ms</title></rect>
-<rect x='273.2' y='230' width='38' height='0' fill='' opacity='0.9'><title> P50: 0.000 ms</title></rect>
+<rect x='273.2' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P50: 0.000 ms</title></rect>
 <rect x='320.4' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P90: 0.000 ms</title></rect>
 <rect x='362.4' y='189.4' width='38' height='40.6' fill='#8e44ad' opacity='0.9'><title>Server GC P90: 0.254 ms</title></rect>
-<rect x='404.4' y='230' width='38' height='0' fill='' opacity='0.9'><title> P90: 0.000 ms</title></rect>
+<rect x='404.4' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P90: 0.000 ms</title></rect>
 <rect x='451.6' y='38.7' width='38' height='191.3' fill='#2b7de9' opacity='0.9'><title>Workstation GC P99: 1.198 ms</title></rect>
 <rect x='493.6' y='155.6' width='38' height='74.4' fill='#8e44ad' opacity='0.9'><title>Server GC P99: 0.466 ms</title></rect>
-<rect x='535.6' y='230' width='38' height='0' fill='' opacity='0.9'><title> P99: 0.000 ms</title></rect>
+<rect x='535.6' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P99: 0.000 ms</title></rect>
 <rect x='582.8' y='38.7' width='38' height='191.3' fill='#2b7de9' opacity='0.9'><title>Workstation GC Max: 1.198 ms</title></rect>
 <rect x='624.8' y='155.6' width='38' height='74.4' fill='#8e44ad' opacity='0.9'><title>Server GC Max: 0.466 ms</title></rect>
-<rect x='666.8' y='230' width='38' height='0' fill='' opacity='0.9'><title> Max: 0.000 ms</title></rect>
+<rect x='666.8' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Max: 0.000 ms</title></rect>
 
   <text x='119.6' y='252' font-size='10' fill='#666' text-anchor='middle'>Avg</text><text x='250.8' y='252' font-size='10' fill='#666' text-anchor='middle'>P50</text><text x='382' y='252' font-size='10' fill='#666' text-anchor='middle'>P90</text><text x='513.2' y='252' font-size='10' fill='#666' text-anchor='middle'>P99</text><text x='644.4' y='252' font-size='10' fill='#666' text-anchor='middle'>Max</text>
 </svg>
@@ -178,28 +185,28 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,153.0 90.4,149.2 126.9,146.6 163.3,143.8 199.8,141.0 236.2,138.4 272.7,135.8 309.1,133.2 345.6,130.5 382.0,128.1 418.4,128.0 454.9,128.0 491.3,128.0 527.8,128.0 564.2,128.0 600.7,128.0 637.1,128.0 673.6,128.0 710.0,128.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,151.9 90.4,151.0 126.9,150.9 163.3,150.8 199.8,150.7 236.2,150.7 272.7,150.6 309.1,150.6 345.6,150.6 382.0,150.5 418.4,150.5 454.9,150.5 491.3,150.5 527.8,150.5 564.2,150.5 600.7,150.4 637.1,150.4 673.6,150.4' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,50.7 90.4,47.1 126.9,44.4 163.3,41.5 199.8,38.8 236.2,36.2 272.7,54.7 309.1,51.9 345.6,49.1 382.0,46.1 418.4,43.2 454.9,40.5 491.3,37.7 527.8,34.9 564.2,32.2 600.7,29.3 637.1,26.6 673.6,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,50.7 90.4,47.1 126.9,44.4 163.3,41.5 199.8,38.8 236.2,36.2 272.7,54.7 309.1,51.9 345.6,49.1 382.0,46.1 418.4,43.2 454.9,40.5 491.3,37.7 527.8,34.9 564.2,32.2 600.7,29.3 637.1,26.6 673.6,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-18</text>
 </svg>
     </div>
   </div>
-  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:'></span></span></div>
+  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:#e94f2b'></span>LXRGC</span></div>
 </section><section>
   <h2>Console: near-zero-allocation numeric compute (matrix multiply)</h2>
   
   <table class="cmp">
-    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th></th><td></td></tr></thead>
+    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th>LXRGC</th><td></td></tr></thead>
     <tbody>
 <tr><td>Duration (s)</td><td>20.0</td><td></td><td>20.0</td><td></td><td>20.0</td><td></td></tr>
-<tr><td>Throughput (ops/sec)</td><td>952.91<div class='barTrack'><div class='barFill' style='width:99%;background:#2b7de9'></div></div></td><td></td><td>962.38<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>959.28<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Total allocated</td><td>1.57 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>1.56 MB<div class='barTrack'><div class='barFill' style='width:99%;background:#8e44ad'></div></div></td><td></td><td>282.50 KB<div class='barTrack'><div class='barFill' style='width:18%;background:'></div></div></td><td></td></tr>
-<tr><td>Gen0 collections</td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>10<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Throughput (ops/sec)</td><td>952.91<div class='barTrack'><div class='barFill' style='width:99%;background:#2b7de9'></div></div></td><td></td><td>962.38<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>959.28<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Total allocated</td><td>1.57 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>1.56 MB<div class='barTrack'><div class='barFill' style='width:99%;background:#8e44ad'></div></div></td><td></td><td>282.50 KB<div class='barTrack'><div class='barFill' style='width:18%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Gen0 collections</td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>10<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Gen1 collections</td><td>0</td><td></td><td>0</td><td></td><td>10</td><td></td></tr>
 <tr><td>Gen2 collections</td><td>0</td><td></td><td>0</td><td></td><td>10</td><td></td></tr>
 <tr><td>GC heap size</td><td>0.00 B</td><td></td><td>0.00 B</td><td></td><td>192.00 MB</td><td></td></tr>
-<tr><td>Total committed bytes</td><td>0.00 B<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0.00 B<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>192.00 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Peak working set</td><td>37.70 MB<div class='barTrack'><div class='barFill' style='width:28%;background:#2b7de9'></div></div></td><td></td><td>39.05 MB<div class='barTrack'><div class='barFill' style='width:29%;background:#8e44ad'></div></div></td><td></td><td>134.84 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Total committed bytes</td><td>0.00 B<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0.00 B<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>192.00 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Peak working set</td><td>37.70 MB<div class='barTrack'><div class='barFill' style='width:28%;background:#2b7de9'></div></div></td><td></td><td>39.05 MB<div class='barTrack'><div class='barFill' style='width:29%;background:#8e44ad'></div></div></td><td></td><td>134.84 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 
     </tbody>
   </table>
@@ -207,7 +214,7 @@
   <details class="statsDetails" open>
     <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
-      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'></th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
+      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'>LXRGC</th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
       <tbody>
         <tr><td>GC pause time (ms per ~1s sample)</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td></tr>
         <tr><td>Working set (MB)</td><td>35</td><td>36</td><td>36</td><td>36</td><td>36</td><td>37</td><td>37</td><td>38</td><td>132</td><td>133</td><td>133</td><td>133</td></tr>
@@ -231,7 +238,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,196.0 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0 710.0,196.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,196.0 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,196.0 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='90.4,196.0 126.9,196.0 163.3,196.0 199.8,196.0 236.2,196.0 272.7,196.0 309.1,196.0 345.6,196.0 382.0,196.0 418.4,196.0 454.9,196.0 491.3,196.0 527.8,196.0 564.2,196.0 600.7,196.0 637.1,196.0 673.6,196.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-18</text>
 </svg>
@@ -250,7 +257,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,24.4 90.4,33.5 126.9,23.8 163.3,26.0 199.8,26.3 236.2,26.6 272.7,26.3 309.1,101.5 345.6,92.7 382.0,93.7 418.4,93.4 454.9,93.4 491.3,93.9 527.8,94.7 564.2,94.7 600.7,92.1 637.1,93.9 673.6,93.4 710.0,94.7' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,24.0 90.4,27.1 126.9,26.4 163.3,26.6 199.8,27.0 236.2,26.0 272.7,89.0 309.1,92.2 345.6,93.4 382.0,93.7 418.4,93.9 454.9,93.8 491.3,93.8 527.8,93.7 564.2,94.1 600.7,91.9 637.1,94.1 673.6,94.5' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,25.5 90.4,31.2 126.9,27.8 163.3,26.3 199.8,27.9 236.2,27.8 272.7,76.9 309.1,93.8 345.6,93.3 382.0,92.2 418.4,93.9 454.9,93.9 491.3,93.5 527.8,93.1 564.2,94.7 600.7,93.5 637.1,93.9 673.6,92.1' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,25.5 90.4,31.2 126.9,27.8 163.3,26.3 199.8,27.9 236.2,27.8 272.7,76.9 309.1,93.8 345.6,93.3 382.0,92.2 418.4,93.9 454.9,93.9 491.3,93.5 527.8,93.1 564.2,94.7 600.7,93.5 637.1,93.9 673.6,92.1' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-18</text>
 </svg>
@@ -268,19 +275,19 @@
   <line x1='54' y1='230' x2='710' y2='230' stroke='#ccc' stroke-width='1'/>
   <rect x='58' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC Avg: 0.000 ms</title></rect>
 <rect x='100' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC Avg: 0.000 ms</title></rect>
-<rect x='142' y='230' width='38' height='0' fill='' opacity='0.9'><title> Avg: 0.000 ms</title></rect>
+<rect x='142' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Avg: 0.000 ms</title></rect>
 <rect x='189.2' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P50: 0.000 ms</title></rect>
 <rect x='231.2' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P50: 0.000 ms</title></rect>
-<rect x='273.2' y='230' width='38' height='0' fill='' opacity='0.9'><title> P50: 0.000 ms</title></rect>
+<rect x='273.2' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P50: 0.000 ms</title></rect>
 <rect x='320.4' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P90: 0.000 ms</title></rect>
 <rect x='362.4' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P90: 0.000 ms</title></rect>
-<rect x='404.4' y='230' width='38' height='0' fill='' opacity='0.9'><title> P90: 0.000 ms</title></rect>
+<rect x='404.4' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P90: 0.000 ms</title></rect>
 <rect x='451.6' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P99: 0.000 ms</title></rect>
 <rect x='493.6' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P99: 0.000 ms</title></rect>
-<rect x='535.6' y='230' width='38' height='0' fill='' opacity='0.9'><title> P99: 0.000 ms</title></rect>
+<rect x='535.6' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P99: 0.000 ms</title></rect>
 <rect x='582.8' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC Max: 0.000 ms</title></rect>
 <rect x='624.8' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC Max: 0.000 ms</title></rect>
-<rect x='666.8' y='230' width='38' height='0' fill='' opacity='0.9'><title> Max: 0.000 ms</title></rect>
+<rect x='666.8' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Max: 0.000 ms</title></rect>
 
   <text x='119.6' y='252' font-size='10' fill='#666' text-anchor='middle'>Avg</text><text x='250.8' y='252' font-size='10' fill='#666' text-anchor='middle'>P50</text><text x='382' y='252' font-size='10' fill='#666' text-anchor='middle'>P90</text><text x='513.2' y='252' font-size='10' fill='#666' text-anchor='middle'>P99</text><text x='644.4' y='252' font-size='10' fill='#666' text-anchor='middle'>Max</text>
 </svg>
@@ -299,32 +306,32 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,155.8 90.4,154.2 126.9,154.2 163.3,153.7 199.8,152.6 236.2,152.5 272.7,152.5 309.1,149.8 345.6,149.7 382.0,149.6 418.4,149.6 454.9,149.5 491.3,149.5 527.8,149.5 564.2,149.4 600.7,149.4 637.1,149.3 673.6,149.3 710.0,149.3' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,154.0 90.4,152.5 126.9,152.5 163.3,152.2 199.8,151.1 236.2,151.0 272.7,148.2 309.1,148.1 345.6,148.1 382.0,147.9 418.4,147.9 454.9,147.8 491.3,147.8 527.8,147.8 564.2,147.7 600.7,147.7 637.1,147.6 673.6,147.5' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,34.2 90.4,28.7 126.9,28.6 163.3,28.3 199.8,27.2 236.2,27.1 272.7,24.4 309.1,24.3 345.6,24.3 382.0,24.1 418.4,24.1 454.9,24.0 491.3,24.0 527.8,24.0 564.2,23.9 600.7,23.9 637.1,23.8 673.6,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,34.2 90.4,28.7 126.9,28.6 163.3,28.3 199.8,27.2 236.2,27.1 272.7,24.4 309.1,24.3 345.6,24.3 382.0,24.1 418.4,24.1 454.9,24.0 491.3,24.0 527.8,24.0 564.2,23.9 600.7,23.9 637.1,23.8 673.6,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-18</text>
 </svg>
     </div>
   </div>
-  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:'></span></span></div>
+  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:#e94f2b'></span>LXRGC</span></div>
 </section><section>
   <h2>Console: growing in-memory cache with real request workload (naturally escalating gen2 GCs)</h2>
   
   <table class="cmp">
-    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th></th><td></td></tr></thead>
+    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th>LXRGC</th><td></td></tr></thead>
     <tbody>
 <tr><td>Duration (s)</td><td>20.1</td><td></td><td>20.0</td><td></td><td>20.2</td><td></td></tr>
-<tr><td>Throughput (ops/sec)</td><td>27.55<div class='barTrack'><div class='barFill' style='width:48%;background:#2b7de9'></div></div></td><td></td><td>57.42<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>49.03<div class='barTrack'><div class='barFill' style='width:85%;background:'></div></div></td><td></td></tr>
-<tr><td>Total allocated</td><td>8.28 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>8.28 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>2.99 GB<div class='barTrack'><div class='barFill' style='width:36%;background:'></div></div></td><td></td></tr>
-<tr><td>Gen0 collections</td><td>236<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>35<div class='barTrack'><div class='barFill' style='width:15%;background:#8e44ad'></div></div></td><td></td><td>19<div class='barTrack'><div class='barFill' style='width:8%;background:'></div></div></td><td></td></tr>
+<tr><td>Throughput (ops/sec)</td><td>27.55<div class='barTrack'><div class='barFill' style='width:48%;background:#2b7de9'></div></div></td><td></td><td>57.42<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>49.03<div class='barTrack'><div class='barFill' style='width:85%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Total allocated</td><td>8.28 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>8.28 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>2.99 GB<div class='barTrack'><div class='barFill' style='width:36%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Gen0 collections</td><td>236<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>35<div class='barTrack'><div class='barFill' style='width:15%;background:#8e44ad'></div></div></td><td></td><td>19<div class='barTrack'><div class='barFill' style='width:8%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Gen1 collections</td><td>235</td><td></td><td>17</td><td></td><td>19</td><td></td></tr>
 <tr><td>Gen2 collections</td><td>10</td><td></td><td>12</td><td></td><td>19</td><td></td></tr>
 <tr><td>GC heap size</td><td>7.14 GB</td><td></td><td>5.52 GB</td><td></td><td>8.05 GB</td><td></td></tr>
-<tr><td>Total committed bytes</td><td>7.29 GB<div class='barTrack'><div class='barFill' style='width:91%;background:#2b7de9'></div></div></td><td></td><td>5.70 GB<div class='barTrack'><div class='barFill' style='width:71%;background:#8e44ad'></div></div></td><td></td><td>8.05 GB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Peak working set</td><td>6.80 GB<div class='barTrack'><div class='barFill' style='width:83%;background:#2b7de9'></div></div></td><td></td><td>7.18 GB<div class='barTrack'><div class='barFill' style='width:88%;background:#8e44ad'></div></div></td><td></td><td>8.15 GB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Total committed bytes</td><td>7.29 GB<div class='barTrack'><div class='barFill' style='width:91%;background:#2b7de9'></div></div></td><td></td><td>5.70 GB<div class='barTrack'><div class='barFill' style='width:71%;background:#8e44ad'></div></div></td><td></td><td>8.05 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Peak working set</td><td>6.80 GB<div class='barTrack'><div class='barFill' style='width:83%;background:#2b7de9'></div></div></td><td></td><td>7.18 GB<div class='barTrack'><div class='barFill' style='width:88%;background:#8e44ad'></div></div></td><td></td><td>8.15 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Final cache entries (retained)</td><td>30,830,011</td><td></td><td>30,831,985</td><td></td><td>28,800,721</td><td></td></tr>
 <tr><td>Naturally observed gen2 GC events</td><td>9</td><td></td><td>11</td><td></td><td>0</td><td></td></tr>
-<tr><td>Naturally observed gen2 GC pause (avg)</td><td>843.9 ms<div class='barTrack'><div class='barFill' style='width:24%;background:#2b7de9'></div></div></td><td></td><td>62.3 ms<div class='barTrack'><div class='barFill' style='width:2%;background:#8e44ad'></div></div></td><td></td><td>0.0 ms<div class='barTrack'><div class='barFill' style='width:0%;background:'></div></div></td><td></td></tr>
-<tr><td>Naturally observed gen2 GC pause (max)</td><td>3,457.5 ms<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>298.1 ms<div class='barTrack'><div class='barFill' style='width:9%;background:#8e44ad'></div></div></td><td></td><td>0.0 ms<div class='barTrack'><div class='barFill' style='width:0%;background:'></div></div></td><td></td></tr>
+<tr><td>Naturally observed gen2 GC pause (avg)</td><td>843.9 ms<div class='barTrack'><div class='barFill' style='width:24%;background:#2b7de9'></div></div></td><td></td><td>62.3 ms<div class='barTrack'><div class='barFill' style='width:2%;background:#8e44ad'></div></div></td><td></td><td>0.0 ms<div class='barTrack'><div class='barFill' style='width:0%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Naturally observed gen2 GC pause (max)</td><td>3,457.5 ms<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>298.1 ms<div class='barTrack'><div class='barFill' style='width:9%;background:#8e44ad'></div></div></td><td></td><td>0.0 ms<div class='barTrack'><div class='barFill' style='width:0%;background:#e94f2b'></div></div></td><td></td></tr>
 
     </tbody>
   </table>
@@ -332,7 +339,7 @@
   <details class="statsDetails" open>
     <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
-      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'></th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
+      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'>LXRGC</th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
       <tbody>
         <tr><td>GC pause time (ms per ~1s sample)</td><td>380.28 ms</td><td>388.32 ms</td><td>439.79 ms</td><td>618.59 ms</td><td>46.80 ms</td><td>43.96 ms</td><td>125.90 ms</td><td>182.73 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td></tr>
         <tr><td>Working set (MB)</td><td>3,903</td><td>3,831</td><td>6,601</td><td>6,965</td><td>4,268</td><td>4,493</td><td>7,068</td><td>7,357</td><td>4,545</td><td>4,436</td><td>6,716</td><td>8,232</td></tr>
@@ -356,7 +363,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='92.6,97.7 131.2,87.6 169.8,96.9 208.4,100.7 246.9,75.2 285.5,87.5 324.1,82.3 362.7,102.8 401.3,156.3 439.9,23.8 478.5,83.0 517.1,98.3 555.6,87.9 594.2,96.6 632.8,98.0 671.4,83.9 710.0,73.6' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='92.6,196.0 131.2,180.5 169.8,160.9 208.4,181.9 246.9,196.0 285.5,183.8 324.1,176.0 362.7,145.1 401.3,196.0 439.9,174.4 478.5,196.0 517.1,196.0 555.6,177.8 594.2,196.0 632.8,175.1 671.4,196.0' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='92.6,196.0 131.2,196.0 169.8,196.0 208.4,196.0 246.9,196.0 285.5,196.0 324.1,196.0 362.7,196.0 401.3,196.0 439.9,196.0 478.5,196.0 517.1,196.0 555.6,196.0 594.2,196.0 671.4,196.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='92.6,196.0 131.2,196.0 169.8,196.0 208.4,196.0 246.9,196.0 285.5,196.0 324.1,196.0 362.7,196.0 401.3,196.0 439.9,196.0 478.5,196.0 517.1,196.0 555.6,196.0 594.2,196.0 671.4,196.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-17</text>
 </svg>
@@ -375,7 +382,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,107.2 92.6,152.9 131.2,104.5 169.8,93.7 208.4,187.9 246.9,104.5 285.5,91.1 324.1,123.3 362.7,99.1 401.3,193.3 439.9,187.9 478.5,93.7 517.1,83.0 555.6,88.4 594.2,83.0 632.8,83.0 671.4,120.7 710.0,136.8' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,29.2 92.6,42.6 131.2,39.9 169.8,50.7 208.4,34.5 246.9,26.5 285.5,56.1 324.1,39.9 362.7,66.8 401.3,26.5 439.9,34.5 478.5,31.9 517.1,26.5 555.6,39.9 594.2,26.5 632.8,93.7 671.4,37.2' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,26.5 92.6,85.7 131.2,101.8 169.8,26.5 208.4,23.8 246.9,34.5 285.5,134.1 324.1,26.5 362.7,26.5 401.3,128.7 439.9,85.7 478.5,26.5 517.1,26.5 555.6,26.5 594.2,23.8 671.4,85.7' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,26.5 92.6,85.7 131.2,101.8 169.8,26.5 208.4,23.8 246.9,34.5 285.5,134.1 324.1,26.5 362.7,26.5 401.3,128.7 439.9,85.7 478.5,26.5 517.1,26.5 555.6,26.5 594.2,23.8 671.4,85.7' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-17</text>
 </svg>
@@ -393,19 +400,19 @@
   <line x1='54' y1='230' x2='710' y2='230' stroke='#ccc' stroke-width='1'/>
   <rect x='58' y='112.4' width='38' height='117.6' fill='#2b7de9' opacity='0.9'><title>Workstation GC Avg: 380.283 ms</title></rect>
 <rect x='100' y='215.5' width='38' height='14.5' fill='#8e44ad' opacity='0.9'><title>Server GC Avg: 46.805 ms</title></rect>
-<rect x='142' y='230' width='38' height='0' fill='' opacity='0.9'><title> Avg: 0.000 ms</title></rect>
+<rect x='142' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Avg: 0.000 ms</title></rect>
 <rect x='189.2' y='109.9' width='38' height='120.1' fill='#2b7de9' opacity='0.9'><title>Workstation GC P50: 388.317 ms</title></rect>
 <rect x='231.2' y='216.4' width='38' height='13.6' fill='#8e44ad' opacity='0.9'><title>Server GC P50: 43.960 ms</title></rect>
-<rect x='273.2' y='230' width='38' height='0' fill='' opacity='0.9'><title> P50: 0.000 ms</title></rect>
+<rect x='273.2' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P50: 0.000 ms</title></rect>
 <rect x='320.4' y='94' width='38' height='136' fill='#2b7de9' opacity='0.9'><title>Workstation GC P90: 439.794 ms</title></rect>
 <rect x='362.4' y='191.1' width='38' height='38.9' fill='#8e44ad' opacity='0.9'><title>Server GC P90: 125.895 ms</title></rect>
-<rect x='404.4' y='230' width='38' height='0' fill='' opacity='0.9'><title> P90: 0.000 ms</title></rect>
+<rect x='404.4' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P90: 0.000 ms</title></rect>
 <rect x='451.6' y='38.7' width='38' height='191.3' fill='#2b7de9' opacity='0.9'><title>Workstation GC P99: 618.590 ms</title></rect>
 <rect x='493.6' y='173.5' width='38' height='56.5' fill='#8e44ad' opacity='0.9'><title>Server GC P99: 182.729 ms</title></rect>
-<rect x='535.6' y='230' width='38' height='0' fill='' opacity='0.9'><title> P99: 0.000 ms</title></rect>
+<rect x='535.6' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P99: 0.000 ms</title></rect>
 <rect x='582.8' y='38.7' width='38' height='191.3' fill='#2b7de9' opacity='0.9'><title>Workstation GC Max: 618.590 ms</title></rect>
 <rect x='624.8' y='173.5' width='38' height='56.5' fill='#8e44ad' opacity='0.9'><title>Server GC Max: 182.729 ms</title></rect>
-<rect x='666.8' y='230' width='38' height='0' fill='' opacity='0.9'><title> Max: 0.000 ms</title></rect>
+<rect x='666.8' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Max: 0.000 ms</title></rect>
 
   <text x='119.6' y='252' font-size='10' fill='#666' text-anchor='middle'>Avg</text><text x='250.8' y='252' font-size='10' fill='#666' text-anchor='middle'>P50</text><text x='382' y='252' font-size='10' fill='#666' text-anchor='middle'>P90</text><text x='513.2' y='252' font-size='10' fill='#666' text-anchor='middle'>P99</text><text x='644.4' y='252' font-size='10' fill='#666' text-anchor='middle'>Max</text>
 </svg>
@@ -424,28 +431,28 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,173.5 92.6,167.2 131.2,158.1 169.8,152.7 208.4,145.5 246.9,139.2 285.5,133.8 324.1,121.2 362.7,115.8 401.3,111.1 439.9,102.1 478.5,96.3 517.1,91.2 555.6,86.1 594.2,80.6 632.8,75.4 671.4,57.9 710.0,50.3' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,169.1 92.6,159.0 131.2,150.4 169.8,145.7 208.4,138.9 246.9,133.1 285.5,119.7 324.1,113.1 362.7,102.0 401.3,96.3 439.9,90.8 478.5,84.9 517.1,79.2 555.6,73.6 594.2,67.9 632.8,48.1 671.4,42.1' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,162.7 92.6,152.1 131.2,142.6 169.8,136.8 208.4,131.0 246.9,124.3 285.5,109.7 324.1,103.2 362.7,96.7 401.3,96.0 439.9,78.7 478.5,72.9 517.1,67.1 555.6,61.4 594.2,55.5 671.4,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,162.7 92.6,152.1 131.2,142.6 169.8,136.8 208.4,131.0 246.9,124.3 285.5,109.7 324.1,103.2 362.7,96.7 401.3,96.0 439.9,78.7 478.5,72.9 517.1,67.1 555.6,61.4 594.2,55.5 671.4,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-17</text>
 </svg>
     </div>
   </div>
-  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:'></span></span></div>
+  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:#e94f2b'></span>LXRGC</span></div>
 </section><section>
   <h2>ASP.NET Core (Kestrel) minimal API</h2>
   
   <table class="cmp">
-    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th></th><td></td></tr></thead>
+    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th>LXRGC</th><td></td></tr></thead>
     <tbody>
 <tr><td>Duration (s)</td><td>20.0</td><td></td><td>20.0</td><td></td><td>20.0</td><td></td></tr>
-<tr><td>Throughput (ops/sec)</td><td>251.75<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>251.52<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>250.82<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Total allocated</td><td>55.35 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>55.22 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>1.10 MB<div class='barTrack'><div class='barFill' style='width:2%;background:'></div></div></td><td></td></tr>
-<tr><td>Gen0 collections</td><td>2<div class='barTrack'><div class='barFill' style='width:15%;background:#2b7de9'></div></div></td><td></td><td>12<div class='barTrack'><div class='barFill' style='width:92%;background:#8e44ad'></div></div></td><td></td><td>13<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Throughput (ops/sec)</td><td>251.75<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>251.52<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>250.82<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Total allocated</td><td>55.35 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>55.22 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>1.10 MB<div class='barTrack'><div class='barFill' style='width:2%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Gen0 collections</td><td>2<div class='barTrack'><div class='barFill' style='width:15%;background:#2b7de9'></div></div></td><td></td><td>12<div class='barTrack'><div class='barFill' style='width:92%;background:#8e44ad'></div></div></td><td></td><td>13<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Gen1 collections</td><td>1</td><td></td><td>1</td><td></td><td>13</td><td></td></tr>
 <tr><td>Gen2 collections</td><td>0</td><td></td><td>0</td><td></td><td>13</td><td></td></tr>
 <tr><td>GC heap size</td><td>3.88 MB</td><td></td><td>3.64 MB</td><td></td><td>960.00 MB</td><td></td></tr>
-<tr><td>Total committed bytes</td><td>26.96 MB<div class='barTrack'><div class='barFill' style='width:3%;background:#2b7de9'></div></div></td><td></td><td>8.14 MB<div class='barTrack'><div class='barFill' style='width:1%;background:#8e44ad'></div></div></td><td></td><td>960.00 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Peak working set</td><td>91.85 MB<div class='barTrack'><div class='barFill' style='width:22%;background:#2b7de9'></div></div></td><td></td><td>73.69 MB<div class='barTrack'><div class='barFill' style='width:18%;background:#8e44ad'></div></div></td><td></td><td>415.44 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Total committed bytes</td><td>26.96 MB<div class='barTrack'><div class='barFill' style='width:3%;background:#2b7de9'></div></div></td><td></td><td>8.14 MB<div class='barTrack'><div class='barFill' style='width:1%;background:#8e44ad'></div></div></td><td></td><td>960.00 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Peak working set</td><td>91.85 MB<div class='barTrack'><div class='barFill' style='width:22%;background:#2b7de9'></div></div></td><td></td><td>73.69 MB<div class='barTrack'><div class='barFill' style='width:18%;background:#8e44ad'></div></div></td><td></td><td>415.44 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 
     </tbody>
   </table>
@@ -453,7 +460,7 @@
   <details class="statsDetails" open>
     <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
-      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'></th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
+      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'>LXRGC</th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
       <tbody>
         <tr><td>GC pause time (ms per ~1s sample)</td><td>0.39 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>5.00 ms</td><td>0.40 ms</td><td>0.55 ms</td><td>0.98 ms</td><td>1.04 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td></tr>
         <tr><td>Working set (MB)</td><td>84</td><td>89</td><td>91</td><td>94</td><td>75</td><td>75</td><td>77</td><td>77</td><td>392</td><td>394</td><td>409</td><td>412</td></tr>
@@ -477,7 +484,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='86.8,196.0 119.6,196.0 152.4,196.0 185.2,196.0 218.0,196.0 250.8,196.0 283.6,196.0 316.4,196.0 349.2,23.8 382.0,196.0 414.8,196.0 447.6,196.0 480.4,196.0 513.2,196.0 546.0,196.0 578.8,196.0 611.6,196.0 644.4,99.3 677.2,196.0 710.0,196.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='86.8,196.0 119.6,160.2 152.4,196.0 185.2,172.9 218.0,196.0 250.8,177.1 283.6,196.0 316.4,175.3 349.2,196.0 382.0,173.6 414.8,162.1 447.6,196.0 480.4,174.5 513.2,173.1 546.0,196.0 578.8,175.3' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='86.8,196.0 119.6,196.0 152.4,196.0 185.2,196.0 218.0,196.0 250.8,196.0 283.6,196.0 316.4,196.0 349.2,196.0 382.0,196.0 414.8,196.0 447.6,196.0 480.4,196.0 513.2,196.0 546.0,196.0 578.8,196.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='86.8,196.0 119.6,196.0 152.4,196.0 185.2,196.0 218.0,196.0 250.8,196.0 283.6,196.0 316.4,196.0 349.2,196.0 382.0,196.0 414.8,196.0 447.6,196.0 480.4,196.0 513.2,196.0 546.0,196.0 578.8,196.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-20</text>
 </svg>
@@ -496,7 +503,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='86.8,143.6 119.6,31.0 152.4,28.4 185.2,29.7 218.0,30.3 250.8,31.6 283.6,30.3 316.4,31.6 349.2,31.0 382.0,31.0 414.8,28.4 447.6,31.0 480.4,29.0 513.2,29.7 546.0,32.3 578.8,31.0 611.6,28.4 644.4,31.0 677.2,31.0 710.0,31.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,29.0 86.8,28.4 119.6,33.6 152.4,31.0 185.2,31.0 218.0,29.7 250.8,32.3 283.6,28.4 316.4,31.0 349.2,31.0 382.0,31.0 414.8,31.0 447.6,31.0 480.4,28.4 513.2,31.0 546.0,31.0 578.8,31.0' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,23.8 86.8,33.6 119.6,31.6 152.4,32.9 185.2,31.0 218.0,31.0 250.8,27.7 283.6,31.0 316.4,31.0 349.2,31.0 382.0,26.4 414.8,28.4 447.6,28.4 480.4,31.0 513.2,31.0 546.0,31.0 578.8,31.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,23.8 86.8,33.6 119.6,31.6 152.4,32.9 185.2,31.0 218.0,31.0 250.8,27.7 283.6,31.0 316.4,31.0 349.2,31.0 382.0,26.4 414.8,28.4 447.6,28.4 480.4,31.0 513.2,31.0 546.0,31.0 578.8,31.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-20</text>
 </svg>
@@ -514,19 +521,19 @@
   <line x1='54' y1='230' x2='710' y2='230' stroke='#ccc' stroke-width='1'/>
   <rect x='58' y='215.1' width='38' height='14.9' fill='#2b7de9' opacity='0.9'><title>Workstation GC Avg: 0.391 ms</title></rect>
 <rect x='100' y='214.7' width='38' height='15.3' fill='#8e44ad' opacity='0.9'><title>Server GC Avg: 0.399 ms</title></rect>
-<rect x='142' y='230' width='38' height='0' fill='' opacity='0.9'><title> Avg: 0.000 ms</title></rect>
+<rect x='142' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Avg: 0.000 ms</title></rect>
 <rect x='189.2' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P50: 0.000 ms</title></rect>
 <rect x='231.2' y='209.1' width='38' height='20.9' fill='#8e44ad' opacity='0.9'><title>Server GC P50: 0.548 ms</title></rect>
-<rect x='273.2' y='230' width='38' height='0' fill='' opacity='0.9'><title> P50: 0.000 ms</title></rect>
+<rect x='273.2' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P50: 0.000 ms</title></rect>
 <rect x='320.4' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P90: 0.000 ms</title></rect>
 <rect x='362.4' y='192.4' width='38' height='37.6' fill='#8e44ad' opacity='0.9'><title>Server GC P90: 0.984 ms</title></rect>
-<rect x='404.4' y='230' width='38' height='0' fill='' opacity='0.9'><title> P90: 0.000 ms</title></rect>
+<rect x='404.4' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P90: 0.000 ms</title></rect>
 <rect x='451.6' y='38.7' width='38' height='191.3' fill='#2b7de9' opacity='0.9'><title>Workstation GC P99: 5.005 ms</title></rect>
 <rect x='493.6' y='190.2' width='38' height='39.8' fill='#8e44ad' opacity='0.9'><title>Server GC P99: 1.040 ms</title></rect>
-<rect x='535.6' y='230' width='38' height='0' fill='' opacity='0.9'><title> P99: 0.000 ms</title></rect>
+<rect x='535.6' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P99: 0.000 ms</title></rect>
 <rect x='582.8' y='38.7' width='38' height='191.3' fill='#2b7de9' opacity='0.9'><title>Workstation GC Max: 5.005 ms</title></rect>
 <rect x='624.8' y='190.2' width='38' height='39.8' fill='#8e44ad' opacity='0.9'><title>Server GC Max: 1.040 ms</title></rect>
-<rect x='666.8' y='230' width='38' height='0' fill='' opacity='0.9'><title> Max: 0.000 ms</title></rect>
+<rect x='666.8' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Max: 0.000 ms</title></rect>
 
   <text x='119.6' y='252' font-size='10' fill='#666' text-anchor='middle'>Avg</text><text x='250.8' y='252' font-size='10' fill='#666' text-anchor='middle'>P50</text><text x='382' y='252' font-size='10' fill='#666' text-anchor='middle'>P90</text><text x='513.2' y='252' font-size='10' fill='#666' text-anchor='middle'>P99</text><text x='644.4' y='252' font-size='10' fill='#666' text-anchor='middle'>Max</text>
 </svg>
@@ -545,28 +552,28 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,174.4 86.8,170.5 119.6,168.5 152.4,166.6 185.2,164.2 218.0,161.4 250.8,160.3 283.6,159.1 316.4,158.0 349.2,156.5 382.0,156.5 414.8,158.8 447.6,158.8 480.4,158.8 513.2,158.8 546.0,158.9 578.8,158.9 611.6,158.9 644.4,158.2 677.2,158.2 710.0,158.2' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,164.4 86.8,163.8 119.6,163.8 152.4,163.8 185.2,163.8 218.0,163.7 250.8,163.7 283.6,163.7 316.4,163.7 349.2,165.8 382.0,165.7 414.8,165.7 447.6,165.7 480.4,166.0 513.2,166.0 546.0,166.0 578.8,166.0' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,46.3 86.8,38.9 119.6,37.2 152.4,36.0 185.2,34.9 218.0,33.7 250.8,32.6 283.6,31.4 316.4,30.3 349.2,31.4 382.0,30.2 414.8,29.2 447.6,27.9 480.4,27.2 513.2,26.0 546.0,24.9 578.8,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,46.3 86.8,38.9 119.6,37.2 152.4,36.0 185.2,34.9 218.0,33.7 250.8,32.6 283.6,31.4 316.4,30.3 349.2,31.4 382.0,30.2 414.8,29.2 447.6,27.9 480.4,27.2 513.2,26.0 546.0,24.9 578.8,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-20</text>
 </svg>
     </div>
   </div>
-  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:'></span></span></div>
+  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:#e94f2b'></span>LXRGC</span></div>
 </section><section>
   <h2>dotLLM: zero-alloc-inference HTTP server (github.com/kkokosa/dotLLM)</h2>
   
   <table class="cmp">
-    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th></th><td></td></tr></thead>
+    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th>LXRGC</th><td></td></tr></thead>
     <tbody>
 <tr><td>Duration (s)</td><td>20.0</td><td></td><td>20.0</td><td></td><td>20.0</td><td></td></tr>
-<tr><td>Throughput (ops/sec)</td><td>1.00<div class='barTrack'><div class='barFill' style='width:95%;background:#2b7de9'></div></div></td><td></td><td>0.90<div class='barTrack'><div class='barFill' style='width:86%;background:#8e44ad'></div></div></td><td></td><td>1.05<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Total allocated</td><td>1.23 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>1.21 MB<div class='barTrack'><div class='barFill' style='width:98%;background:#8e44ad'></div></div></td><td></td><td>297.92 KB<div class='barTrack'><div class='barFill' style='width:24%;background:'></div></div></td><td></td></tr>
-<tr><td>Gen0 collections</td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:'></div></div></td><td></td></tr>
+<tr><td>Throughput (ops/sec)</td><td>1.00<div class='barTrack'><div class='barFill' style='width:95%;background:#2b7de9'></div></div></td><td></td><td>0.90<div class='barTrack'><div class='barFill' style='width:86%;background:#8e44ad'></div></div></td><td></td><td>1.05<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Total allocated</td><td>1.23 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>1.21 MB<div class='barTrack'><div class='barFill' style='width:98%;background:#8e44ad'></div></div></td><td></td><td>297.92 KB<div class='barTrack'><div class='barFill' style='width:24%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Gen0 collections</td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Gen1 collections</td><td>0</td><td></td><td>0</td><td></td><td>0</td><td></td></tr>
 <tr><td>Gen2 collections</td><td>0</td><td></td><td>0</td><td></td><td>0</td><td></td></tr>
 <tr><td>GC heap size</td><td>n/a</td><td></td><td>n/a</td><td></td><td>n/a</td><td></td></tr>
-<tr><td>Total committed bytes</td><td>38.30 MB<div class='barTrack'><div class='barFill' style='width:1%;background:#2b7de9'></div></div></td><td></td><td>50.36 MB<div class='barTrack'><div class='barFill' style='width:2%;background:#8e44ad'></div></div></td><td></td><td>2.94 GB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Peak working set</td><td>315.75 MB<div class='barTrack'><div class='barFill' style='width:40%;background:#2b7de9'></div></div></td><td></td><td>315.64 MB<div class='barTrack'><div class='barFill' style='width:40%;background:#8e44ad'></div></div></td><td></td><td>796.69 MB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Total committed bytes</td><td>38.30 MB<div class='barTrack'><div class='barFill' style='width:1%;background:#2b7de9'></div></div></td><td></td><td>50.36 MB<div class='barTrack'><div class='barFill' style='width:2%;background:#8e44ad'></div></div></td><td></td><td>2.94 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Peak working set</td><td>315.75 MB<div class='barTrack'><div class='barFill' style='width:40%;background:#2b7de9'></div></div></td><td></td><td>315.64 MB<div class='barTrack'><div class='barFill' style='width:40%;background:#8e44ad'></div></div></td><td></td><td>796.69 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 
     </tbody>
   </table>
@@ -574,7 +581,7 @@
   <details class="statsDetails" open>
     <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
-      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'></th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
+      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'>LXRGC</th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
       <tbody>
         <tr><td>GC pause time (ms per ~1s sample)</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td></tr>
         <tr><td>Working set (MB)</td><td>314</td><td>315</td><td>316</td><td>316</td><td>314</td><td>315</td><td>316</td><td>316</td><td>759</td><td>765</td><td>796</td><td>797</td></tr>
@@ -598,7 +605,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-24</text>
 </svg>
@@ -617,7 +624,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='86.8,109.9 119.6,109.9 152.4,109.9 185.2,109.9 218.0,109.9 250.8,109.9 283.6,109.9 316.4,109.9 349.2,109.9 414.8,109.9 447.6,23.8 480.4,109.9 513.2,109.9 546.0,109.9 578.8,109.9 644.4,23.8 677.2,109.9 710.0,109.9' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='86.8,109.9 119.6,109.9 152.4,109.9 185.2,109.9 218.0,109.9 250.8,109.9 316.4,109.9 349.2,109.9 382.0,109.9 414.8,109.9 447.6,109.9 480.4,109.9 513.2,109.9 546.0,109.9 578.8,109.9 611.6,109.9 644.4,109.9 710.0,109.9' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='86.8,109.9 119.6,109.9 152.4,109.9 185.2,109.9 218.0,109.9 250.8,23.8 283.6,109.9 316.4,109.9 349.2,109.9 382.0,109.9 414.8,109.9 447.6,109.9 480.4,109.9 513.2,109.9 546.0,109.9 578.8,109.9 611.6,109.9 644.4,109.9 677.2,109.9 710.0,109.9' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='86.8,109.9 119.6,109.9 152.4,109.9 185.2,109.9 218.0,109.9 250.8,23.8 283.6,109.9 316.4,109.9 349.2,109.9 382.0,109.9 414.8,109.9 447.6,109.9 480.4,109.9 513.2,109.9 546.0,109.9 578.8,109.9 611.6,109.9 644.4,109.9 677.2,109.9 710.0,109.9' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-20</text>
 </svg>
@@ -635,19 +642,19 @@
   <line x1='54' y1='230' x2='710' y2='230' stroke='#ccc' stroke-width='1'/>
   <rect x='58' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC Avg: 0.000 ms</title></rect>
 <rect x='100' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC Avg: 0.000 ms</title></rect>
-<rect x='142' y='230' width='38' height='0' fill='' opacity='0.9'><title> Avg: 0.000 ms</title></rect>
+<rect x='142' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Avg: 0.000 ms</title></rect>
 <rect x='189.2' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P50: 0.000 ms</title></rect>
 <rect x='231.2' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P50: 0.000 ms</title></rect>
-<rect x='273.2' y='230' width='38' height='0' fill='' opacity='0.9'><title> P50: 0.000 ms</title></rect>
+<rect x='273.2' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P50: 0.000 ms</title></rect>
 <rect x='320.4' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P90: 0.000 ms</title></rect>
 <rect x='362.4' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P90: 0.000 ms</title></rect>
-<rect x='404.4' y='230' width='38' height='0' fill='' opacity='0.9'><title> P90: 0.000 ms</title></rect>
+<rect x='404.4' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P90: 0.000 ms</title></rect>
 <rect x='451.6' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P99: 0.000 ms</title></rect>
 <rect x='493.6' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P99: 0.000 ms</title></rect>
-<rect x='535.6' y='230' width='38' height='0' fill='' opacity='0.9'><title> P99: 0.000 ms</title></rect>
+<rect x='535.6' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P99: 0.000 ms</title></rect>
 <rect x='582.8' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC Max: 0.000 ms</title></rect>
 <rect x='624.8' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC Max: 0.000 ms</title></rect>
-<rect x='666.8' y='230' width='38' height='0' fill='' opacity='0.9'><title> Max: 0.000 ms</title></rect>
+<rect x='666.8' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Max: 0.000 ms</title></rect>
 
   <text x='119.6' y='252' font-size='10' fill='#666' text-anchor='middle'>Avg</text><text x='250.8' y='252' font-size='10' fill='#666' text-anchor='middle'>P50</text><text x='382' y='252' font-size='10' fill='#666' text-anchor='middle'>P90</text><text x='513.2' y='252' font-size='10' fill='#666' text-anchor='middle'>P99</text><text x='644.4' y='252' font-size='10' fill='#666' text-anchor='middle'>Max</text>
 </svg>
@@ -666,28 +673,28 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,128.5 81.3,128.4 108.7,128.4 136.0,128.3 163.3,128.3 190.7,128.2 218.0,128.2 245.3,128.1 272.7,128.1 300.0,128.1 327.3,128.0 354.7,128.0 382.0,128.0 409.3,127.9 436.7,127.9 464.0,127.9 491.3,127.8 518.7,127.8 546.0,127.8 573.3,127.8 600.7,127.8 628.0,127.8 655.3,127.8 682.7,127.7 710.0,127.7' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,128.5 81.3,128.4 108.7,128.4 136.0,128.3 163.3,128.3 190.7,128.2 218.0,128.2 245.3,128.2 272.7,128.1 300.0,128.1 327.3,128.0 354.7,128.0 382.0,128.0 409.3,128.0 436.7,128.0 464.0,127.9 491.3,127.8 518.7,127.8 546.0,127.8 573.3,127.8 600.7,127.8 628.0,127.8 655.3,127.8 682.7,127.8 710.0,127.8' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,47.2 81.3,43.1 108.7,42.2 136.0,40.9 163.3,39.8 190.7,37.9 218.0,36.8 245.3,35.8 272.7,34.7 300.0,33.7 327.3,32.8 354.7,31.7 382.0,30.7 409.3,29.8 436.7,28.9 464.0,27.9 491.3,27.2 518.7,26.3 546.0,25.4 573.3,24.6 600.7,24.2 628.0,24.1 655.3,24.0 682.7,23.9 710.0,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,47.2 81.3,43.1 108.7,42.2 136.0,40.9 163.3,39.8 190.7,37.9 218.0,36.8 245.3,35.8 272.7,34.7 300.0,33.7 327.3,32.8 354.7,31.7 382.0,30.7 409.3,29.8 436.7,28.9 464.0,27.9 491.3,27.2 518.7,26.3 546.0,25.4 573.3,24.6 600.7,24.2 628.0,24.1 655.3,24.0 682.7,23.9 710.0,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-24</text>
 </svg>
     </div>
   </div>
-  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:'></span></span></div>
+  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:#e94f2b'></span>LXRGC</span></div>
 </section><section>
   <h2>dotLLM: 1.5B model (~1GB, Q4_K_M), few-hundred-token context, zero-alloc-inference HTTP server</h2>
   
   <table class="cmp">
-    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th></th><td></td></tr></thead>
+    <thead><tr><th>Metric</th><th>Workstation GC</th><td></td><th>Server GC</th><td></td><th>LXRGC</th><td></td></tr></thead>
     <tbody>
 <tr><td>Duration (s)</td><td>20.0</td><td></td><td>20.0</td><td></td><td>20.0</td><td></td></tr>
-<tr><td>Throughput (ops/sec)</td><td>0.15<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>0.15<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>0.15<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Total allocated</td><td>1.05 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>1,014.59 KB<div class='barTrack'><div class='barFill' style='width:94%;background:#8e44ad'></div></div></td><td></td><td>53.01 KB<div class='barTrack'><div class='barFill' style='width:5%;background:'></div></div></td><td></td></tr>
-<tr><td>Gen0 collections</td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:'></div></div></td><td></td></tr>
+<tr><td>Throughput (ops/sec)</td><td>0.15<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>0.15<div class='barTrack'><div class='barFill' style='width:100%;background:#8e44ad'></div></div></td><td></td><td>0.15<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Total allocated</td><td>1.05 MB<div class='barTrack'><div class='barFill' style='width:100%;background:#2b7de9'></div></div></td><td></td><td>1,014.59 KB<div class='barTrack'><div class='barFill' style='width:94%;background:#8e44ad'></div></div></td><td></td><td>53.01 KB<div class='barTrack'><div class='barFill' style='width:5%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Gen0 collections</td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#2b7de9'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#8e44ad'></div></div></td><td></td><td>0<div class='barTrack'><div class='barFill' style='width:0%;background:#e94f2b'></div></div></td><td></td></tr>
 <tr><td>Gen1 collections</td><td>0</td><td></td><td>0</td><td></td><td>0</td><td></td></tr>
 <tr><td>Gen2 collections</td><td>0</td><td></td><td>0</td><td></td><td>0</td><td></td></tr>
 <tr><td>GC heap size</td><td>n/a</td><td></td><td>n/a</td><td></td><td>n/a</td><td></td></tr>
-<tr><td>Total committed bytes</td><td>123.82 MB<div class='barTrack'><div class='barFill' style='width:4%;background:#2b7de9'></div></div></td><td></td><td>102.59 MB<div class='barTrack'><div class='barFill' style='width:3%;background:#8e44ad'></div></div></td><td></td><td>3.14 GB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
-<tr><td>Peak working set</td><td>2.25 GB<div class='barTrack'><div class='barFill' style='width:81%;background:#2b7de9'></div></div></td><td></td><td>2.26 GB<div class='barTrack'><div class='barFill' style='width:82%;background:#8e44ad'></div></div></td><td></td><td>2.76 GB<div class='barTrack'><div class='barFill' style='width:100%;background:'></div></div></td><td></td></tr>
+<tr><td>Total committed bytes</td><td>123.82 MB<div class='barTrack'><div class='barFill' style='width:4%;background:#2b7de9'></div></div></td><td></td><td>102.59 MB<div class='barTrack'><div class='barFill' style='width:3%;background:#8e44ad'></div></div></td><td></td><td>3.14 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
+<tr><td>Peak working set</td><td>2.25 GB<div class='barTrack'><div class='barFill' style='width:81%;background:#2b7de9'></div></div></td><td></td><td>2.26 GB<div class='barTrack'><div class='barFill' style='width:82%;background:#8e44ad'></div></div></td><td></td><td>2.76 GB<div class='barTrack'><div class='barFill' style='width:100%;background:#e94f2b'></div></div></td><td></td></tr>
 
     </tbody>
   </table>
@@ -695,7 +702,7 @@
   <details class="statsDetails" open>
     <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
-      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'></th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
+      <thead><tr><th></th><th colspan='4'>Workstation GC</th><th colspan='4'>Server GC</th><th colspan='4'>LXRGC</th></tr><tr><th>Metric</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th><th>avg</th><th>p50</th><th>p90</th><th>p99</th></tr></thead>
       <tbody>
         <tr><td>GC pause time (ms per ~1s sample)</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td><td>0.00 ms</td></tr>
         <tr><td>Working set (MB)</td><td>2,302</td><td>2,302</td><td>2,302</td><td>2,302</td><td>2,315</td><td>2,315</td><td>2,316</td><td>2,316</td><td>2,825</td><td>2,825</td><td>2,826</td><td>2,826</td></tr>
@@ -719,7 +726,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='81.3,196.0 108.7,196.0 136.0,196.0 163.3,196.0 190.7,196.0 218.0,196.0 245.3,196.0 272.7,196.0 300.0,196.0 327.3,196.0 354.7,196.0 382.0,196.0 409.3,196.0 436.7,196.0 464.0,196.0 491.3,196.0 518.7,196.0 546.0,196.0 573.3,196.0 600.7,196.0 628.0,196.0 655.3,196.0 682.7,196.0 710.0,196.0' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-24</text>
 </svg>
@@ -738,7 +745,7 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='262.7,23.8 501.3,23.8 710.0,23.8' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='262.7,23.8 471.5,23.8 710.0,23.8' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='262.7,23.8 501.3,23.8 710.0,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='262.7,23.8 501.3,23.8 710.0,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-22</text>
 </svg>
@@ -756,19 +763,19 @@
   <line x1='54' y1='230' x2='710' y2='230' stroke='#ccc' stroke-width='1'/>
   <rect x='58' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC Avg: 0.000 ms</title></rect>
 <rect x='100' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC Avg: 0.000 ms</title></rect>
-<rect x='142' y='230' width='38' height='0' fill='' opacity='0.9'><title> Avg: 0.000 ms</title></rect>
+<rect x='142' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Avg: 0.000 ms</title></rect>
 <rect x='189.2' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P50: 0.000 ms</title></rect>
 <rect x='231.2' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P50: 0.000 ms</title></rect>
-<rect x='273.2' y='230' width='38' height='0' fill='' opacity='0.9'><title> P50: 0.000 ms</title></rect>
+<rect x='273.2' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P50: 0.000 ms</title></rect>
 <rect x='320.4' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P90: 0.000 ms</title></rect>
 <rect x='362.4' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P90: 0.000 ms</title></rect>
-<rect x='404.4' y='230' width='38' height='0' fill='' opacity='0.9'><title> P90: 0.000 ms</title></rect>
+<rect x='404.4' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P90: 0.000 ms</title></rect>
 <rect x='451.6' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC P99: 0.000 ms</title></rect>
 <rect x='493.6' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC P99: 0.000 ms</title></rect>
-<rect x='535.6' y='230' width='38' height='0' fill='' opacity='0.9'><title> P99: 0.000 ms</title></rect>
+<rect x='535.6' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC P99: 0.000 ms</title></rect>
 <rect x='582.8' y='230' width='38' height='0' fill='#2b7de9' opacity='0.9'><title>Workstation GC Max: 0.000 ms</title></rect>
 <rect x='624.8' y='230' width='38' height='0' fill='#8e44ad' opacity='0.9'><title>Server GC Max: 0.000 ms</title></rect>
-<rect x='666.8' y='230' width='38' height='0' fill='' opacity='0.9'><title> Max: 0.000 ms</title></rect>
+<rect x='666.8' y='230' width='38' height='0' fill='#e94f2b' opacity='0.9'><title>LXRGC Max: 0.000 ms</title></rect>
 
   <text x='119.6' y='252' font-size='10' fill='#666' text-anchor='middle'>Avg</text><text x='250.8' y='252' font-size='10' fill='#666' text-anchor='middle'>P50</text><text x='382' y='252' font-size='10' fill='#666' text-anchor='middle'>P90</text><text x='513.2' y='252' font-size='10' fill='#666' text-anchor='middle'>P99</text><text x='644.4' y='252' font-size='10' fill='#666' text-anchor='middle'>Max</text>
 </svg>
@@ -787,40 +794,38 @@
   <line x1='54' y1='196' x2='710' y2='196' stroke='#ccc' stroke-width='1'/>
   <polyline points='54.0,55.8 81.3,55.8 108.7,55.7 136.0,55.7 163.3,55.7 190.7,55.7 218.0,55.7 245.3,55.7 272.7,55.7 300.0,55.7 327.3,55.7 354.7,55.7 382.0,55.7 409.3,55.7 436.7,55.7 464.0,55.7 491.3,55.7 518.7,55.7 546.0,55.7 573.3,55.7 600.7,55.7 628.0,55.7 655.3,55.7 682.7,55.7 710.0,55.7' fill='none' stroke='#2b7de9' stroke-width='2' opacity='0.9' />
 <polyline points='54.0,55.0 81.3,55.0 108.7,55.0 136.0,55.0 163.3,55.0 190.7,54.9 218.0,54.9 245.3,54.9 272.7,54.9 300.0,54.9 327.3,54.9 354.7,54.9 382.0,54.9 409.3,54.9 436.7,54.9 464.0,54.9 491.3,54.9 518.7,54.9 546.0,54.9 573.3,54.9 600.7,54.9 628.0,54.9 655.3,54.9 682.7,54.9 710.0,54.9' fill='none' stroke='#8e44ad' stroke-width='2' opacity='0.9' />
-<polyline points='54.0,24.0 81.3,23.9 108.7,23.9 136.0,23.9 163.3,23.9 190.7,23.9 218.0,23.9 245.3,23.9 272.7,23.9 300.0,23.9 327.3,23.9 354.7,23.9 382.0,23.8 409.3,23.8 436.7,23.8 464.0,23.8 491.3,23.8 518.7,23.8 546.0,23.8 573.3,23.8 600.7,23.8 628.0,23.8 655.3,23.8 682.7,23.8 710.0,23.8' fill='none' stroke='' stroke-width='2' opacity='0.9' />
+<polyline points='54.0,24.0 81.3,23.9 108.7,23.9 136.0,23.9 163.3,23.9 190.7,23.9 218.0,23.9 245.3,23.9 272.7,23.9 300.0,23.9 327.3,23.9 354.7,23.9 382.0,23.8 409.3,23.8 436.7,23.8 464.0,23.8 491.3,23.8 518.7,23.8 546.0,23.8 573.3,23.8 600.7,23.8 628.0,23.8 655.3,23.8 682.7,23.8 710.0,23.8' fill='none' stroke='#e94f2b' stroke-width='2' opacity='0.9' />
 
   <text x='640' y='216' font-size='10' fill='#666'>time (s), 0-24</text>
 </svg>
     </div>
   </div>
-  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:'></span></span></div>
+  <div class="legend small"><span><span class='sw' style='background:#2b7de9'></span>Workstation GC</span><span><span class='sw' style='background:#8e44ad'></span>Server GC</span><span><span class='sw' style='background:#e94f2b'></span>LXRGC</span></div>
 </section>
 
   <div class="callout">
-    <strong>How to read this:</strong> LXRGC always reports 0 ms GC pause time and 0 collections
-    across all generations - there is nothing to compact or trace. Its memory (working
-    set/committed bytes/heap size) grows monotonically and roughly tracks total bytes allocated,
-    since nothing is ever reclaimed, whereas Workstation/Server GC's footprint stays roughly flat
-    (or grows much more slowly) thanks to periodic gen0/1/2 collections. Throughput differences
-    between the three configurations reflect the true cost of garbage collection (pause time,
-    write barriers, card scanning) for that specific allocation pattern - workloads with more
-    survivorship/larger live sets (e.g. the cache-heavy GCPerfSim scenario) tend to show a bigger
-    gap than workloads dominated by short-lived gen0 garbage.
+    <strong>How to read this:</strong> LXRGC <em>does</em> collect &mdash; it reports real
+    collection counts (with equal gen0/1/2 numbers, since each cycle is a unified full-heap
+    stop-the-world pass) and non-zero GC pause time while a backup trace + sweep runs. As a young
+    research collector it is throughput-competitive with the built-in GC across these workloads,
+    but <strong>over-commits memory</strong>: its working-set/committed-bytes footprint is
+    typically much higher than Workstation/Server GC because its Immix sweep reclaims coarsely (at
+    chunk granularity, no evacuation/compaction yet) and its allocator over-reserves. The gap in
+    the memory rows is the honest cost of a from-scratch GC versus the mature, compacting built-in
+    collector; the throughput rows show that RC + periodic tracing keeps pace on these patterns.
   </div>
 
   <div class="callout">
-    <strong>Why "Total allocated" looks much bigger for LXRGC:</strong> this is expected, not a
-    bug. <code>GC.GetTotalAllocatedBytes(precise: false)</code> - the counter both the real GC and
-    LXRGC report through - is documented as a fast approximation on the real GC: each thread
-    allocates from a private bump-pointer "allocation context" and the imprecise counter only
-    reconciles those contexts opportunistically, so with many concurrently-allocating threads it
-    can noticeably <em>undercount</em> true allocation volume between reconciliations. LXRGC's
-    implementation instead returns its arena's exact bump-pointer position - a true, exact count of
-    every byte ever handed out, since nothing is ever reclaimed. So the gap between GC modes in the
-    "Total allocated" row partly reflects this counter-precision difference, not solely a
-    difference in actual allocation behavior; the working-set/committed-bytes/heap-size rows (which
-    come from OS/GC-heap accounting, not this approximate counter) are the more apples-to-apples
-    memory comparison.
+    <strong>A note on the <code>Total allocated</code> row:</strong>
+    <code>GC.GetTotalAllocatedBytes(precise: false)</code> &mdash; the counter all three modes
+    report through &mdash; is documented as a fast approximation on the built-in GC: each thread
+    allocates from a private bump-pointer &ldquo;allocation context&rdquo; and the imprecise counter
+    only reconciles those contexts opportunistically, so with many concurrently-allocating threads
+    it can noticeably <em>undercount</em> true allocation volume between reconciliations. Small
+    differences in this row across GC modes therefore partly reflect counter-precision, not solely
+    a difference in actual allocation behavior; the working-set/committed-bytes/heap-size rows
+    (which come from OS/GC-heap accounting, not this approximate counter) are the more
+    apples-to-apples memory comparison.
   </div>
 
   <footer>

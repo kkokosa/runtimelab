@@ -36,8 +36,8 @@ $gcPerfSimArgs = @{
 }
 
 $gcModeOrder = @("workstation", "server", "lxrgc")
-$gcModeColor = @{ workstation = "#2b7de9"; server = "#8e44ad"; zerogc = "#e94f2b" }
-$gcModeLabel = @{ workstation = "Workstation GC"; server = "Server GC"; zerogc = "LXRGC" }
+$gcModeColor = @{ workstation = "#2b7de9"; server = "#8e44ad"; lxrgc = "#e94f2b" }
+$gcModeLabel = @{ workstation = "Workstation GC"; server = "Server GC"; lxrgc = "LXRGC" }
 
 function Fmt-Bytes($n) {
     if ($null -eq $n) { return "n/a" }
@@ -442,25 +442,32 @@ $html = @"
 </head>
 <body>
   <h1>LXRGC vs. Workstation GC vs. Server GC</h1>
-  <p class="subtitle">Generated $genDate on this machine. Eleven workloads (2 hand-written sample apps, 5 GCPerfSim scenarios, 2 zero-alloc scenarios, dotLLM inference, and a growing-cache scenario), each run once per GC configuration.</p>
+  <p class="subtitle">Generated $genDate on this machine. $($byScenario.Keys.Count) workloads, each run once per GC configuration (Workstation, Server, LXRGC), on the custom pluggable-write-barrier runtime.</p>
 
   <div class="legend">
     <span><span class="sw" style="background:$($gcModeColor.workstation)"></span>Workstation GC (default, non-concurrent-by-default background GC)</span>
     <span><span class="sw" style="background:$($gcModeColor.server)"></span>Server GC (DOTNET_gcServer=1, per-core heaps)</span>
-    <span><span class="sw" style="background:$($gcModeColor.zerogc)"></span>LXRGC (allocate-only, never-collect standalone GC)</span>
+    <span><span class="sw" style="background:$($gcModeColor.lxrgc)"></span>LXRGC (LXR: coalescing reference counting + backup trace + Immix sweep, stop-the-world)</span>
   </div>
 
   <div class="callout">
     <strong>What is LXRGC?</strong> LXRGC is a custom standalone CoreCLR GC (loaded via
-    <code>DOTNET_GCName=LXRGC.dll</code>) modeled after the "Epsilon"/"no-op" GC idea (and the
-    author's earlier <a href="https://github.com/kkokosa/UpsilonGC">UpsilonGC</a> experiment): it
-    implements the full <code>IGCHeap</code>/<code>IGCHandleManager</code> ABI, but its allocator is a
-    simple bump-pointer arena that <em>never</em> collects, compacts, or reclaims memory - every
-    object allocated for the lifetime of the process stays resident. It exposes the same
+    <code>DOTNET_GCName=LXRGC.dll</code>) that implements the <strong>LXR</strong> collector
+    (&ldquo;Low-Latency, High-Throughput Garbage Collection&rdquo;, Zhao, Blackburn &amp; McKinley,
+    PLDI 2022 &mdash; <a href="https://arxiv.org/abs/2210.17175">arXiv:2210.17175</a>) as a sibling to
+    the author's earlier <a href="https://github.com/kkokosa/UpsilonGC">UpsilonGC</a> experiment. It
+    implements the full <code>IGCHeap</code>/<code>IGCHandleManager</code> ABI over a real
+    <strong>Immix</strong> substrate (32&nbsp;KiB blocks / 256&nbsp;B lines, per-thread bump
+    allocator), and performs <em>algorithmically-full stop-the-world reclamation</em>:
+    <strong>coalescing reference counting</strong> driven by the runtime fork's generic pluggable
+    write barrier (which surfaces the overwritten field value), recursive zero-count freeing, a
+    periodic <strong>backup trace</strong> (under <code>SuspendEE</code>, marking from handles +
+    <code>GcScanRoots</code>) that collects the dead cycles pure RC cannot, and an
+    <strong>Immix sweep</strong> that <code>MEM_DECOMMIT</code>s fully-dead chunks and recycles
+    them. Collection is triggered by an allocation-growth budget. It exposes the same
     <code>GC.CollectionCount</code>, <code>GC.GetTotalAllocatedBytes</code>, and
-    <code>GC.GetGCMemoryInfo()</code> counters as the real GC, so apps and tools observe 0
-    collections and monotonically growing memory instead of an error. This report compares it
-    against both default GC modes (Workstation and Server) across 5 workloads, using
+    <code>GC.GetGCMemoryInfo()</code> counters as the built-in GC. This report compares it against
+    both default GC modes (Workstation and Server) across every workload, using
     <code>dotnet-counters</code> to capture real second-by-second time series (not just
     end-of-run summaries) for GC pause time, memory, and throughput.
   </div>
@@ -468,30 +475,28 @@ $html = @"
   $sections
 
   <div class="callout">
-    <strong>How to read this:</strong> LXRGC always reports 0 ms GC pause time and 0 collections
-    across all generations - there is nothing to compact or trace. Its memory (working
-    set/committed bytes/heap size) grows monotonically and roughly tracks total bytes allocated,
-    since nothing is ever reclaimed, whereas Workstation/Server GC's footprint stays roughly flat
-    (or grows much more slowly) thanks to periodic gen0/1/2 collections. Throughput differences
-    between the three configurations reflect the true cost of garbage collection (pause time,
-    write barriers, card scanning) for that specific allocation pattern - workloads with more
-    survivorship/larger live sets (e.g. the cache-heavy GCPerfSim scenario) tend to show a bigger
-    gap than workloads dominated by short-lived gen0 garbage.
+    <strong>How to read this:</strong> LXRGC <em>does</em> collect &mdash; it reports real
+    collection counts (with equal gen0/1/2 numbers, since each cycle is a unified full-heap
+    stop-the-world pass) and non-zero GC pause time while a backup trace + sweep runs. As a young
+    research collector it is throughput-competitive with the built-in GC across these workloads,
+    but <strong>over-commits memory</strong>: its working-set/committed-bytes footprint is
+    typically much higher than Workstation/Server GC because its Immix sweep reclaims coarsely (at
+    chunk granularity, no evacuation/compaction yet) and its allocator over-reserves. The gap in
+    the memory rows is the honest cost of a from-scratch GC versus the mature, compacting built-in
+    collector; the throughput rows show that RC + periodic tracing keeps pace on these patterns.
   </div>
 
   <div class="callout">
-    <strong>Why "Total allocated" looks much bigger for LXRGC:</strong> this is expected, not a
-    bug. <code>GC.GetTotalAllocatedBytes(precise: false)</code> - the counter both the real GC and
-    LXRGC report through - is documented as a fast approximation on the real GC: each thread
-    allocates from a private bump-pointer "allocation context" and the imprecise counter only
-    reconciles those contexts opportunistically, so with many concurrently-allocating threads it
-    can noticeably <em>undercount</em> true allocation volume between reconciliations. LXRGC's
-    implementation instead returns its arena's exact bump-pointer position - a true, exact count of
-    every byte ever handed out, since nothing is ever reclaimed. So the gap between GC modes in the
-    "Total allocated" row partly reflects this counter-precision difference, not solely a
-    difference in actual allocation behavior; the working-set/committed-bytes/heap-size rows (which
-    come from OS/GC-heap accounting, not this approximate counter) are the more apples-to-apples
-    memory comparison.
+    <strong>A note on the <code>Total allocated</code> row:</strong>
+    <code>GC.GetTotalAllocatedBytes(precise: false)</code> &mdash; the counter all three modes
+    report through &mdash; is documented as a fast approximation on the built-in GC: each thread
+    allocates from a private bump-pointer &ldquo;allocation context&rdquo; and the imprecise counter
+    only reconciles those contexts opportunistically, so with many concurrently-allocating threads
+    it can noticeably <em>undercount</em> true allocation volume between reconciliations. Small
+    differences in this row across GC modes therefore partly reflect counter-precision, not solely
+    a difference in actual allocation behavior; the working-set/committed-bytes/heap-size rows
+    (which come from OS/GC-heap accounting, not this approximate counter) are the more
+    apples-to-apples memory comparison.
   </div>
 
   <footer>
