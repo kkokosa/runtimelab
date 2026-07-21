@@ -50,6 +50,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <windows.h>
+#include <vector>
 
 #include "gcenv.structs.h"
 #include "gcenv.base.h"
@@ -283,6 +284,7 @@ public:
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs
     void ParallelDrainMarkStack(int workers); // P5: parallel transitive closure
+    void DrainSliceLocal(std::vector<Object*>& local); // drain one worker's grey set
     void DrainClosure();                // parallel or serial closure per LXR_GC_THREADS
     Object* ResolveInterior(uint8_t* interior); // interior pointer -> containing object
     // Conservative fallback when an in-heap interior/byref root cannot be

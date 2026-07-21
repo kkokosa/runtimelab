@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>
 #include <thread>
 
 // GCScanObjectRefs' collectible-class branch calls this EE up-call. LXRGC does
@@ -209,6 +210,24 @@ static size_t g_zeroCountCap = 0;
 static Object** g_markStack = nullptr;
 static size_t g_markTop = 0;
 static size_t g_markCap = 0;
+
+// P5 persistent parallel-mark worker pool. Raw std::thread workers spun up/torn
+// down per drain (the previous approach) perturbed SuspendEE and hung/raced even
+// in the STW path, because thread creation/teardown inside a suspension pause
+// races the runtime's thread store. Instead we create N-1 runtime-registered,
+// non-suspendable worker threads ONCE at Initialize (never during a pause) via
+// IGCToCLR::CreateThread; they block on per-worker start events and only run
+// inside the STW mark pause (all mutators parked), so they may read object memory
+// safely. Coordination is one auto-reset start event + one auto-reset done event
+// per worker; the current work partition lives in g_poolSlices. Only one drain
+// runs at a time (collection is serialized), so this shared state needs no lock.
+static int      g_poolWorkers = 0;              // persistent workers created (= gcThreads-1)
+static HANDLE*  g_poolStart   = nullptr;        // [w] auto-reset: wake worker w
+static HANDLE*  g_poolDone    = nullptr;        // [w] auto-reset: worker w finished its slice
+static std::vector<std::vector<Object*>>* g_poolSlices = nullptr; // slice[w+1] is worker w's grey set
+static class LXRCollector* g_poolCollector = nullptr;
+static void LXRMarkWorkerProc(void* idx);
+static void EnsureMarkWorkerPool();
 
 static uint32_t g_pageSize = 4096;
 
@@ -902,13 +921,75 @@ void LXRCollector::DrainMarkStack()
     }
 }
 
-// Parallel transitive closure (P5). The seed set already sits in g_markStack
-// (each entry marked by PushMark). Partition it round-robin across `workers`
-// threads; each drains its own local stack to completion. Correctness rests on
-// the atomic mark bit (MarkObject): an object is claimed by exactly one worker,
-// so no object is scanned twice and no shared mark stack / termination protocol
-// is needed. Runs inside the STW trace pause, where no managed code executes, so
-// transient worker threads may read object memory without runtime registration.
+// Drain one worker's local grey set to completion. The atomic mark bit
+// (MarkObject) claims each object for exactly one worker, so workers never scan
+// the same object and need no shared stack or termination protocol.
+void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
+{
+    while (!local.empty())
+    {
+        Object* o = local.back();
+        local.pop_back();
+        size_t osz = LXRObjectSize(o);
+        if (osz == 0)
+            continue; // null/half-init MethodTable: not scannable
+        GCScanObjectRefs(o, osz, [this, &local](Object** ref)
+        {
+            Object* c = *ref;
+            if (c != nullptr && MarkObject(c)) // atomic claim
+                local.push_back(c);
+        });
+    }
+}
+
+// Persistent worker-pool thread body. Blocks until signalled for a drain, then
+// processes its dedicated slice (index = poolIndex+1; slice 0 is the main GC
+// thread) and signals completion. Runs only inside the STW mark pause.
+static void LXRMarkWorkerProc(void* idx)
+{
+    int w = (int)(intptr_t)idx; // pool index [0, g_poolWorkers)
+    for (;;)
+    {
+        WaitForSingleObject(g_poolStart[w], INFINITE);
+        std::vector<std::vector<Object*>>* slices = g_poolSlices;
+        if (slices != nullptr && (size_t)(w + 1) < slices->size() && g_poolCollector != nullptr)
+            g_poolCollector->DrainSliceLocal((*slices)[(size_t)(w + 1)]);
+        SetEvent(g_poolDone[w]);
+    }
+}
+
+// Create the persistent parallel-mark worker pool once, at Initialize time (never
+// during a STW pause). No-op unless LXR_GC_THREADS>1. On any failure we leave
+// g_poolWorkers at its partial count; ParallelDrainMarkStack falls back to serial.
+static void EnsureMarkWorkerPool()
+{
+    if (g_poolWorkers != 0 || g_gcThreads <= 1 || g_theGCToCLR == nullptr)
+        return;
+    int want = g_gcThreads - 1;
+    g_poolStart = new (std::nothrow) HANDLE[want];
+    g_poolDone  = new (std::nothrow) HANDLE[want];
+    if (g_poolStart == nullptr || g_poolDone == nullptr)
+        return;
+    g_poolCollector = &g_lxrCollector;
+    for (int w = 0; w < want; w++)
+    {
+        g_poolStart[w] = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_poolDone[w]  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (g_poolStart[w] == nullptr || g_poolDone[w] == nullptr)
+            return; // partial pool; ParallelDrainMarkStack clamps to g_poolWorkers
+        if (!g_theGCToCLR->CreateThread(&LXRMarkWorkerProc, (void*)(intptr_t)w,
+                                        /*is_suspendable*/ false, ".NET LXR mark worker"))
+            return;
+        g_poolWorkers = w + 1; // publish only fully-created workers
+    }
+}
+
+// Parallel transitive closure (P5). The seed set already sits in g_markStack.
+// Partition it round-robin across the available lanes (main thread = lane 0, each
+// pooled worker = lane w+1); each lane drains its own local stack to completion.
+// Correctness rests on the atomic mark bit: an object is claimed by exactly one
+// lane. Runs inside the STW trace pause. Uses the persistent worker pool; if the
+// pool is unavailable it falls back to the serial drain (never per-drain threads).
 void LXRCollector::ParallelDrainMarkStack(int workers)
 {
     if (workers < 2 || g_markTop == 0)
@@ -916,38 +997,33 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
         DrainMarkStack();
         return;
     }
-
-    size_t n = g_markTop;
-    std::vector<std::vector<Object*>> slices((size_t)workers);
-    for (size_t i = 0; i < n; i++)
-        slices[i % (size_t)workers].push_back(g_markStack[i]);
-    g_markTop = 0; // consumed into the per-worker slices
-
-    auto run = [this](std::vector<Object*>* local)
+    if (g_poolWorkers < 1)
     {
-        while (!local->empty())
-        {
-            Object* o = local->back();
-            local->pop_back();
-            size_t osz = LXRObjectSize(o);
-            if (osz == 0)
-                continue; // null/half-init MethodTable: not scannable
-            GCScanObjectRefs(o, osz, [this, local](Object** ref)
-            {
-                Object* c = *ref;
-                if (c != nullptr && MarkObject(c)) // atomic claim
-                    local->push_back(c);
-            });
-        }
-    };
+        // Pool not available (creation failed / gcThreads changed): stay correct.
+        DrainMarkStack();
+        return;
+    }
 
-    std::vector<std::thread> ts;
-    ts.reserve((size_t)workers - 1);
-    for (int w = 1; w < workers; w++)
-        ts.emplace_back(run, &slices[(size_t)w]);
-    run(&slices[0]);
-    for (auto& t : ts)
-        t.join();
+    int lanes = workers;
+    if (lanes > g_poolWorkers + 1)
+        lanes = g_poolWorkers + 1; // clamp to what the pool can serve
+
+    static std::vector<std::vector<Object*>> slices; // reused; single drain at a time
+    slices.assign((size_t)lanes, std::vector<Object*>());
+    size_t n = g_markTop;
+    for (size_t i = 0; i < n; i++)
+        slices[i % (size_t)lanes].push_back(g_markStack[i]);
+    g_markTop = 0; // consumed into the per-lane slices
+
+    g_poolSlices = &slices;
+    for (int w = 1; w < lanes; w++)   // wake pooled workers 0..lanes-2 -> slices 1..lanes-1
+        SetEvent(g_poolStart[w - 1]);
+
+    DrainSliceLocal(slices[0]);       // main thread drains lane 0
+
+    for (int w = 1; w < lanes; w++)
+        WaitForSingleObject(g_poolDone[w - 1], INFINITE);
+    g_poolSlices = nullptr;
 }
 
 // Drain the current grey set (already in g_markStack) using the parallel closure
@@ -1439,6 +1515,10 @@ void LXRCollector::EnsureMarkCommitted(uint8_t* addrEnd)
 // Pre-pass callbacks: pin every root/handle referent (never move it) so
 // evacuation only ever has to forward heap references, not roots or handles.
 static std::unordered_set<Object*>* g_evacPinned = nullptr;
+// Set if an interior root could not be resolved during the evac pin pass: its
+// target cannot be pinned and roots are not fixed up, so evacuation is skipped
+// this cycle (sweep still runs). Rare (0 under all validated runs).
+static volatile LONG g_evacUnresolvedInterior = 0;
 static void LXRPinRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
 {
     Object* o = *ppObj;
@@ -1448,7 +1528,10 @@ static void LXRPinRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags
     {
         o = g_lxrCollector.ResolveInterior((uint8_t*)o);
         if (o == nullptr)
+        {
+            InterlockedExchange(&g_evacUnresolvedInterior, 1);
             return;
+        }
     }
     if (g_evacPinned != nullptr)
         g_evacPinned->insert(o);
@@ -1483,11 +1566,21 @@ void LXRCollector::Evacuate()
 
     // 1. Pin all root/handle referents (interior roots resolve to their base).
     std::unordered_set<Object*> pinned;
+    InterlockedExchange(&g_evacUnresolvedInterior, 0);
     g_evacPinned = &pinned;
     ScanContext sc; sc.promotion = true;
     g_theGCToCLR->GcScanRoots(&LXRPinRoot, 2, 2, &sc);
     g_evacPinned = nullptr;
     LXRGCHandleStore::ForEachLiveHandle(&LXRPinHandle, &pinned);
+
+    // If any interior root could not be resolved, its target is unpinned and
+    // roots are not fixed up; moving anything risks dangling that root byref.
+    // Skip evacuation this cycle (the sweep still reclaims dead regions).
+    if (g_evacUnresolvedInterior != 0)
+    {
+        if (verbose) { fprintf(stderr, "LXRGC: [evac] skipped: unresolved interior root this cycle\n"); fflush(stderr); }
+        return;
+    }
 
     // 2. Select fragmented regions within the copy budget. Snapshot first so
     //    that registering destination chunks (which may realloc g_chunks) cannot
@@ -1532,6 +1625,12 @@ void LXRCollector::Evacuate()
     // 3. Copy live, non-pinned objects into fresh destination chunks; record
     //    forwarding old->new. Pinned live objects are left in place.
     std::unordered_map<Object*, Object*> forwarding;
+    // Interior/byref support (defect 3): also record each moved object's old
+    // address range and new base, so a heap byref/interior pointer that lands
+    // *inside* a moved object (e.g. a runtime-async continuation's captured `ref`
+    // field) can be rebased preserving its offset, not just object-start refs.
+    struct MovedRange { uint8_t* oldStart; uint8_t* oldEnd; uint8_t* newStart; };
+    std::vector<MovedRange> movedRanges;
     uint8_t* destPtr = nullptr;
     uint8_t* destEnd = nullptr;
     int      curDestIndex = -1;
@@ -1581,6 +1680,7 @@ void LXRCollector::Evacuate()
             if (d == nullptr) { skipped++; continue; } // out of space: leave in place
             memcpy(d, o, sz);
             forwarding.emplace(o, (Object*)d);
+            movedRanges.push_back({ (uint8_t*)o, (uint8_t*)o + sz, d });
             MarkObject((Object*)d);
             CommitPageFor(RCSlot((Object*)d));
             CommitPageFor(RCSlot(o));
@@ -1603,6 +1703,50 @@ void LXRCollector::Evacuate()
     //    fix-up (their referents were pinned). Walk all live objects (including
     //    the freshly copied destinations) and forward their fields. Forwarded
     //    source objects are dead and skipped.
+    //
+    //    Both object-start references and *interior/byref* pointers are handled:
+    //    GCScanObjectRefs visits objref and byref slots identically, so a field
+    //    value may point at a moved object's start (objref) or into its interior
+    //    (a heap byref, e.g. a runtime-async continuation's captured `ref`).
+    //    Sort the moved ranges by old address so an interior value can be located
+    //    by binary search and rebased preserving its offset (defect 3). Without
+    //    this, interior byrefs into moved objects dangle -> NRE in runtime-async.
+    std::sort(movedRanges.begin(), movedRanges.end(),
+              [](const MovedRange& a, const MovedRange& b) { return a.oldStart < b.oldStart; });
+    auto rebaseField = [&forwarding, &movedRanges](Object** f)
+    {
+        uint8_t* v = (uint8_t*)*f;
+        if (v == nullptr)
+            return;
+        // Fast path: exact object-start reference to a moved object.
+        auto it = forwarding.find((Object*)v);
+        if (it != forwarding.end())
+        {
+            *f = it->second;
+            InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
+            return;
+        }
+        // Interior/byref: find the moved object whose [oldStart,oldEnd) strictly
+        // contains v (v==oldStart is the exact case handled above). upper_bound
+        // gives the first range with oldStart > v; its predecessor is the only
+        // candidate whose oldStart <= v.
+        if (movedRanges.empty())
+            return;
+        size_t lo = 0, hi = movedRanges.size();
+        while (lo < hi) // first index with oldStart > v
+        {
+            size_t mid = (lo + hi) >> 1;
+            if (movedRanges[mid].oldStart <= v) lo = mid + 1; else hi = mid;
+        }
+        if (lo == 0)
+            return; // no range starts at/below v
+        const MovedRange& r = movedRanges[lo - 1];
+        if (v > r.oldStart && v < r.oldEnd)
+        {
+            *f = (Object*)(r.newStart + (v - r.oldStart));
+            InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
+        }
+    };
     for (size_t i = 0; i < g_chunkCount; i++)
     {
         ChunkRegion& c = g_chunks[i];
@@ -1621,15 +1765,7 @@ void LXRCollector::Evacuate()
                 continue; // dead source
             if (!IsMarked(o))
                 continue; // unreachable garbage: sweep will handle
-            GCScanObjectRefs(o, sz, [&forwarding](Object** f)
-            {
-                auto it = forwarding.find(*f);
-                if (it != forwarding.end())
-                {
-                    *f = it->second;
-                    InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
-                }
-            });
+            GCScanObjectRefs(o, sz, rebaseField);
         }
     }
 
@@ -1843,6 +1979,10 @@ HRESULT LXRGCHeap::Initialize()
             g_theGCToCLR->CreateThread(&LXRWatchdogThreadProc, nullptr, /*is_suspendable*/ false, ".NET LXR watchdog");
         }
         (void)&LXRWatchdogThreadProc;
+
+        // Bring up the persistent parallel-mark worker pool now (init time, not
+        // during a pause) so parallel drains never create threads under STW.
+        EnsureMarkWorkerPool();
     }
 
     return S_OK;
