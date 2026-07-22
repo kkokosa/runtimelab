@@ -845,9 +845,30 @@ void LXRCollector::VerifyTraceComplete()
 // CoreLib ref-array clear, drain/mark-commit ordering) failed to grey a slot.
 // Returns the number of objects it had to newly mark (the closure gap = 0 when
 // the concurrent trace was already complete), which is the root-cause signal.
+// Classify a heap address relative to the concurrent snapshot: returns true if it
+// was born DURING the trace window (at/above its region's recorded snapshot
+// high-water, or in a region that did not exist at snapshot time). A false result
+// means the object was already live at snapshot time - so if such an object is a
+// closure gap, some snapshot-era incoming edge was deleted without a barrier.
+static bool LXRBornInWindow(uint8_t* addr)
+{
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        if (addr < c.Start || addr >= end) continue;
+        if (i >= g_snapChunkCount || g_snapUsedEnd == nullptr || i >= g_snapUsedEnd->size())
+            return true; // region born mid-trace
+        return addr >= (*g_snapUsedEnd)[i];
+    }
+    return false;
+}
+
 int64_t LXRCollector::CompleteClosureOverMarked()
 {
     int64_t newlyMarked = 0;
+    int64_t gapBornInWindow = 0, gapSnapshotEra = 0;
     int reported = 0;
     bool progress = true;
     // Iterate to a fixpoint: draining pushed children marks transitively, but a
@@ -863,6 +884,13 @@ int64_t LXRCollector::CompleteClosureOverMarked()
             ChunkRegion& c = g_chunks[i];
             if (!c.Committed) continue;
             uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            // Skip provably-dead regions without parsing them. A region with no
+            // mark bit set contains no reachable object, so it can hold no
+            // marked->unmarked edge; the linear object parse (the expensive part,
+            // proportional to total heap) is only needed where marks exist. This
+            // keeps closure-completion proportional to the LIVE heap plus a cheap
+            // bitmap scan, not to the whole used heap.
+            if (!AnyMarkedInRange(c.Start, end)) continue;
             uint8_t* p = c.Start;
             while (p < end)
             {
@@ -872,18 +900,21 @@ int64_t LXRCollector::CompleteClosureOverMarked()
                 if (IsMarked(o))
                 {
                     MethodTable* pmt = o->GetGCSafeMethodTable();
-                    GCScanObjectRefs(o, sz, [this, o, pmt, &newlyMarked, &reported, &progress](Object** ref)
+                    GCScanObjectRefs(o, sz, [this, o, pmt, &newlyMarked, &gapBornInWindow, &gapSnapshotEra, &reported, &progress](Object** ref)
                     {
                         Object* child = *ref;
                         if (child != nullptr && InHeap(child) && !IsMarked(child))
                         {
-                            if (reported < 8)
+                            bool childBorn  = LXRBornInWindow((uint8_t*)child);
+                            bool parentBorn = LXRBornInWindow((uint8_t*)o);
+                            if (childBorn) gapBornInWindow++; else gapSnapshotEra++;
+                            if (reported < 12)
                             {
                                 reported++;
                                 fprintf(stderr,
-                                    "LXRGC: [closure] gap: MARKED parent %p mt=%p comp=%d -> UNMARKED child %p (fieldoff=%lld)\n",
-                                    (void*)o, (void*)pmt, pmt->HasComponentSize() ? 1 : 0,
-                                    (void*)child, (long long)((uint8_t*)ref - (uint8_t*)o));
+                                    "LXRGC: [closure] gap: parent %p mt=%p comp=%d born=%d -> child %p (fieldoff=%lld childBorn=%d)\n",
+                                    (void*)o, (void*)pmt, pmt->HasComponentSize() ? 1 : 0, parentBorn ? 1 : 0,
+                                    (void*)child, (long long)((uint8_t*)ref - (uint8_t*)o), childBorn ? 1 : 0);
                             }
                             newlyMarked++;
                             progress = true;
@@ -900,6 +931,9 @@ int64_t LXRCollector::CompleteClosureOverMarked()
         // reveal further children, hence the outer fixpoint loop.
         DrainClosure();
     }
+    if (newlyMarked != 0 && getenv("LXR_VERIFY_TRACE") != nullptr)
+        fprintf(stderr, "LXRGC: [closure] gap classification: bornInWindow=%lld snapshotEra=%lld total=%lld\n",
+                (long long)gapBornInWindow, (long long)gapSnapshotEra, (long long)newlyMarked);
     return newlyMarked;
 }
 
