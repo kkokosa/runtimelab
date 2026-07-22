@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <thread>
 #include <dbghelp.h>
+#include <tlhelp32.h>
 
 // One-shot full-memory minidump (enabled via LXR_DUMP_ON_GAP=1). Called at the
 // first concurrent-trace closure gap - while mutators are STW-stopped, so the
@@ -135,8 +136,27 @@ struct ModifiedBuffer
 };
 
 static thread_local ModifiedBuffer* t_modifiedBuffer = nullptr;
-static ModifiedBuffer* g_registeredBuffers = nullptr;
+static ModifiedBuffer* volatile g_registeredBuffers = nullptr;
 static CRITICAL_SECTION g_buffersLock;
+
+// Lock-free prepend of a modified buffer onto the global registry (see
+// RegisterSatbBuffer). The write barrier runs in cooperative GC mode; taking a
+// Win32 CRITICAL_SECTION there deadlocks SuspendEE - a mutator stalled on the
+// lock whose holder SuspendEE has already OS-suspended never reaches a safepoint,
+// so the suspension hangs. CAS-prepend keeps the barrier non-blocking. The
+// collector only traverses the registry under STW (ProcessModifiedBuffers /
+// SnapshotModifiedBuffers), so there is never a concurrent register+traverse.
+static void RegisterModifiedBuffer(ModifiedBuffer* nb)
+{
+    for (;;)
+    {
+        ModifiedBuffer* head = g_registeredBuffers;
+        nb->NextRegistered = head;
+        if (InterlockedCompareExchangePointer((PVOID volatile*)&g_registeredBuffers,
+                                              nb, head) == head)
+            return;
+    }
+}
 
 // --- SATB (snapshot-at-the-beginning) deletion buffers (P2) ----------------
 // While a trace window is open (g_satbActive), the field-logging barrier
@@ -194,10 +214,25 @@ struct RemsetBuffer
     RemsetBuffer* NextRegistered = nullptr;
 };
 static thread_local RemsetBuffer* t_remsetBuffer = nullptr;
-static RemsetBuffer* g_registeredRemsetBuffers = nullptr;
+static RemsetBuffer* volatile g_registeredRemsetBuffers = nullptr;
 static CRITICAL_SECTION g_remsetLock;
 static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation is enabled
 static volatile LONG g_evacActive = 0;   // STW evacuation gate (P3)
+
+// Lock-free prepend of a remset buffer (see RegisterModifiedBuffer): the barrier
+// must not take a CRITICAL_SECTION in cooperative mode or it can deadlock
+// SuspendEE. The collector only traverses the registry under STW (evacuation).
+static void RegisterRemsetBuffer(RemsetBuffer* nb)
+{
+    for (;;)
+    {
+        RemsetBuffer* head = g_registeredRemsetBuffers;
+        nb->NextRegistered = head;
+        if (InterlockedCompareExchangePointer((PVOID volatile*)&g_registeredRemsetBuffers,
+                                              nb, head) == head)
+            return;
+    }
+}
 
 // --- Concurrent SATB trace (P4) --------------------------------------------
 // While a concurrent trace window is open, block reuse is suppressed so region
@@ -342,6 +377,17 @@ static volatile int64_t g_traceEpoch = 0;
 // never itself a suspension target, so SuspendEE from it is deadlock-free.
 static HANDLE g_collectRequestEvent = nullptr; // auto-reset: wake the collector
 static HANDLE g_collectDoneEvent = nullptr;    // auto-reset: pulsed after each cycle
+// Manual-reset GC-completion event + flag backing IGCHeap::WaitUntilGCComplete /
+// IsGCInProgressHelper. RESET while a SuspendEE..RestartEE window is open, SET
+// otherwise (initially signaled). Without this, a thread trapped in
+// Thread::RareDisablePreemptiveGC calls our WaitUntilGCComplete, which (as a
+// no-op stub) returned instantly, so the thread busy-toggled preemptive<->coop
+// instead of blocking. Under a first-JIT/eviction thread storm 20+ threads spin
+// this loop and ThreadSuspend::SuspendAllThreads never gets a clean snapshot ->
+// SuspendEE livelocks forever. Blocking here lets trapped threads park until we
+// RestartEE, so suspension converges.
+static HANDLE g_gcCompleteEvent = nullptr;
+static volatile LONG g_gcInProgress = 0;
 static volatile LONG g_collectPending = 0;     // coalesces repeated alloc triggers
 static volatile int64_t g_collectCompletedSeq = 0; // ++ after each completed cycle
 static volatile LONG g_collectorShutdown = 0;
@@ -762,25 +808,50 @@ bool LXRCollector::RCDecrement(Object* obj)
     return (*slot == 0);
 }
 
+// Provision this thread's write-barrier buffers OFF the barrier, on the
+// allocation path (AllocateSlow) where the thread holds a proper frame and
+// allocation is safe w.r.t. SuspendEE. Doing the malloc here (never in the
+// leaf barrier) is what makes the barrier non-allocating and deadlock-free:
+// a mutator can never be frozen inside malloc while cooperative in the barrier.
+// Every thread that stores a heap reference must first obtain one to store,
+// which requires an allocation, so buffers are ready before any store logs.
+static void EnsureThreadBuffers()
+{
+    if (t_modifiedBuffer == nullptr)
+    {
+        ModifiedBuffer* mb = new (std::nothrow) ModifiedBuffer();
+        if (mb != nullptr) { t_modifiedBuffer = mb; RegisterModifiedBuffer(mb); }
+    }
+    if (t_satbBuffer == nullptr)
+    {
+        SatbBuffer* sb = new (std::nothrow) SatbBuffer();
+        if (sb != nullptr) { t_satbBuffer = sb; RegisterSatbBuffer(sb); }
+    }
+    if (t_remsetBuffer == nullptr)
+    {
+        RemsetBuffer* rb = new (std::nothrow) RemsetBuffer();
+        if (rb != nullptr) { t_remsetBuffer = rb; RegisterRemsetBuffer(rb); }
+    }
+}
+
 // LXR write-barrier slow path. Reached from the runtime's generic Callback
 // write barrier (WriteBarrierKind::Callback) on every in-heap reference-field
 // store, carrying the OLD value the runtime just overwrote.
+//
+// CRITICAL: this runs in cooperative GC mode as a leaf helper the runtime cannot
+// hijack while it is blocked. It must therefore NEVER allocate or take a blocking
+// lock - a mutator stalled here (e.g. inside malloc holding the CRT heap lock, or
+// on a CRITICAL_SECTION whose holder SuspendEE has frozen) can never reach a
+// safepoint, hanging SuspendEE forever. All per-thread buffers are provisioned
+// off the barrier by EnsureThreadBuffers() on the allocation path (a proper
+// frame). If a buffer is somehow still absent (a store before this thread's first
+// allocation - vanishingly rare), we take the sound fallback: drop the entry and
+// force this cycle's trace to re-close from roots, rather than allocate here.
 void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* newValue)
 {
     // (1) Coalescing-RC modified buffer: record (slot, oldValue) on mutation.
     ModifiedBuffer* buf = t_modifiedBuffer;
-    if (buf == nullptr)
-    {
-        buf = new (nothrow) ModifiedBuffer();
-        if (buf == nullptr)
-            return;
-        t_modifiedBuffer = buf;
-        EnterCriticalSection(&g_buffersLock);
-        buf->NextRegistered = g_registeredBuffers;
-        g_registeredBuffers = buf;
-        LeaveCriticalSection(&g_buffersLock);
-    }
-    if (buf->Count < ModifiedBuffer::kCapacity)
+    if (buf != nullptr && buf->Count < ModifiedBuffer::kCapacity)
     {
         buf->Entries[buf->Count].Slot = slot;
         buf->Entries[buf->Count].OldValue = oldValue;
@@ -789,8 +860,8 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
     }
     else if (g_satbActive)
     {
-        // Buffer full during a trace window: a written slot is dropped, so the
-        // finish-pause modified-set race reconciliation (MarkModifiedNewValues)
+        // Buffer absent/full during a trace window: a written slot is dropped, so
+        // the finish-pause modified-set race reconciliation (MarkModifiedNewValues)
         // could miss a reference installed into an already-scanned object. Fall
         // back to the full closure this cycle.
         InterlockedExchange(&g_modifiedOverflow, 1);
@@ -802,27 +873,12 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
     //     overwritten referent so a concurrent marker (P4) cannot miss an object
     //     unlinked mid-trace. Over-retention for one cycle is always safe;
     //     dropping an entry is not (a lost old value is an object the concurrent
-    //     marker may never reach). CRITICAL: the barrier runs in cooperative GC
-    //     mode, so it must NEVER allocate here - SuspendEE can hard-suspend a
-    //     mutator mid-HeapAlloc holding the OS heap lock, then the collector's own
-    //     realloc (PushMark) deadlocks on it. We therefore use a single, large,
-    //     pre-sized per-thread buffer; on overflow we set g_satbOverflow and the
-    //     STW finish pause falls back to a full, sound from-roots closure
-    //     (ConcurrentTraceFinish) that needs no SATB entry at all. The only
-    //     allocation is the once-per-thread first-touch (rare, matches the
-    //     pre-existing modified-buffer path).
+    //     marker may never reach) - so on absence/overflow we set g_satbOverflow
+    //     and the STW finish pause falls back to a full, sound from-roots closure
+    //     (ConcurrentTraceFinish) that needs no SATB entry at all.
     if (g_satbActive && oldValue != nullptr && InHeap(oldValue))
     {
         SatbBuffer* sb = t_satbBuffer;
-        if (sb == nullptr)
-        {
-            sb = new (nothrow) SatbBuffer();
-            if (sb != nullptr)
-            {
-                t_satbBuffer = sb;
-                RegisterSatbBuffer(sb);
-            }
-        }
         if (sb != nullptr && sb->Count < SatbBuffer::kCapacity)
         {
             sb->Entries[sb->Count++] = oldValue;
@@ -830,14 +886,16 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
         }
         else
         {
-            // Buffer full (or first-touch alloc failed): record that a snapshot
-            // entry was lost so the finish pause re-traces from roots.
+            // Buffer absent or full: record that a snapshot entry was lost so the
+            // finish pause re-traces from roots.
             InterlockedExchange(&g_satbOverflow, 1);
         }
     }
 
     // (3) Remembered set: record slots that now hold an inter-block pointer, so
     //     evacuation (P3) can locate and rewrite references into a moved block.
+    //     A dropped entry is safe: Evacuate() also forwards the fields of every
+    //     marked object, so remsets are an optimization, not the sole fix-up path.
     if (g_remsetActive && newValue != nullptr && InHeap(newValue) && InHeap((Object*)slot))
     {
         uintptr_t sblk = (uintptr_t)slot     & ~(lxr::kBlockSize - 1);
@@ -845,18 +903,6 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
         if (sblk != tblk)
         {
             RemsetBuffer* rb = t_remsetBuffer;
-            if (rb == nullptr)
-            {
-                rb = new (nothrow) RemsetBuffer();
-                if (rb != nullptr)
-                {
-                    t_remsetBuffer = rb;
-                    EnterCriticalSection(&g_remsetLock);
-                    rb->NextRegistered = g_registeredRemsetBuffers;
-                    g_registeredRemsetBuffers = rb;
-                    LeaveCriticalSection(&g_remsetLock);
-                }
-            }
             if (rb != nullptr && rb->Count < RemsetBuffer::kCapacity)
             {
                 rb->Entries[rb->Count++] = slot;
@@ -2873,6 +2919,13 @@ uint8_t* LXRGCHeap::ClaimBlocks(size_t bytes)
 
 Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_t flags)
 {
+    // Provision this thread's write-barrier buffers here (safe frame), so the
+    // cooperative-mode leaf barrier never has to allocate (see EnsureThreadBuffers
+    // / LogModifiedField): a mutator frozen inside malloc in the barrier would
+    // hang SuspendEE. Every heap-ref store is preceded by an allocation, so the
+    // buffers are always ready by the time the barrier logs.
+    EnsureThreadBuffers();
+
     size_t alignedSize = (size + 7) & ~(size_t)7;
     const size_t headerPad = sizeof(void*);
 
@@ -3153,6 +3206,35 @@ static LXRPhase DecidePhase(bool forceTrace)
     return LXRPhase::RCPause;
 }
 
+// --- GC-suspension helpers: drive g_gcCompleteEvent/g_gcInProgress around every
+//     SuspendEE..RestartEE window so threads trapped in RareDisablePreemptiveGC
+//     block (in our WaitUntilGCComplete) instead of busy-looping. See
+//     g_gcCompleteEvent for why (SuspendAllThreads livelock otherwise).
+static void LXREnsureGcCompleteEvent()
+{
+    if (g_gcCompleteEvent == nullptr)
+    {
+        // Manual-reset, initially signaled (no GC in progress at startup).
+        HANDLE e = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+        if (InterlockedCompareExchangePointer(&g_gcCompleteEvent, e, nullptr) != nullptr)
+            CloseHandle(e); // lost the race; keep the winner
+    }
+}
+static void LXRSuspendEE()
+{
+    LXREnsureGcCompleteEvent();
+    InterlockedExchange(&g_gcInProgress, 1);
+    ResetEvent(g_gcCompleteEvent); // trapped threads will now block in WaitUntilGCComplete
+    g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+}
+static void LXRRestartEE()
+{
+    g_theGCToCLR->RestartEE(true); // clears the runtime suspend trap first
+    InterlockedExchange(&g_gcInProgress, 0);
+    if (g_gcCompleteEvent != nullptr)
+        SetEvent(g_gcCompleteEvent); // release threads parked in WaitUntilGCComplete
+}
+
 // Runs one LXR epoch. Every epoch replays the coalescing-RC modified buffers (a
 // cheap RC pause). Occasionally - as decided by DecidePhase - the epoch is a full
 // TracePause that additionally runs a stop-the-world backup trace + Immix sweep,
@@ -3212,7 +3294,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // --- Snapshot pause (STW): mod buffers, reset marks, seed roots ---
         QueryPerformanceCounter(&a0);
         LXRSetPhase("conc:suspend-snapshot");
-        g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+        LXRSuspendEE();
         LXRSetPhase("conc:snapshot-buffers");
         if (doBuffers)
         {
@@ -3227,7 +3309,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("conc:snapshot");
         g_lxrCollector.ConcurrentTraceSnapshot();
         LXRSetPhase("conc:restart-snapshot");
-        g_theGCToCLR->RestartEE(true);
+        LXRRestartEE();
         QueryPerformanceCounter(&a1);
         int64_t snapMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent snapshot done (pause=%lldus)\n", (long long)snapMicros); fflush(stderr); }
@@ -3253,7 +3335,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // --- Finish pause (STW): residual SATB, allocate-black, evac, sweep ---
         QueryPerformanceCounter(&a0);
         LXRSetPhase("conc:suspend-finish");
-        g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+        LXRSuspendEE();
         LXRSetPhase("conc:finish");
         // Diagnostic/soundness switch: when set, the finish pause discards the
         // concurrent (SATB) marks and re-marks the whole live graph from roots
@@ -3285,7 +3367,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
         LXRSetPhase("conc:restart-finish");
-        g_theGCToCLR->RestartEE(true);
+        LXRRestartEE();
         LXRSetPhase("idle");
         QueryPerformanceCounter(&a1);
         int64_t finMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
@@ -3304,7 +3386,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase(phase == LXRPhase::TracePause ? "stw:suspend-trace" : "stw:suspend-rc");
         if (g_theGCToCLR != nullptr)
         {
-            g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
+            LXRSuspendEE();
             suspended = true;
         }
         if (verbose) { fprintf(stderr, "LXRGC: [stage] phase=%s suspended=%d\n",
@@ -3349,7 +3431,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
 
         LXRSetPhase("stw:restart");
         if (suspended)
-            g_theGCToCLR->RestartEE(true);
+            LXRRestartEE();
         LXRSetPhase("idle");
         QueryPerformanceCounter(&t1);
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
@@ -3401,6 +3483,99 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
 }
 
 // Monitor thread (LXR_WATCHDOG): if a collection phase stalls, print which one.
+// --- In-process native stack dumper (diagnostic; LXR_STACKS=1) --------------
+// When the watchdog detects a stuck SuspendEE, walk and symbolize EVERY other
+// thread's native+managed stack from inside the process using dbghelp
+// StackWalk64. External post-mortem tools (dotnet-dump/SOS) cannot unwind native
+// frames of a custom-GC dump, so this is the only way to see WHICH thread the
+// suspension is waiting on and where it is wedged. Runs at most once.
+static volatile LONG g_lxrStacksDumped = 0;
+static void LXRDumpAllThreadStacks()
+{
+    if (getenv("LXR_STACKS") == nullptr)
+        return;
+    if (InterlockedCompareExchange(&g_lxrStacksDumped, 1, 0) != 0)
+        return;
+
+    HANDLE proc = GetCurrentProcess();
+    DWORD selfPid = GetCurrentProcessId();
+    DWORD selfTid = GetCurrentThreadId();
+
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    // Point the symbol path at the app dir (coreclr.pdb / LXRGC.pdb sit next to
+    // the binaries) plus the runtime PDB dir; fInvadeProcess=TRUE loads modules.
+    const char* symPath =
+        "C:\\github\\runtimelab\\src\\LXRGC\\samples\\WebApi\\publish;"
+        "C:\\github\\runtime\\artifacts\\bin\\coreclr\\windows.x64.Release\\PDB;"
+        "C:\\github\\runtime\\artifacts\\bin\\coreclr\\windows.x64.Release";
+    SymInitialize(proc, symPath, TRUE);
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        fprintf(stderr, "LXRGC: [stacks] snapshot failed err=%lu\n", GetLastError());
+        return;
+    }
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    fprintf(stderr, "LXRGC: [stacks] ===== all-thread native stack dump (stuck suspend) =====\n");
+    fflush(stderr);
+    if (Thread32First(snap, &te))
+    {
+        do
+        {
+            if (te.th32OwnerProcessID != selfPid) continue;
+            if (te.th32ThreadID == selfTid) continue;
+
+            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                   THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (th == nullptr) continue;
+
+            DWORD susp = SuspendThread(th);
+            (void)susp;
+
+            CONTEXT ctx; memset(&ctx, 0, sizeof(ctx)); ctx.ContextFlags = CONTEXT_FULL;
+            if (!GetThreadContext(th, &ctx)) { ResumeThread(th); CloseHandle(th); continue; }
+
+            STACKFRAME64 sf; memset(&sf, 0, sizeof(sf));
+            sf.AddrPC.Offset = ctx.Rip;    sf.AddrPC.Mode = AddrModeFlat;
+            sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+            sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+
+            fprintf(stderr, "LXRGC: [stacks] --- thread %lu (rip=%p) ---\n",
+                    te.th32ThreadID, (void*)ctx.Rip);
+            for (int frame = 0; frame < 40; frame++)
+            {
+                if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, th, &sf, &ctx,
+                                 nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+                    break;
+                if (sf.AddrPC.Offset == 0) break;
+
+                DWORD64 disp = 0;
+                char buf[sizeof(SYMBOL_INFO) + 512];
+                SYMBOL_INFO* sym = (SYMBOL_INFO*)buf;
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                sym->MaxNameLen = 512;
+                char modname[128] = "?";
+                DWORD64 modbase = SymGetModuleBase64(proc, sf.AddrPC.Offset);
+                IMAGEHLP_MODULE64 mi; mi.SizeOfStruct = sizeof(mi);
+                if (modbase && SymGetModuleInfo64(proc, modbase, &mi))
+                    strncpy(modname, mi.ModuleName, sizeof(modname) - 1);
+                if (SymFromAddr(proc, sf.AddrPC.Offset, &disp, sym))
+                    fprintf(stderr, "LXRGC: [stacks]     %-16s %s+0x%llx\n",
+                            modname, sym->Name, (unsigned long long)disp);
+                else
+                    fprintf(stderr, "LXRGC: [stacks]     %-16s 0x%llx\n",
+                            modname, (unsigned long long)sf.AddrPC.Offset);
+            }
+            ResumeThread(th);
+            CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    fprintf(stderr, "LXRGC: [stacks] ===== end stack dump =====\n");
+    fflush(stderr);
+}
+
 static void LXRWatchdogThreadProc(void*)
 {
     const int64_t stallMicros = 20 * 1000000; // 20s without a phase change = stuck
@@ -3422,6 +3597,10 @@ static void LXRWatchdogThreadProc(void*)
                     ph, (long long)(stampAge / 1000000), (long long)seq);
             fflush(stderr);
             lastReportedSeq = seq;
+            // If we're stuck inside a SuspendEE, dump every thread's native stack
+            // so we can see which mutator is failing to reach a safepoint.
+            if (strstr(ph, "suspend") != nullptr)
+                LXRDumpAllThreadStacks();
         }
     }
 }
@@ -3511,11 +3690,21 @@ bool LXRGCHeap::IsHeapPointer(void* object, bool small_heap_only)
 }
 
 unsigned LXRGCHeap::GetCondemnedGeneration() { return 0; }
-bool LXRGCHeap::IsGCInProgressHelper(bool bConsiderGCStart) { return false; }
+bool LXRGCHeap::IsGCInProgressHelper(bool bConsiderGCStart) { return g_gcInProgress != 0; }
 unsigned LXRGCHeap::GetGcCount() { return 0; }
 bool LXRGCHeap::IsThreadUsingAllocationContextHeap(gc_alloc_context* acontext, int thread_number) { return true; }
 bool LXRGCHeap::IsEphemeral(Object* object) { return true; }
-uint32_t LXRGCHeap::WaitUntilGCComplete(bool bConsiderGCStart) { return 0; }
+// Block a thread trapped in Thread::RareDisablePreemptiveGC until the current
+// SuspendEE..RestartEE window closes (event SET by LXRRestartEE). Returning
+// immediately - as the old stub did - busy-loops trapped threads and livelocks
+// SuspendAllThreads under a thread storm (see g_gcCompleteEvent).
+uint32_t LXRGCHeap::WaitUntilGCComplete(bool bConsiderGCStart)
+{
+    HANDLE e = g_gcCompleteEvent;
+    if (e != nullptr && g_gcInProgress != 0)
+        WaitForSingleObject(e, INFINITE);
+    return 0;
+}
 void LXRGCHeap::FixAllocContext(gc_alloc_context* acontext, void* arg, void* heap) { }
 size_t LXRGCHeap::GetCurrentObjSize() { return (size_t)g_lxrCounters.TotalAllocatedBytes; }
 void LXRGCHeap::SetGCInProgress(bool fInProgress) { }
