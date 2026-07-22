@@ -328,6 +328,10 @@ struct ChunkRegion
     size_t            Size;
     gc_alloc_context* Owner;     // non-null while a thread is bump-allocating into it
     bool              Committed;
+    bool              FreeRun;    // Immix line reuse (LXR_LINE_REUSE): a plugged/dead
+                                  // sub-run carved from a retained region, available to
+                                  // hand back to an allocator context. Parseable as
+                                  // [Start,UsedEnd); never decommitted while listed.
 };
 static ChunkRegion* g_chunks = nullptr;
 static size_t g_chunkCount = 0;
@@ -336,6 +340,42 @@ static size_t* g_freeChunks = nullptr;   // stack of reclaimed (decommitted) chu
 static size_t g_freeChunkTop = 0;
 static size_t g_freeChunkCap = 0;
 static CRITICAL_SECTION g_chunkLock;
+
+// Immix line reuse (LXR difference #2, LXR_LINE_REUSE): stack of region indices
+// that are FreeRun == reusable dead line-runs carved from retained regions by
+// the sweep. Popped by the allocator before it extends the heap watermark, so
+// dead space inside otherwise-live blocks is reused instead of growing committed
+// memory (the Immix "recycle partially-free blocks" property). Guarded by
+// g_chunkLock (same as g_chunks). Kept empty unless line reuse is enabled.
+static size_t* g_freeRuns = nullptr;
+static size_t  g_freeRunTop = 0;
+static size_t  g_freeRunCap = 0;
+static int     g_lineReuse = -1; // env LXR_LINE_REUSE (-1 = not yet resolved)
+static size_t  g_lineReuseMinBytes = 0; // env LXR_LINE_MIN (min carve/reuse size)
+static volatile int64_t g_carveRunsTotal = 0;  // FreeRun segments carved (observability)
+static volatile int64_t g_carveBytesTotal = 0; // bytes carved into FreeRun segments
+
+// The runtime's free-object MethodTable (component size 1). Writing it over a
+// byte range with NumComponents == size-baseSize makes that range parse as a
+// single object, so a linear heap walk stays in sync after we overwrite part of
+// a dead run with fresh allocations (the standard GC "plug" / unused-array).
+static MethodTable* g_freeObjectMT = nullptr;
+static size_t       g_freeObjectBaseSize = 0;
+
+// Plug [start, start+size) as one free object so a linear parse treats it as a
+// single sized object. Requires size >= g_freeObjectBaseSize; smaller tails are
+// left as an unparsed inter-region gap by the caller. Returns true if plugged.
+static bool PlugFreeRange(uint8_t* start, size_t size)
+{
+    if (g_freeObjectMT == nullptr || size < g_freeObjectBaseSize)
+        return false;
+    // Object layout: [MethodTable*][num components...]. Component size is 1, so
+    // total size = baseSize + numComponents  =>  numComponents = size - baseSize.
+    *((MethodTable**)start) = g_freeObjectMT;
+    // ArrayBase stores the component count right after the MT pointer (m_NumComponents).
+    *((uint32_t*)(start + sizeof(void*))) = (uint32_t)(size - g_freeObjectBaseSize);
+    return true;
+}
 
 // Total object size in bytes, matching the runtime's Align(base + comps*compSize).
 size_t LXRObjectSize(Object* o)
@@ -400,6 +440,7 @@ static int RegisterChunk(uint8_t* start, size_t size, gc_alloc_context* owner)
     g_chunks[idx].Size = size;
     g_chunks[idx].Owner = owner;
     g_chunks[idx].Committed = true;
+    g_chunks[idx].FreeRun = false;
     LeaveCriticalSection(&g_chunkLock);
     return idx;
 }
@@ -450,6 +491,86 @@ static uint8_t* ReuseChunk(gc_alloc_context* owner, int* outIndex)
     return start;
 }
 
+// Immix line reuse: hand back a carved FreeRun region big enough for 'needBytes'
+// before the allocator extends the committed heap. The run's pages are already
+// committed (it held live+dead objects), so reuse avoids a fresh commit - this
+// is where dead line space actually offsets heap growth. Returns the run start
+// and its full size, or nullptr if none fits. Suppressed during a trace window
+// (region indices/starts must stay stable for the allocate-black snapshot).
+static uint8_t* ReuseFreeRun(gc_alloc_context* owner, size_t needBytes, size_t headerPad, int* outIndex, size_t* outSize)
+{
+    if (g_traceWindowOpen)
+        return nullptr;
+    uint8_t* start = nullptr;
+    EnterCriticalSection(&g_chunkLock);
+    // Scan from the top for the first run that fits; compact out consumed/invalid
+    // entries lazily by swapping the taken slot with the top.
+    for (size_t k = g_freeRunTop; k-- > 0; )
+    {
+        size_t idx = g_freeRuns[k];
+        if (idx >= g_chunkCount || !g_chunks[idx].FreeRun || !g_chunks[idx].Committed)
+        {
+            g_freeRuns[k] = g_freeRuns[--g_freeRunTop];
+            continue;
+        }
+        ChunkRegion& c = g_chunks[idx];
+        if (c.Size < needBytes)
+            continue;
+        // Take it: remove from the free-run stack (swap with top).
+        g_freeRuns[k] = g_freeRuns[--g_freeRunTop];
+        memset(c.Start, 0, c.Size); // hand back zeroed memory like a fresh commit
+        // Reserve headerPad before the first object (its sync-block/-8 header),
+        // exactly like a fresh chunk (RegisterChunk registers the object start,
+        // not the raw base), so the region parses cleanly from Start.
+        c.Start   = c.Start + headerPad;
+        c.Size    = c.Size - headerPad;
+        c.Owner   = owner;
+        c.UsedEnd = c.Start;
+        c.FreeRun = false;          // now a normal allocating region
+        c.Committed = true;
+        start = c.Start;
+        *outIndex = (int)idx;
+        *outSize = c.Size;
+        break;
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    return start;
+}
+
+// Append a region entry under g_chunkLock (already held by the caller). May
+// realloc g_chunks. Returns the new index, or -1 on OOM.
+static int AppendRegionLocked(uint8_t* start, uint8_t* usedEnd, size_t size, bool freeRun)
+{
+    if (g_chunkCount == g_chunkCap)
+    {
+        size_t nc = g_chunkCap ? g_chunkCap * 2 : 1024;
+        ChunkRegion* grown = (ChunkRegion*)realloc(g_chunks, nc * sizeof(ChunkRegion));
+        if (grown == nullptr) return -1;
+        g_chunks = grown; g_chunkCap = nc;
+    }
+    int idx = (int)g_chunkCount++;
+    g_chunks[idx].Start = start;
+    g_chunks[idx].UsedEnd = usedEnd;
+    g_chunks[idx].Size = size;
+    g_chunks[idx].Owner = nullptr;
+    g_chunks[idx].Committed = true;
+    g_chunks[idx].FreeRun = freeRun;
+    return idx;
+}
+
+// Push a FreeRun region index onto the reuse stack (under g_chunkLock).
+static void PushFreeRunLocked(size_t idx)
+{
+    if (g_freeRunTop == g_freeRunCap)
+    {
+        size_t nc = g_freeRunCap ? g_freeRunCap * 2 : 256;
+        size_t* grown = (size_t*)realloc(g_freeRuns, nc * sizeof(size_t));
+        if (grown == nullptr) return;
+        g_freeRuns = grown; g_freeRunCap = nc;
+    }
+    g_freeRuns[g_freeRunTop++] = idx;
+}
+
 static void CommitPageFor(uint8_t* addr)
 {
     // The RC side table is reserved-only; commit the touched page lazily so
@@ -487,6 +608,14 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     size_t metaBytes = m_blockCount * sizeof(lxr::BlockMeta);
     m_blockMeta = (lxr::BlockMeta*)VirtualAlloc(nullptr, metaBytes, MEM_RESERVE, PAGE_READWRITE);
     if (m_blockMeta == nullptr)
+        return false;
+
+    // Immix line-mark side table: 1 bit per 256 B line. Reserved only; committed
+    // and zeroed per trace over the used-heap prefix (see ResetMarks). Enables
+    // O(lines) free-line-run discovery for line reuse (LXR_LINE_REUSE).
+    size_t lineTableBytes = (heapReservedBytes / lxr::kLineSize + 7) / 8;
+    m_lineMarkTable = (uint8_t*)VirtualAlloc(nullptr, lineTableBytes, MEM_RESERVE, PAGE_READWRITE);
+    if (m_lineMarkTable == nullptr)
         return false;
 
     InitializeCriticalSection(&m_collectLock);
@@ -795,6 +924,161 @@ bool LXRCollector::MarkObject(Object* obj)
     return (prev & bit) == 0;
 }
 
+// Line-marks-populated-this-cycle flag. Only when true (a full mark that ran the
+// line-marking scan sites) AND on a mark-authoritative cycle may the sweep carve
+// free line runs; otherwise unmarked-but-live (RC-kept) objects could sit in an
+// apparently-free line and be reused. Set by ResetMarks (arming) + drain sites.
+static volatile LONG g_lineMarksValid = 0;
+// Set whenever ConservativelyKeepAliveInterior fires during a cycle. Such a
+// keep-alive marks only the interior's single granule (the object bounds are
+// unknown), so the object's body lines are neither line-marked nor mark-bit-set
+// and cannot be excluded from a free-line run. Disable line carving for the whole
+// cycle when this happens — conservative keep-alive is a rare unresolved-interior
+// fallback, so the footprint cost of skipping carve is negligible and correctness
+// is guaranteed. Reset at ResetMarks.
+static volatile LONG g_conservativeKeepAliveThisCycle = 0;
+
+void LXRCollector::MarkLines(Object* obj, size_t size)
+{
+    if (m_lineMarkTable == nullptr || !InHeap(obj) || size == 0)
+        return;
+    uint8_t* p = (uint8_t*)obj;
+    uint8_t* end = p + size;
+    if (end > m_heapBase + m_heapBytes)
+        end = m_heapBase + m_heapBytes;
+    size_t firstLine = (size_t)(p - m_heapBase) / lxr::kLineSize;
+    size_t lastLine  = (size_t)(end - 1 - m_heapBase) / lxr::kLineSize;
+    for (size_t line = firstLine; line <= lastLine; line++)
+    {
+        size_t byteIdx = line >> 3;
+        if (byteIdx >= m_lineMarkCommittedBytes)
+            break; // beyond the committed line-table prefix (shouldn't happen)
+        _InterlockedOr8((volatile char*)&m_lineMarkTable[byteIdx], (char)(1u << (line & 7)));
+    }
+}
+
+uint8_t* LXRCollector::FirstMarkedAtOrAfter(uint8_t* from, uint8_t* end) const
+{
+    if (from < m_heapBase) from = m_heapBase;
+    if (end <= from) return end;
+    size_t g = (size_t)(from - m_heapBase) / lxr::kObjectGranule;
+    size_t gEnd = (size_t)(end - m_heapBase) / lxr::kObjectGranule;
+    size_t maxG = m_markCommittedBytes * 8;
+    if (gEnd > maxG) gEnd = maxG;
+    for (; g < gEnd; g++)
+    {
+        if (m_markTable[g >> 3] & (uint8_t)(1u << (g & 7)))
+            return m_heapBase + g * lxr::kObjectGranule;
+    }
+    return end;
+}
+
+void LXRCollector::CarveFreeRuns(size_t i)
+{
+    // Caller holds g_chunkLock and has verified g_chunks[i] is a committed,
+    // retired (Owner==null), non-FreeRun region that DID contain live objects.
+    uint8_t* Start = g_chunks[i].Start;
+    uint8_t* End   = g_chunks[i].UsedEnd;
+    if (m_lineMarkTable == nullptr || End <= Start)
+        return;
+    size_t minRun = g_lineReuseMinBytes ? g_lineReuseMinBytes : (4 * lxr::kLineSize);
+
+    // Enumerate maximal free-line runs fully inside [Start, End) using ONLY the
+    // line-mark bitmap, then snap each run's end forward to the first live object
+    // start (mark bit) so the following live segment begins on a real object
+    // boundary and stays linearly parseable. Collect the resulting (plugStart,
+    // plugEnd) free segments in order; they never overlap (a run's snapped end is
+    // < the next run's line-aligned start, which is unmarked).
+    uint8_t* firstLineAddr = (uint8_t*)(((uintptr_t)Start + lxr::kLineSize - 1) & ~((uintptr_t)lxr::kLineSize - 1));
+    struct Seg { uint8_t* a; uint8_t* b; };
+    Seg segs[512];
+    int nseg = 0;
+    uint8_t* runStart = nullptr;
+    for (uint8_t* la = firstLineAddr; la + lxr::kLineSize <= End; la += lxr::kLineSize)
+    {
+        size_t line = (size_t)(la - m_heapBase) / lxr::kLineSize;
+        size_t byteIdx = line >> 3;
+        bool freeLine = (byteIdx >= m_lineMarkCommittedBytes) ||
+                        ((m_lineMarkTable[byteIdx] & (uint8_t)(1u << (line & 7))) == 0);
+        if (freeLine)
+        {
+            if (runStart == nullptr) runStart = la;
+        }
+        else if (runStart != nullptr)
+        {
+            uint8_t* plugEnd = FirstMarkedAtOrAfter(la, End);
+            // Mark table is authoritative: only carve if NO mark bit falls in the
+            // run. Line marks can miss an object that was mark-bit-set without a
+            // MarkLines (e.g. a conservatively kept unresolved-interior target);
+            // such an object is live and must never be reclaimed. This parse-free
+            // bitmap check makes the carve sound regardless of line-mark coverage.
+            if ((size_t)(plugEnd - runStart) >= minRun && !AnyMarkedInRange(runStart, plugEnd) &&
+                nseg < (int)(sizeof(segs)/sizeof(segs[0])))
+                segs[nseg++] = { runStart, plugEnd };
+            runStart = nullptr;
+        }
+    }
+    if (runStart != nullptr)
+    {
+        // Trailing free run extends to End (nothing marked after it).
+        if ((size_t)(End - runStart) >= minRun && !AnyMarkedInRange(runStart, End) &&
+            nseg < (int)(sizeof(segs)/sizeof(segs[0])))
+            segs[nseg++] = { runStart, End };
+    }
+    if (nseg == 0)
+        return;
+
+    // Re-tile [Start, End) into ordered sub-regions: live segments interleaved
+    // with the carved free segments. Region i is rewritten to the first
+    // sub-region; the rest are appended. Plug each free segment as one free
+    // object so any incidental linear parse of it stays valid, and list it for
+    // reuse.
+    bool firstWritten = false;
+    uint8_t* cursor = Start;
+    for (int s = 0; s < nseg; s++)
+    {
+        uint8_t* fa = segs[s].a;
+        uint8_t* fb = segs[s].b;
+        if (cursor < fa) // live segment before this free run
+        {
+            if (!firstWritten)
+            {
+                g_chunks[i].Start = cursor; g_chunks[i].UsedEnd = fa;
+                g_chunks[i].Size = (size_t)(fa - cursor); g_chunks[i].Owner = nullptr;
+                g_chunks[i].Committed = true; g_chunks[i].FreeRun = false;
+                firstWritten = true;
+            }
+            else AppendRegionLocked(cursor, fa, (size_t)(fa - cursor), /*freeRun*/ false);
+        }
+        // free segment
+        PlugFreeRange(fa, (size_t)(fb - fa));
+        int fidx;
+        if (!firstWritten)
+        {
+            g_chunks[i].Start = fa; g_chunks[i].UsedEnd = fb;
+            g_chunks[i].Size = (size_t)(fb - fa); g_chunks[i].Owner = nullptr;
+            g_chunks[i].Committed = true; g_chunks[i].FreeRun = true;
+            firstWritten = true;
+            fidx = (int)i;
+        }
+        else fidx = AppendRegionLocked(fa, fb, (size_t)(fb - fa), /*freeRun*/ true);
+        if (fidx >= 0) PushFreeRunLocked((size_t)fidx);
+        InterlockedIncrement64(&g_carveRunsTotal);
+        InterlockedExchangeAdd64(&g_carveBytesTotal, (int64_t)(fb - fa));
+        cursor = fb;
+    }
+    if (cursor < End) // trailing live segment
+    {
+        if (!firstWritten)
+        {
+            g_chunks[i].Start = cursor; g_chunks[i].UsedEnd = End;
+            g_chunks[i].Size = (size_t)(End - cursor); g_chunks[i].FreeRun = false;
+            firstWritten = true;
+        }
+        else AppendRegionLocked(cursor, End, (size_t)(End - cursor), /*freeRun*/ false);
+    }
+}
+
 bool LXRCollector::AnyMarkedInRange(uint8_t* start, uint8_t* end) const
 {
     if (start < m_heapBase) start = m_heapBase;
@@ -970,6 +1254,8 @@ int64_t LXRCollector::CompleteClosureOverMarked()
                 if (sz == 0) break;
                 if (IsMarked(o))
                 {
+                    if (g_lineMarksValid)
+                        MarkLines(o, sz);
                     MethodTable* pmt = o->GetGCSafeMethodTable();
                     GCScanObjectRefs(o, sz, [this, o, pmt, &newlyMarked, &gapBornInWindow, &gapSnapshotEra, &reported, &progress](Object** ref)
                     {
@@ -1032,6 +1318,30 @@ void LXRCollector::ResetMarks()
         memset(m_markTable, 0, neededBytes);
     }
     m_markCommittedBytes = neededBytes;
+
+    // Immix line reuse: commit+zero the covering line-table prefix so line marks
+    // accumulate from a clean slate this cycle. Arm g_lineMarksValid only when
+    // line reuse is enabled; the drain/closure sites then populate line marks and
+    // the sweep may carve free line runs (mark-authoritative cycles only).
+    if (g_lineReuse > 0 && m_lineMarkTable != nullptr)
+    {
+        size_t lineNeeded = (usedBytes / lxr::kLineSize + 7) / 8;
+        lineNeeded = (lineNeeded + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
+        size_t lineCap = (m_heapBytes / lxr::kLineSize + 7) / 8;
+        if (lineNeeded > lineCap) lineNeeded = lineCap;
+        if (lineNeeded > 0)
+        {
+            VirtualAlloc(m_lineMarkTable, lineNeeded, MEM_COMMIT, PAGE_READWRITE);
+            memset(m_lineMarkTable, 0, lineNeeded);
+        }
+        m_lineMarkCommittedBytes = lineNeeded;
+        InterlockedExchange(&g_lineMarksValid, 1);
+        InterlockedExchange(&g_conservativeKeepAliveThisCycle, 0);
+    }
+    else
+    {
+        InterlockedExchange(&g_lineMarksValid, 0);
+    }
 }
 
 void LXRCollector::PushMark(Object* obj)
@@ -1093,6 +1403,8 @@ void LXRCollector::DrainMarkStack()
             if (osz == 0)
                 continue; // genuinely not scannable
         }
+        if (g_lineMarksValid)
+            MarkLines(o, osz);
         GCScanObjectRefs(o, osz, [this, o, verify](Object** ref)
         {
             Object* child = *ref;
@@ -1151,6 +1463,8 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
             if (osz == 0)
                 continue;
         }
+        if (g_lineMarksValid)
+            MarkLines(o, osz);
         GCScanObjectRefs(o, osz, [this, &local](Object** ref)
         {
             Object* c = *ref;
@@ -1389,6 +1703,7 @@ bool LXRCollector::ConservativelyKeepAliveInterior(uint8_t* interior)
     if (byteIdx >= m_markCommittedBytes)
         return false;
     _InterlockedOr8((volatile char*)&m_markTable[byteIdx], (char)(1u << (granule & 7)));
+    InterlockedExchange(&g_conservativeKeepAliveThisCycle, 1);
     int64_t n = InterlockedIncrement64(&g_unresolvedInteriorRoots);
     static int diag = -1;
     if (diag < 0) diag = (getenv("LXR_FAULT_DIAG") != nullptr) ? 1 : 0;
@@ -1718,11 +2033,21 @@ void LXRCollector::SweepAndSelectDefrag()
     // work). Runs inside the same stop-the-world pause as BackupTrace so the
     // mark bits and region high-water marks are stable.
     EnterCriticalSection(&g_chunkLock);
-    for (size_t i = 0; i < g_chunkCount; i++)
+    // Line reuse carves dead runs out of RETAINED regions on mark-authoritative
+    // cycles only, when the line marks were populated this cycle and evacuation
+    // (the alternative defragmentation strategy) is not running: on those cycles
+    // every kept object is marked and so has its lines marked, making unmarked
+    // lines provably dead. Snapshot the count so appended sub-regions (from a
+    // split) are not re-scanned this pass.
+    bool carveLines = (g_lineReuse > 0) && g_traceCompleteThisCycle &&
+                      (g_lineMarksValid != 0) && (g_evacActive == 0) &&
+                      (g_conservativeKeepAliveThisCycle == 0);
+    size_t sweepCount = g_chunkCount;
+    for (size_t i = 0; i < sweepCount; i++)
     {
         ChunkRegion& c = g_chunks[i];
-        if (!c.Committed || c.Owner != nullptr)
-            continue; // uncommitted, or an active (still-allocating) region
+        if (!c.Committed || c.Owner != nullptr || c.FreeRun)
+            continue; // uncommitted, active, or an already-carved free run
 
         // Region liveness via the mark bits directly (parse-independent). The
         // old linear object walk depended on LXRObjectSize correctly parsing
@@ -1747,7 +2072,14 @@ void LXRCollector::SweepAndSelectDefrag()
         bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd) ||
                        (!g_traceCompleteThisCycle && AnyRCNonZeroInRange(c.Start, c.UsedEnd));
         if (anyLive)
+        {
+            // Retained region: recover its dead line runs for reuse (Immix line
+            // recycling). CarveFreeRuns may realloc g_chunks, so do not touch 'c'
+            // afterwards - continue to the next index.
+            if (carveLines)
+                CarveFreeRuns(i);
             continue;
+        }
 
         // Red-handed check (LXR_VERIFY_TRACE): AnyMarkedInRange says this chunk
         // is dead. Linearly parse it and confirm no object carries a mark bit.
@@ -1802,6 +2134,10 @@ void LXRCollector::SweepAndSelectDefrag()
             g_freeChunks[g_freeChunkTop++] = i;
     }
     LeaveCriticalSection(&g_chunkLock);
+    if (carveLines && getenv("LXR_VERIFY_TRACE") != nullptr)
+        fprintf(stderr, "LXRGC: [sweep] line reuse: carved %lld run(s) / %lld MiB cumulative; freeRunStack=%llu\n",
+                (long long)g_carveRunsTotal, (long long)(g_carveBytesTotal >> 20),
+                (unsigned long long)g_freeRunTop);
 }
 
 void LXRCollector::SetEvacActive(bool active) { InterlockedExchange(&g_evacActive, active ? 1 : 0); }
@@ -2271,6 +2607,26 @@ HRESULT LXRGCHeap::Initialize()
     if (g_theGCToCLR != nullptr)
         g_theGCToCLR->StompWriteBarrier(&wbParams);
 
+    // Cache the runtime's free-object MethodTable so we can write parseable
+    // "plugs" over dead byte ranges (see PlugFreeRange). This is what keeps the
+    // linear heap walk in sync after Immix line reuse overwrites part of a dead
+    // run with fresh allocations. GetFreeObjectMethodTable is part of the
+    // standalone GC-to-EE interface (no runtime change needed).
+    if (g_theGCToCLR != nullptr && g_freeObjectMT == nullptr)
+    {
+        g_freeObjectMT = (MethodTable*)g_theGCToCLR->GetFreeObjectMethodTable();
+        if (g_freeObjectMT != nullptr)
+            g_freeObjectBaseSize = g_freeObjectMT->GetBaseSize();
+    }
+    if (g_lineReuse < 0)
+        g_lineReuse = (getenv("LXR_LINE_REUSE") != nullptr) ? 1 : 0;
+    if (g_lineReuseMinBytes == 0)
+    {
+        const char* e = getenv("LXR_LINE_MIN");
+        int64_t mb = e ? _atoi64(e) : 0;
+        g_lineReuseMinBytes = (mb > 0) ? (size_t)mb : (32 * lxr::kLineSize); // default 8 KiB
+    }
+
     // Upgrade from the card-marking barrier to the generic, GC-agnostic Callback
     // barrier now exposed by the runtime. From here on the runtime hands us the
     // overwritten (old) value on every reference-field store, which drives LXR's
@@ -2398,6 +2754,24 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
     // Block reuse: prefer a previously reclaimed standard-size region.
     if (!isLarge && chunkSize == CONTEXT_ALLOC_QUANTUM)
         chunkStart = ReuseChunk(acontext, &newIndex);
+
+    // Immix line reuse: else hand out a carved dead line run before extending the
+    // committed heap (its pages are already committed, so this offsets heap
+    // growth). Small-object allocation nominally wants a 128 KiB quantum chunk,
+    // but a run only needs to fit the CURRENT object; the whole run is then
+    // adopted as this chunk and bump-filled by subsequent fast-path allocations.
+    // Requiring only object-fit (not the full quantum) is what lets the many
+    // small carved runs actually be consumed.
+    if (chunkStart == nullptr && !isLarge && g_lineReuse > 0)
+    {
+        size_t runObjSize = 0;
+        uint8_t* r = ReuseFreeRun(acontext, alignedSize + headerPad, headerPad, &newIndex, &runObjSize);
+        if (r != nullptr)
+        {
+            chunkStart = r;
+            chunkSize = runObjSize;
+        }
+    }
 
     if (chunkStart == nullptr)
     {

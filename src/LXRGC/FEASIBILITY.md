@@ -474,7 +474,49 @@ every marked object's field against a fully-marked heap with all roots pinned.
 The remaining work is depth and hardening (finer parallel work-stealing, broader
 benchmark coverage), not new runtime dependencies.
 
-#### Resolved bug — null MethodTable in the linear heap parse (concurrent+evac)
+### P6 — Immix line-granular free-line reuse (paper-faithful; done; no runtime change)
+
+The §6 sweep reclaims only *whole* dead chunks. The paper's Immix substrate is
+finer: a partially-live block still recycles its **dead 256 B lines**, so live and
+dead objects can share a block and fragmentation is recovered *without* copying.
+LXRGC now implements this line-granular reuse (gated by `LXR_LINE_REUSE=1`, off by
+default; an alternative to evacuation on the same cycle, never both):
+
+- **Line marks** — a 1-bit/256 B line side table, committed+zeroed over the
+  used-heap prefix each cycle (`ResetMarks`) alongside the object mark table. Every
+  object-scan site (`DrainMarkStack`, `DrainSliceLocal`, `CompleteClosureOverMarked`)
+  calls `MarkLines(obj, size)` to mark the full span `[obj, obj+size)` of each kept
+  object. Marking the *whole* span (not just the header line) is what makes the
+  invariant hold: **no live object crosses a free-line boundary**.
+- **Carve** — after a mark-authoritative trace, `SweepAndSelectDefrag` calls
+  `CarveFreeRuns` on each *retained* region: it scans the line table (O(lines), no
+  object parse), and every run of consecutive line-unmarked lines ≥ a minimum
+  (`LXR_LINE_REUSE_MIN`, 8 KiB) is split out as a free sub-region, its end snapped
+  forward to the next live object start (`FirstMarkedAtOrAfter`) so the following
+  live segment stays a real object boundary. Free runs are plugged with a parseable
+  free object (`GetFreeObjectMethodTable`) and pushed on a free-run stack.
+- **Reuse** — `AllocateSlow` pops a free run that fits the *current* object (not the
+  128 KiB context quantum) before extending the bump watermark, reserving the sync-
+  block header pad exactly like a fresh chunk. Footprint stabilizes instead of
+  growing.
+
+**Soundness** — the line marks are a fast filter, but the object **mark table is
+authoritative**: `CarveFreeRuns` carves a candidate run only if
+`!AnyMarkedInRange(run)`, so an object that was mark-bit-set *without* a `MarkLines`
+call is never reclaimed. The one such path — `ConservativelyKeepAliveInterior`,
+which marks a single granule for an unresolvable interior root without knowing the
+object's bounds — cannot be excluded per-line, so carving is **skipped for the whole
+cycle** whenever conservative keep-alive fired (`g_conservativeKeepAliveThisCycle`);
+this is a rare fallback, so the footprint cost is negligible. Verified: STW and
+concurrent (1 and 16 GC threads) line-reuse runs are all clean — exit 0, trace-
+completeness `offenders=0`, `av=0`, carving and reuse both firing, heap contained
+(no unbounded growth). With evacuation ON, line carving is skipped: the two are
+paper-consistent *alternative* defragmentation strategies (a cycle does "mark +
+recycle lines" **or** "mark + evacuate"), never combined, since pre-move line marks
+would be stale for evacuated objects.
+
+The remaining work is depth and hardening (finer parallel work-stealing, broader
+benchmark coverage), not new runtime dependencies.
 
 Under the full unified config, WebApi occasionally access-violated at `0x0`
 inside `ResolveInterior`/`LXRObjectSize` (fault-diag RVA resolved to

@@ -290,6 +290,22 @@ public:
     bool AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const;
     void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
     int64_t CompleteClosureOverMarked(); // finish pause: close closure over all marked objects
+    // Immix line marking (LXR_LINE_REUSE): record every 256 B line touched by a
+    // live object [obj, obj+size) in the line-mark side table. Accumulated at the
+    // object-scan sites (drain/closure) where the size is already known, so the
+    // sweep can find fully-dead line runs inside otherwise-live regions in
+    // O(lines) - no whole-heap object parse. Thread-safe (atomic bit set).
+    void MarkLines(Object* obj, size_t size);
+    // First marked (live) object-start at or after 'from', bounded by 'end'
+    // (returns 'end' if none). Cheap mark-table bit scan used to snap a free
+    // line run's end to a real object boundary so the following live segment
+    // stays linearly parseable after line reuse.
+    uint8_t* FirstMarkedAtOrAfter(uint8_t* from, uint8_t* end) const;
+    // Carve fully-dead line runs out of retained region g_chunks[i] into their
+    // own reusable FreeRun regions (Immix line recycling). Reads only line marks
+    // (O(lines)); splits the region at object boundaries; may realloc g_chunks,
+    // so the caller must not touch a prior g_chunks reference afterwards.
+    void CarveFreeRuns(size_t regionIndex);
     void ResetMarks();                  // decommits the mark side-table (all bits -> 0)
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs
@@ -323,6 +339,8 @@ private:
     uint8_t*        m_rcTable = nullptr;     // 1 byte / 8 heap bytes
     uint8_t*        m_markTable = nullptr;   // 1 bit / 8 heap bytes (backup-trace marks)
     size_t          m_markCommittedBytes = 0; // committed+zeroed mark-table prefix (bytes)
+    uint8_t*        m_lineMarkTable = nullptr;   // 1 bit / 256 B line (Immix line reuse)
+    size_t          m_lineMarkCommittedBytes = 0; // committed+zeroed line-table prefix (bytes)
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block
     size_t          m_blockCount = 0;
     volatile int64_t m_reclaimedBytes = 0;   // cumulative bytes decommitted by sweeps
