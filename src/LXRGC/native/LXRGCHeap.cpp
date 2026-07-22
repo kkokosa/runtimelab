@@ -324,6 +324,15 @@ static volatile int64_t g_lastTraceCommitted = 0; // committed-in-use right afte
 static volatile int64_t g_traceBudgetBytes = -1;  // -1 = uninitialized; growth before forcing a trace
 static volatile int64_t g_traceEveryEpochs = -1;  // force a trace at least every N epochs (0 = off)
 
+// Young-object nursery (LXR difference #6). g_traceEpoch is a monotonic counter
+// bumped once per completed trace cycle; every allocation region is stamped with
+// its value at registration (BlockMeta.bornTraceEpoch). An object is "young" while
+// bornTraceEpoch == g_traceEpoch (no trace has aged it since birth); young objects
+// are excluded from reference counting and kept alive by the trace/allocate-black.
+// Gated by LXR_YOUNG_RC (default off; part of the full-LXR configuration).
+static volatile LONG g_youngRC = 0;
+static volatile int64_t g_traceEpoch = 0;
+
 // Dedicated collector thread. Driving SuspendEE from a random cooperative-mode
 // allocating thread deadlocks under high concurrency (the initiator can end up
 // waiting on threads that are in turn waiting on it). Real LXR runs its trace on
@@ -467,6 +476,7 @@ static int RegisterChunk(uint8_t* start, size_t size, gc_alloc_context* owner)
     g_chunks[idx].Committed = true;
     g_chunks[idx].FreeRun = false;
     LeaveCriticalSection(&g_chunkLock);
+    g_lxrCollector.StampBornEpoch(start, size); // #6: mark blocks as this window's nursery
     return idx;
 }
 
@@ -513,6 +523,8 @@ static uint8_t* ReuseChunk(gc_alloc_context* owner, int* outIndex)
         break;
     }
     LeaveCriticalSection(&g_chunkLock);
+    if (start != nullptr)
+        g_lxrCollector.StampBornEpoch(start, CONTEXT_ALLOC_QUANTUM); // #6: recycled region hosts young objects
     return start;
 }
 
@@ -663,6 +675,10 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // #1: replay coalescing-RC decrements + the recursive free OFF the STW
     // pause (concurrent path only). Only the bounded buffer snapshot is paused.
     if (getenv("LXR_CONC_DECREMENTS") != nullptr) g_concDecrements = 1;
+    // #6: decouple young objects from reference counting (nursery). Young liveness
+    // is decided by the trace/allocate-black; sound because reclamation is
+    // mark-authoritative every trace cycle.
+    if (getenv("LXR_YOUNG_RC") != nullptr) g_youngRC = 1;
     // P5: parallel mark worker count. Clamped to [1, 64]; 1 keeps the verified
     // single-threaded closure.
     if (const char* t = getenv("LXR_GC_THREADS"))
@@ -684,6 +700,34 @@ lxr::BlockMeta* LXRCollector::MetaForBlock(uint8_t* blockAddr)
     return &m_blockMeta[idx];
 }
 
+// #6 young-object nursery. Stamp every 32 KiB block spanned by a freshly
+// (re)registered allocation region with the current inter-trace window id, so
+// objects born in the region are recognised as young until the next trace ages
+// them. Bounded (one iteration per block in the region). No-op unless enabled.
+void LXRCollector::StampBornEpoch(uint8_t* start, size_t size)
+{
+    if (!g_youngRC || start < m_heapBase)
+        return;
+    int64_t epoch = g_traceEpoch;
+    uint8_t* blk = (uint8_t*)((uintptr_t)start & ~(lxr::kBlockSize - 1));
+    uint8_t* end = start + size;
+    for (; blk < end; blk += lxr::kBlockSize)
+    {
+        lxr::BlockMeta* meta = MetaForBlock(blk);
+        if (meta != nullptr)
+            meta->bornTraceEpoch = epoch;
+    }
+}
+
+bool LXRCollector::IsYoung(Object* obj)
+{
+    if (!g_youngRC || (uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
+        return false;
+    uint8_t* blk = (uint8_t*)((uintptr_t)obj & ~(lxr::kBlockSize - 1));
+    lxr::BlockMeta* meta = MetaForBlock(blk);
+    return meta != nullptr && meta->bornTraceEpoch == g_traceEpoch;
+}
+
 uint8_t* LXRCollector::RCSlot(Object* obj) const
 {
     size_t idx = ((uint8_t*)obj - m_heapBase) / lxr::kObjectGranule;
@@ -694,6 +738,8 @@ void LXRCollector::RCIncrement(Object* obj)
 {
     if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
         return; // not our heap (frozen segment, boot object, etc.)
+    if (IsYoung(obj))
+        return; // #6: young objects are not reference-counted (nursery)
     uint8_t* slot = RCSlot(obj);
     CommitPageFor(slot);
     if (*slot != 0xFF) // 0xFF is the "stuck / overflowed" sentinel
@@ -705,6 +751,8 @@ bool LXRCollector::RCDecrement(Object* obj)
 {
     if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
         return false;
+    if (IsYoung(obj))
+        return false; // #6: young objects are not reference-counted (nursery)
     uint8_t* slot = RCSlot(obj);
     CommitPageFor(slot);
     InterlockedIncrement64(&g_lxrCounters.RCDecrements);
@@ -2191,7 +2239,9 @@ void LXRCollector::SweepAndSelectDefrag()
         // (possibly incomplete) trace. Both tests are parse-free side-table
         // scans, so a misparse can never wrongly reclaim a live region.
         bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd) ||
-                       (!g_traceCompleteThisCycle && AnyRCNonZeroInRange(c.Start, c.UsedEnd));
+                       (!g_traceCompleteThisCycle &&
+                        (AnyRCNonZeroInRange(c.Start, c.UsedEnd) ||
+                         IsYoung((Object*)c.Start)));
         if (anyLive)
         {
             // Retained region: recover its dead line runs for reuse (Immix line
@@ -3323,6 +3373,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         }
         g_lastTraceCommitted = g_committedInUse;
         g_epochsSinceTrace = 0;
+        // #6: age the nursery. Regions born in the window just ended (their blocks
+        // stamped with the pre-bump g_traceEpoch) are no longer young after this
+        // trace has had the chance to mark/reclaim them, so RC resumes for them.
+        InterlockedIncrement64(&g_traceEpoch);
     }
     else
     {

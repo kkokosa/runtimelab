@@ -853,6 +853,48 @@ do not perturb trace completeness. STW path (unchanged, `LXR_CONCURRENT=0`) stil
 difference #5, unrelated to correctness.)
 
 
+##### RESOLVED (2026-07-23) — young-object nursery: decouple young objects from RC (difference #6)
+
+Paper-LXR applies the generational hypothesis to reference counting: because most
+objects die young, it does **not** reference-count objects in their birth epoch —
+their liveness is decided by the trace / survival, not RC. Ours previously
+reference-counted every object (the barrier logs every store, and
+`ProcessModifiedBuffers` inc/dec'd young targets too), wasting RC work on the
+short-lived majority. (Note: young objects were never *incorrectly reclaimed* —
+`SweepAndSelectDefrag` runs only on trace cycles, which are mark-authoritative and
+scan roots / apply allocate-black, and RC-only pauses never reclaim. So this was a
+fidelity + efficiency gap, not a soundness bug.)
+
+Fix (gated by `LXR_YOUNG_RC`):
+
+- **Nursery stamp.** `g_traceEpoch` is bumped once per completed trace cycle. Every
+  allocation region stamps the blocks it spans with the current `g_traceEpoch`
+  (`BlockMeta.bornTraceEpoch`, an O(1) side-table field) at `RegisterChunk` /
+  `ReuseChunk`. An object `IsYoung` while `bornTraceEpoch == g_traceEpoch` — i.e. no
+  trace has aged it since birth.
+- **RC decoupling.** `RCIncrement` / `RCDecrement` early-return for young objects,
+  so no reference counts are maintained for the birth-epoch population.
+- **Stuck-if-young guard.** On the (diagnostic-only) RC-authoritative sweep branch,
+  a young region is treated as live so a young object's *skipped* RC can never make
+  it look dead. On production trace cycles the sweep is mark-authoritative, so dead
+  young garbage is still collected (via unmarked ⇒ reclaimed) — the nursery only
+  suppresses RC work, it does not pin garbage.
+- **Aging.** After each trace's sweep, `g_traceEpoch` is incremented, so the window
+  just processed ages out and its survivors resume normal RC.
+
+*Why sound:* RC is only ever *authoritative* on the diagnostic no-trace path (guarded
+above); in every production config reclamation is mark-authoritative, so an
+under-counted (skipped) young/aged RC can only float a little garbage for a cycle,
+never free a reachable object. Young objects reachable from the stack are retained
+by the root scan / allocate-black exactly as before.
+
+*Verified* (`LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_LINE_REUSE=1
+LXR_CONC_DECREMENTS=1 LXR_YOUNG_RC=1`, `LXR_VERIFY_TRACE=1`, `DOTNET_ReadyToRun=0`,
+60 s WebApi): 3/3 `av=0 hang=0`, every finish `gap=0 offenders=0`, no red-handed
+reclaim of a marked object. STW path (`LXR_YOUNG_RC=1`, no concurrency) `av=0` (one
+run hit the pre-existing #5 `SuspendEE` hang, unrelated).
+
+
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 
 On a continuously-growing multi-GB object graph containing very large reference

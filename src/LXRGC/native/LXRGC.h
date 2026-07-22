@@ -109,6 +109,9 @@ namespace lxr
         uint8_t    liveLines;   // number of marked lines (0..128)
         uint16_t   liveObjects; // objects with RC > 0 in this block
         uint32_t   deadBytes;   // approx. reclaimable bytes (defrag heuristic)
+        int64_t    bornTraceEpoch; // inter-trace window this block was allocated in
+                                   // (young-object nursery, LXR difference #6). 0 =
+                                   // never stamped (old / pre-first-trace).
     };
 }
 
@@ -271,6 +274,16 @@ public:
     void SweepAndSelectDefrag();
 
     lxr::BlockMeta* MetaForBlock(uint8_t* blockAddr);
+    // Young-object nursery (LXR difference #6). StampBornEpoch marks the blocks
+    // spanned by a freshly (re)registered allocation region with the current
+    // inter-trace window id; IsYoung reports whether an object still lives in the
+    // window it was born in (no trace has aged it yet). Young objects are decoupled
+    // from reference counting (the generational hypothesis: most die young, so
+    // paying RC inc/dec for them is wasted) and are kept alive by the trace /
+    // allocate-black instead. Sound because reclamation is mark-authoritative on
+    // every trace cycle and RC-only pauses never reclaim.
+    void StampBornEpoch(uint8_t* start, size_t size);
+    bool IsYoung(Object* obj);
 
     // --- Backup trace (stop-the-world mark) + Immix reclamation ---
     //
