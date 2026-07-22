@@ -290,6 +290,7 @@ public:
     bool AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const;
     void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
     int64_t CompleteClosureOverMarked(); // finish pause: close closure over all marked objects
+    int64_t MarkModifiedNewValues();     // finish pause: reconcile concurrent-marking race via modified set
     // Immix line marking (LXR_LINE_REUSE): record every 256 B line touched by a
     // live object [obj, obj+size) in the line-mark side table. Accumulated at the
     // object-scan sites (drain/closure) where the size is already known, so the

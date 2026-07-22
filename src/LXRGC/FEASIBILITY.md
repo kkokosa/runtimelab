@@ -780,6 +780,42 @@ each concurrent finish pause. Concurrent cycles are occasional, so the added STW
 time is modest, but it can be narrowed later to dirty/remset regions or skipped
 when barrier coverage is provably complete.
 
+##### RESOLVED (2026-07-22) — the O(live-heap) closure replaced by modified-set race reconciliation
+
+Two follow-up findings closed this properly:
+
+1. **The barrier is already complete.** With the generic full-ref-barrier flag +
+   VM-side routing (1 & 2 above), an A/B test isolates the residual: running the
+   concurrent finish with `LXR_CONC_NO_DRAIN=1` (skip the off-pause drain, compute
+   the whole closure at the STW finish from snapshot roots + SATB + allocate-black)
+   yields **zero** closure gap, whereas the off-pause drain leaves ~1 object/cycle.
+   So the residual is **not** a barrier/SATB completeness bug (the .NET 11
+   runtime-async continuation spills are ordinary `STOREIND(TYP_REF)` /
+   GC-struct block stores with no `GTF_IND_TGT_NOT_HEAP`, so they *do* barrier — the
+   earlier "runtime-async bypasses the barrier" claim was stale). It is the normal
+   **off-pause concurrent-marking race** every incremental SATB marker must
+   reconcile at a safepoint: the marker scans an object before a mutator installs a
+   new reference into it.
+
+2. **Reconcile the race in O(mutations), not O(live-heap).** The coalescing-RC
+   modified buffer already records every slot written during the window. At the STW
+   finish (mutators stopped, `*slot` stable) `MarkModifiedNewValues()` marks the
+   current value of every written slot, then drains — catching exactly the raced
+   references, proportional to the mutation working set. The full
+   `CompleteClosureOverMarked` is demoted to (a) an **overflow fallback** when a
+   mutator dropped a written slot (`g_modifiedOverflow` / `g_satbOverflow`), and
+   (b) a **verifier** under `LXR_VERIFY_TRACE`. Because the trace is now complete
+   every finish, the sweep is **mark-authoritative every cycle** (dead cycles
+   collected promptly, not every 4th).
+
+   *Verified* (`LXR_VERIFY_TRACE=1`, `DOTNET_ReadyToRun=0`, `LXR_CONCURRENT=1
+   LXR_GC_THREADS=1`, 60 s WebApi): every finish reports `raceMarked=N gap=0` — the
+   modified-set pass reconciles the race (`raceMarked` up to a few objects) and the
+   verifier confirms the full closure then finds **nothing** (`gap=0`,
+   `offenders=0`). Production path (no verify → the O(live-heap) closure never runs):
+   `av=0` across runs. This removes the user's performance objection while keeping
+   the trace provably complete.
+
 
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 

@@ -157,6 +157,11 @@ static SatbBuffer* volatile g_registeredSatbBuffers = nullptr;
 static CRITICAL_SECTION g_satbLock;
 static volatile LONG g_satbActive = 0;   // logging gate: open while a trace window is live
 static volatile LONG g_satbOverflow = 0; // a mutator dropped a SATB entry this cycle
+// A mutator's coalescing-RC modified buffer filled during a trace window, so a
+// written slot was dropped and the modified-set race reconciliation (below) may
+// be incomplete. When set, the concurrent finish falls back to the full
+// O(live-heap) closure. Reset each epoch in ProcessModifiedBuffers.
+static volatile LONG g_modifiedOverflow = 0;
 
 // Lock-free prepend of a buffer onto the global SATB registry. The write barrier
 // runs in cooperative GC mode; taking a lock there can deadlock against SuspendEE
@@ -710,6 +715,14 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
         buf->Entries[buf->Count].OldValue = oldValue;
         buf->Count++;
         InterlockedIncrement64(&g_lxrCounters.ModifiedBufferEntries);
+    }
+    else if (g_satbActive)
+    {
+        // Buffer full during a trace window: a written slot is dropped, so the
+        // finish-pause modified-set race reconciliation (MarkModifiedNewValues)
+        // could miss a reference installed into an already-scanned object. Fall
+        // back to the full closure this cycle.
+        InterlockedExchange(&g_modifiedOverflow, 1);
     }
     // A production LXR flushes a full buffer into a shared queue; omitted here.
     // Once full we simply stop recording further entries this epoch.
@@ -1737,6 +1750,38 @@ void LXRCollector::ProcessModifiedBuffers()
     LeaveCriticalSection(&g_buffersLock);
     DrainZeroCountWorkList();
     LeaveCriticalSection(&m_collectLock);
+    InterlockedExchange(&g_modifiedOverflow, 0);
+}
+
+// Concurrent-marking-race reconciliation (LXR difference #3). The off-pause
+// concurrent drain can scan an object BEFORE a mutator installs a new reference
+// into it; under a Yuasa/SATB *deletion* barrier the newly installed referent is
+// not otherwise greyed, so it can be transiently missed (empirically ~1 object
+// per cycle). Rather than reconcile with an O(live-heap) closure over every
+// marked object, mark the CURRENT value of every slot written during the window:
+// the coalescing-RC modified buffer already records each written slot, so this is
+// proportional to the mutation working set, not the live heap. Mutators are
+// stopped (STW finish), so *Slot is stable. Marking a currently-referenced object
+// is definitionally sound (it is live) and at worst floats a little garbage for
+// one cycle. Returns the number of objects newly marked.
+int64_t LXRCollector::MarkModifiedNewValues()
+{
+    int64_t marked = 0;
+    EnterCriticalSection(&g_buffersLock);
+    for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
+    {
+        for (size_t i = 0; i < buf->Count; i++)
+        {
+            Object* newValue = *(buf->Entries[i].Slot);
+            if (newValue != nullptr && InHeap(newValue) && !IsMarked(newValue))
+            {
+                PushMark(newValue);
+                marked++;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_buffersLock);
+    return marked;
 }
 
 // Root callback for handle scanning: mark the referent of a live handle.
@@ -1966,58 +2011,51 @@ void LXRCollector::ConcurrentTraceFinish()
     // their referents (incl. snapshot-era objects they solely reference) are marked.
     DrainClosure();
 
-    // Final soundness backstop: complete the transitive closure over ALL marked
-    // objects. Any marked (live) object whose child was not greyed - by a missed
-    // deletion barrier (JIT-elided null store, native VM ref store, IntPtr-typed
-    // CoreLib ref-array clear) or a mark-commit/drain ordering gap - would leave a
-    // live child unmarked and let the mark-authoritative sweep decommit its chunk
-    // (UAF/AV in e.g. DispatchContinuations). Closing the closure here retains
-    // exactly the reachable set and never over-retains dead objects. The returned
-    // gap size is the residual-completeness signal (0 == trace already complete).
-    // LXR difference #2 - pace the O(live-heap) closure. Because the sweep is now
-    // RC-authoritative (AnyRCNonZeroInRange keeps any RC>=1 region), a concurrent
-    // finish that SKIPS the closure is still safe: every live object the trace
-    // missed is heap-referenced (RC>=1) and so its region is retained. We only
-    // need a complete trace to reclaim dead CYCLES (RC>=1 but unreachable), which
-    // can be deferred. Run the full closure - the authoritative, cycle-collecting
-    // pass - only every LXR_CYCLE_EVERY-th finish (default 4); other finishes
-    // return immediately, turning the per-finish cost from O(live heap) into an
-    // occasional amortized one. LXR_CYCLE_EVERY=1 restores closure every finish.
-    static int s_cycleEvery = -1;
-    if (s_cycleEvery < 0)
+    // Concurrent-marking-race reconciliation (LXR difference #3). The off-pause
+    // drain can scan an object before a mutator installs a new reference into it;
+    // under a Yuasa/SATB deletion barrier that new referent is not otherwise
+    // greyed, so it can be transiently missed (empirically ~1 object/cycle).
+    // Rather than reconcile with an O(live-heap) closure over every marked object
+    // (the user's perf objection), mark the CURRENT value of every slot written
+    // during the window - the coalescing-RC modified buffer already records each
+    // written slot, so this is proportional to the mutation working set, not the
+    // live heap. This makes the trace complete EVERY finish, so the sweep is
+    // mark-authoritative every cycle (dead cycles collected promptly).
+    //
+    // The full O(live-heap) closure is retained ONLY as (a) an overflow fallback
+    // when a mutator dropped a written slot (modified/SATB buffer full), and (b) a
+    // verifier under LXR_VERIFY_TRACE that asserts the cheap reconciliation left
+    // the trace complete (closureGap must be 0). In production with no overflow it
+    // never runs.
+    bool needFullClosure = g_satbOverflow || g_modifiedOverflow;
+    int64_t raceMarked = 0;
+    if (!needFullClosure)
     {
-        const char* e = getenv("LXR_CYCLE_EVERY");
-        s_cycleEvery = (e != nullptr) ? atoi(e) : 4;
-        if (s_cycleEvery < 1) s_cycleEvery = 1;
+        raceMarked = MarkModifiedNewValues();
+        DrainClosure();
     }
-    static volatile LONG s_finishCounter = 0;
-    LONG finishNo = InterlockedIncrement(&s_finishCounter);
-    bool runClosure = (finishNo % s_cycleEvery) == 0;
-    InterlockedExchange(&g_traceCompleteThisCycle, runClosure ? 1 : 0);
+    InterlockedExchange(&g_traceCompleteThisCycle, 1);
 
-    if (runClosure)
+    static int s_verify = -1;
+    if (s_verify < 0) s_verify = (getenv("LXR_VERIFY_TRACE") != nullptr) ? 1 : 0;
+
+    if (needFullClosure || s_verify)
     {
         int64_t closureGap = CompleteClosureOverMarked();
         if (closureGap != 0)
         {
             InterlockedExchangeAdd64(&g_lxrCounters.ClosureGapMarked, closureGap);
-            if (getenv("LXR_VERIFY_TRACE") != nullptr)
-                fprintf(stderr, "LXRGC: [conc-finish] closure-completion marked %lld live object(s) the concurrent trace missed\n",
-                        (long long)closureGap);
+            if (s_verify)
+                fprintf(stderr, "LXRGC: [conc-finish] closure marked %lld object(s) AFTER race-reconciliation (raceMarked=%lld fullFallback=%d) - reconciliation INCOMPLETE\n",
+                        (long long)closureGap, (long long)raceMarked, needFullClosure ? 1 : 0);
         }
-
-        if (getenv("LXR_VERIFY_TRACE") != nullptr)
+        if (s_verify)
         {
-            fprintf(stderr, "LXRGC: [conc-finish] verifying after allocate-black\n");
+            fprintf(stderr, "LXRGC: [conc-finish] verifying after race-reconciliation (raceMarked=%lld gap=%lld)\n",
+                    (long long)raceMarked, (long long)closureGap);
             VerifyTraceComplete();
         }
     }
-    else if (getenv("LXR_VERIFY_TRACE") != nullptr)
-    {
-        fprintf(stderr, "LXRGC: [conc-finish] closure skipped (RC-authoritative sweep this cycle)\n");
-    }
-
-    // Close the window: stop logging deletions, allow block reuse again, clear
     // the SATB buffers for the next cycle (safe: still STW here).
     SetSatbActive(false);
     InterlockedExchange(&g_traceWindowOpen, 0);
