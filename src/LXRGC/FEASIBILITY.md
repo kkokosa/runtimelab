@@ -673,6 +673,72 @@ a **targeted, non-generic change to a specific runtime subsystem**, exactly the
    under STW at the concurrent finish pause (6/6 clean), but forfeits most of the
    concurrency benefit (effectively "STW trace with extra steps").
 
+##### RESOLVED — sound concurrency via generic barrier completion + STW closure-completion
+
+The wall above is now closed **without** the non-generic option 2 (no
+runtime-async-specific plumbing). Three changes, in dependency order:
+
+1. **Generic JIT full-ref-barrier flag** (`kkokosa/runtime`, GC-agnostic). A new
+   `CORJIT_FLAG_GC_FULL_REF_BARRIERS` (mirrored `JIT_FLAG_GC_FULL_REF_BARRIERS`)
+   makes the JIT emit a barrier for **every** in-heap ref store, including the
+   null-store / frozen-object-handle stores it normally elides. Under a Yuasa/SATB
+   *deletion* barrier those elided stores are exactly the deletions the concurrent
+   trace must observe. The flag is off by default (zero impact on the built-in GC);
+   a custom GC opts in via `write_barrier_requires_all_ref_stores` in
+   `WriteBarrierParameters` (minor-version bump). *Files:* `inc/corjitflags.h`,
+   `jit/jitee.h`, `jit/gcinfo.cpp`, `vm/writebarriermanager.cpp`, `vm/gchelpers.h`,
+   `vm/gcenv.ee.cpp`, `vm/jitinterface.cpp`, `gc/gcinterface.h`.
+
+2. **VM-side `SetObjectReferenceUnchecked` routing** (`kkokosa/runtime`,
+   GC-agnostic). The VM's canonical native heap ref store (used by exceptions,
+   reflection, statics, delegates, string interning) only card-marked and never
+   surfaced the old value. It now captures the old value and calls the pluggable
+   Callback barrier for in-heap destinations when one is installed. *File:*
+   `vm/object.cpp`.
+
+3. **GC-side STW closure-completion** (`kkokosa/runtimelab`, no runtime change).
+   Even with (1)+(2), a residual handful of live objects per occasional cycle are
+   still deleted through paths that never reach the barrier — notably **.NET 11
+   runtime-async continuation spills** (live refs/byrefs spilled into a heap
+   continuation object) and `IntPtr`-typed / `Unsafe` ref-array clears in CoreLib,
+   which are not lowered to `JIT_WriteBarrier`. Rather than add a targeted,
+   non-generic hook to the runtime-async subsystem (the flagged stop-and-inform
+   boundary), the concurrent **finish pause** — already STW, with every mutator
+   stopped — completes the transitive closure over all currently-marked objects
+   (`CompleteClosureOverMarked`): for each marked (retained/live) object it marks
+   any in-heap child not yet marked, to a fixpoint, **before** the
+   mark-authoritative sweep. Marking a child of a live object is definitionally
+   correct (it is reachable from a live object, hence live) and never retains a
+   genuinely-dead object (nothing points to it), so this yields the *correct,
+   complete* trace state — it fixes the desync rather than hiding an invalid final
+   state. It is the SATB-overflow full re-trace generalized to "any missed
+   deletion," and it needs no read barrier and no runtime change.
+
+This is why it is not masking: the closure-completion **computes the correct live
+set** that the barrier-incomplete concurrent trace failed to reach; the alternative
+(leaving a marked/live parent with an unmarked child) is the actual bug, because
+the mark-authoritative sweep would then `MEM_DECOMMIT` a live object's chunk →
+UAF/AV in `DispatchContinuations` / `PinnedBlockMemoryPool.Rent`. A new counter
+`ClosureGapMarked` records the residual gap size (typically 3–8 objects/cycle) so
+the barrier-coverage shortfall stays visible rather than silent.
+
+**Verified sound** (`LXR_VERIFY_TRACE=1`, `DOTNET_ReadyToRun=0` so CoreLib is JIT'd
+with the flag):
+- `LXR_CONCURRENT=1 LXR_GC_THREADS=1` (serial concurrent): **5/5 clean**, 120 s
+  WebApi, `av=0 hang=0`; every finish `verify` reports `offenders=0` after
+  closure-completion.
+- Full unified `LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_GC_THREADS=16`
+  (concurrent trace + parallel-16 mark + copying evacuation): **3/3 clean**,
+  120 s, `av=0 hang=0`, valid `##RESULT##` with `Errors:0`; the earlier
+  GcThreads=1 concurrent hang did not recur (it was a symptom of the same
+  incomplete-trace decommit).
+
+*Cost / future work:* `CompleteClosureOverMarked` linearly walks the used heap at
+each concurrent finish pause. Concurrent cycles are occasional, so the added STW
+time is modest, but it can be narrowed later to dirty/remset regions or skipped
+when barrier coverage is provably complete.
+
+
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 
 On a continuously-growing multi-GB object graph containing very large reference

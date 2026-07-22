@@ -162,6 +162,7 @@ struct LXRCounters
     volatile int64_t ConcurrentTraces;      // concurrent trace cycles run
     volatile int64_t ConcMarkedObjects;     // objects marked during the concurrent drain
     volatile int64_t ConcAllocBlack;        // objects retained by allocate-black (born mid-trace)
+    volatile int64_t ClosureGapMarked;      // live objects the conc trace missed, marked by closure-completion
     volatile int64_t ConcSnapshotMicros;    // cumulative STW snapshot-pause time (us)
     volatile int64_t ConcFinishMicros;      // cumulative STW finish-pause time (us)
     volatile int64_t ConcDrainMicros;       // cumulative concurrent (non-pause) drain time (us)
@@ -280,6 +281,7 @@ public:
     // Parse-independent region liveness for the sweep (see SweepAndSelectDefrag).
     bool AnyMarkedInRange(uint8_t* start, uint8_t* end) const;
     void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
+    int64_t CompleteClosureOverMarked(); // finish pause: close closure over all marked objects
     void ResetMarks();                  // decommits the mark side-table (all bits -> 0)
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs

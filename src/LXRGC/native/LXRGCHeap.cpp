@@ -814,11 +814,13 @@ void LXRCollector::VerifyTraceComplete()
                         if (reported < 12)
                         {
                             reported++;
+                            bool childNew  = (uint8_t*)child >= g_concWatermark;
+                            bool parentNew = (uint8_t*)o     >= g_concWatermark;
                             fprintf(stderr,
-                                "LXRGC: [verify] MARKED parent %p mt=%p base=%u comp=%d -> UNMARKED child %p (fieldoff=%lld)\n",
+                                "LXRGC: [verify] MARKED parent %p mt=%p base=%u comp=%d parentNew=%d -> UNMARKED child %p (fieldoff=%lld childNew=%d wm=%p)\n",
                                 (void*)o, (void*)pmt, (unsigned)pmt->GetBaseSize(),
-                                pmt->HasComponentSize() ? 1 : 0, (void*)child,
-                                (long long)((uint8_t*)ref - (uint8_t*)o));
+                                pmt->HasComponentSize() ? 1 : 0, parentNew ? 1 : 0, (void*)child,
+                                (long long)((uint8_t*)ref - (uint8_t*)o), childNew ? 1 : 0, (void*)g_concWatermark);
                         }
                     }
                 });
@@ -830,6 +832,75 @@ void LXRCollector::VerifyTraceComplete()
     fprintf(stderr, "LXRGC: [verify] trace-completeness offenders=%lld markStackDrops=%lld\n",
             (long long)offenders, (long long)g_lxrCounters.MarkStackDrops);
     fflush(stderr);
+}
+
+// Close the transitive closure over every currently-marked object. This is a
+// STW-only soundness backstop for the concurrent trace: it walks the whole used
+// heap and, for each MARKED (retained/live) object, pushes any in-heap child
+// that is not yet marked, then drains. Marking a child of a marked object is
+// definitionally correct - the child is reachable from a live object, so it is
+// live - and it never retains genuinely-dead objects (an object no marked object
+// points to is never visited). This makes the trace complete regardless of which
+// deletion-barrier path (JIT-elided null store, native VM ref store, IntPtr-typed
+// CoreLib ref-array clear, drain/mark-commit ordering) failed to grey a slot.
+// Returns the number of objects it had to newly mark (the closure gap = 0 when
+// the concurrent trace was already complete), which is the root-cause signal.
+int64_t LXRCollector::CompleteClosureOverMarked()
+{
+    int64_t newlyMarked = 0;
+    int reported = 0;
+    bool progress = true;
+    // Iterate to a fixpoint: draining pushed children marks transitively, but a
+    // marked object located earlier in the linear walk than the parent that
+    // revealed it is only re-examined on a subsequent pass. A pass that adds
+    // nothing proves closure completeness.
+    while (progress)
+    {
+        progress = false;
+        EnterCriticalSection(&g_chunkLock);
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed) continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            uint8_t* p = c.Start;
+            while (p < end)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0) break;
+                if (IsMarked(o))
+                {
+                    MethodTable* pmt = o->GetGCSafeMethodTable();
+                    GCScanObjectRefs(o, sz, [this, o, pmt, &newlyMarked, &reported, &progress](Object** ref)
+                    {
+                        Object* child = *ref;
+                        if (child != nullptr && InHeap(child) && !IsMarked(child))
+                        {
+                            if (reported < 8)
+                            {
+                                reported++;
+                                fprintf(stderr,
+                                    "LXRGC: [closure] gap: MARKED parent %p mt=%p comp=%d -> UNMARKED child %p (fieldoff=%lld)\n",
+                                    (void*)o, (void*)pmt, pmt->HasComponentSize() ? 1 : 0,
+                                    (void*)child, (long long)((uint8_t*)ref - (uint8_t*)o));
+                            }
+                            newlyMarked++;
+                            progress = true;
+                            PushMark(child);   // mark + enqueue; children scanned by drain below
+                        }
+                    });
+                }
+                p += sz;
+            }
+        }
+        LeaveCriticalSection(&g_chunkLock);
+        // Scan everything just pushed (transitively). Newly marked objects reached
+        // here need one more linear pass in case they precede a parent that would
+        // reveal further children, hence the outer fixpoint loop.
+        DrainClosure();
+    }
+    return newlyMarked;
 }
 
 void LXRCollector::ResetMarks()
@@ -1448,13 +1519,53 @@ void LXRCollector::ConcurrentTraceFinish()
                 break;
             if (p >= floor)
             {
-                if (MarkObject(o))
+                // Allocate-black: retain objects born during the window. They must
+                // be SCANNED, not merely mark-bit-set: a window-born object's ref
+                // fields are filled by the mutator with arbitrary referents, and
+                // under a Yuasa/SATB *deletion* barrier (which never greys the NEW
+                // referent of a store) those referents are only otherwise reached
+                // if snapshot-reachable. Pushing black objects onto the mark stack
+                // traces their fields so any referent they solely keep alive is
+                // marked. (With per-thread alloc contexts a black object can even
+                // sit below the global high-water, so parentNew classification is
+                // not a reliable proxy for "already scanned".)
+                if (!IsMarked(o))
+                {
+                    PushMark(o);
                     InterlockedIncrement64(&g_lxrCounters.ConcAllocBlack);
+                }
             }
             p += sz;
         }
     }
     LeaveCriticalSection(&g_chunkLock);
+
+    // Trace the transitive closure of every allocate-black object just pushed, so
+    // their referents (incl. snapshot-era objects they solely reference) are marked.
+    DrainClosure();
+
+    // Final soundness backstop: complete the transitive closure over ALL marked
+    // objects. Any marked (live) object whose child was not greyed - by a missed
+    // deletion barrier (JIT-elided null store, native VM ref store, IntPtr-typed
+    // CoreLib ref-array clear) or a mark-commit/drain ordering gap - would leave a
+    // live child unmarked and let the mark-authoritative sweep decommit its chunk
+    // (UAF/AV in e.g. DispatchContinuations). Closing the closure here retains
+    // exactly the reachable set and never over-retains dead objects. The returned
+    // gap size is the residual-completeness signal (0 == trace already complete).
+    int64_t closureGap = CompleteClosureOverMarked();
+    if (closureGap != 0)
+    {
+        InterlockedExchangeAdd64(&g_lxrCounters.ClosureGapMarked, closureGap);
+        if (getenv("LXR_VERIFY_TRACE") != nullptr)
+            fprintf(stderr, "LXRGC: [conc-finish] closure-completion marked %lld live object(s) the concurrent trace missed\n",
+                    (long long)closureGap);
+    }
+
+    if (getenv("LXR_VERIFY_TRACE") != nullptr)
+    {
+        fprintf(stderr, "LXRGC: [conc-finish] verifying after allocate-black\n");
+        VerifyTraceComplete();
+    }
 
     // Close the window: stop logging deletions, allow block reuse again, clear
     // the SATB buffers for the next cycle (safe: still STW here).
@@ -2031,6 +2142,12 @@ HRESULT LXRGCHeap::Initialize()
         // for A/B measurement of its cost/soundness contribution.
         if (getenv("LXR_NO_BULK_BARRIER") == nullptr)
             cb.write_barrier_bulk_callback = &LXRBulkWriteBarrierCallback;
+        // Ask the JIT to barrier EVERY in-heap ref-field store, including
+        // `obj.field = null` and frozen-constant stores that the card barrier
+        // elides. These are SATB referent deletions the concurrent trace must
+        // observe (see FEASIBILITY.md). Gate off for A/B via LXR_NO_FULL_REF_BARRIERS.
+        if (getenv("LXR_NO_FULL_REF_BARRIERS") == nullptr)
+            cb.write_barrier_requires_all_ref_stores = true;
         cb.lowest_address = m_heapBase;
         cb.highest_address = m_heapReservedEnd;
         cb.card_table = (uint32_t*)cardTableBiased;
@@ -2418,7 +2535,13 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // --- Concurrent drain (mutators running) ---
         QueryPerformanceCounter(&a0);
         LXRSetPhase("conc:drain");
-        g_lxrCollector.ConcurrentTraceDrain();
+        // Diagnostic: LXR_CONC_NO_DRAIN skips the off-pause drain so the ENTIRE
+        // closure is computed at the STW finish from snapshot-greyed roots + SATB
+        // + allocate-black. Discriminates a barrier/SATB-completeness bug (offenders
+        // persist) from an off-pause concurrent-marking race (offenders vanish).
+        static int s_noDrain = (getenv("LXR_CONC_NO_DRAIN") != nullptr) ? 1 : 0;
+        if (!s_noDrain)
+            g_lxrCollector.ConcurrentTraceDrain();
         QueryPerformanceCounter(&a1);
         int64_t drainMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent drain done (%lldus off-pause)\n", (long long)drainMicros); fflush(stderr); }
