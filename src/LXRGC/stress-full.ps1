@@ -7,7 +7,7 @@ param(
     [int]$VerifyTrace = 0,
     [int]$ReadyToRun = 1
 )
-Get-ChildItem Env: | Where-Object { $_.Name -like 'LXR*' -or $_.Name -eq 'DOTNET_GCName' } | ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }
+Get-ChildItem Env: | Where-Object { ($_.Name -like 'LXR*' -and $_.Name -ne 'LXR_DUMP_ON_GAP') -or $_.Name -eq 'DOTNET_GCName' } | ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }
 $exe = "C:\github\runtimelab\src\LXRGC\samples\WebApi\publish\WebApi.exe"
 $dir = Split-Path $exe
 $env:DOTNET_GCName = "LXRGC.dll"

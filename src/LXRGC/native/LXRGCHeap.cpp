@@ -13,6 +13,36 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <dbghelp.h>
+
+// One-shot full-memory minidump (enabled via LXR_DUMP_ON_GAP=1). Called at the
+// first concurrent-trace closure gap - while mutators are STW-stopped, so the
+// logged offender addresses stay valid - so the offender MethodTable pointers
+// can be resolved to type names offline with SOS/dotnet-dump. Diagnostic only.
+static volatile LONG g_lxrDumpedOnGap = 0;
+static void LXRWriteGapMiniDump()
+{
+    if (getenv("LXR_DUMP_ON_GAP") == nullptr)
+        return;
+    if (InterlockedCompareExchange(&g_lxrDumpedOnGap, 1, 0) != 0)
+        return;
+    if (InterlockedCompareExchange(&g_lxrDumpedOnGap, 1, 0) != 0)
+        return;
+    const wchar_t* path = L"C:\\temp\\lxr-gap.dmp";
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        fprintf(stderr, "LXRGC: [gap-dump] could not create %ls (err=%lu)\n", path, GetLastError());
+        return;
+    }
+    BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), h,
+                                MiniDumpWithFullMemory, nullptr, nullptr, nullptr);
+    CloseHandle(h);
+    fprintf(stderr, "LXRGC: [gap-dump] wrote %ls ok=%d\n", path, ok);
+    fflush(stderr);
+}
+
 
 // GCScanObjectRefs' collectible-class branch calls this EE up-call. LXRGC does
 // not compile the standalone gcenv.ee inline forwarders, so provide the single
@@ -908,6 +938,8 @@ int64_t LXRCollector::CompleteClosureOverMarked()
                             bool childBorn  = LXRBornInWindow((uint8_t*)child);
                             bool parentBorn = LXRBornInWindow((uint8_t*)o);
                             if (childBorn) gapBornInWindow++; else gapSnapshotEra++;
+                            if (!childBorn)
+                                LXRWriteGapMiniDump(); // one-shot: capture for offline SOS type resolution
                             if (reported < 12)
                             {
                                 reported++;

@@ -74,7 +74,7 @@ $pdbPath = Join-Path $objDir "LXRGC.pdb"
 $clCmd = "cl.exe /nologo /c /EHsc /std:c++17 $optFlags /Fd:`"$pdbPath`" /I `"$includes`" $($defs -join ' ') /Fo:`"$objDir\\`" $($sourceFiles -join ' ')"
 $objFiles = @("dllmain.obj", "LXRGCHeap.obj", "LXRGCHandles.obj") | ForEach-Object { "`"$objDir\$_`"" }
 $outDll = Join-Path $objDir "LXRGC.dll"
-$linkCmd = "link.exe /nologo /DLL /DEBUG /OUT:`"$outDll`" $($objFiles -join ' ') kernel32.lib advapi32.lib"
+$linkCmd = "link.exe /nologo /DLL /DEBUG /OUT:`"$outDll`" $($objFiles -join ' ') kernel32.lib advapi32.lib dbghelp.lib"
 
 Write-Host "Compiling LXRGC ($Configuration)..." -ForegroundColor Cyan
 $output = & $env:ComSpec /c "call `"$VcVarsPath`" >nul 2>&1 && cd /d `"$src`" && $clCmd 2>&1 && $linkCmd 2>&1"
