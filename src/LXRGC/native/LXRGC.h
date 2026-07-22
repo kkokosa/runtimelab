@@ -280,6 +280,14 @@ public:
     // True if any mark bit is set at a granule-aligned start within [start,end).
     // Parse-independent region liveness for the sweep (see SweepAndSelectDefrag).
     bool AnyMarkedInRange(uint8_t* start, uint8_t* end) const;
+    // RC-authoritative liveness: true if any object-start granule in [start,end)
+    // has a non-zero reference count. Parse-free (scans the RC side table like
+    // AnyMarkedInRange scans the mark table); skips uncommitted RC pages, which
+    // are necessarily all-zero (never had an RC set). Used by the sweep so a
+    // region holding any RC>=1 object is never reclaimed - the guarantee that
+    // makes concurrent-trace incompleteness harmless (missed-live objects have
+    // RC>=1 and so are protected without relying on the trace).
+    bool AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const;
     void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
     int64_t CompleteClosureOverMarked(); // finish pause: close closure over all marked objects
     void ResetMarks();                  // decommits the mark side-table (all bits -> 0)

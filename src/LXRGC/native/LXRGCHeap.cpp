@@ -201,6 +201,13 @@ static volatile LONG g_evacActive = 0;   // STW evacuation gate (P3)
 // high-water at the snapshot pause; g_snapChunkCount is the region count then.
 static volatile LONG g_concurrentEnabled = 0; // env LXR_CONCURRENT: use concurrent backup trace
 static volatile LONG g_traceWindowOpen  = 0;  // a concurrent trace window is live
+// LXR difference #2: the sweep is RC-authoritative unless the current cycle ran
+// a COMPLETE trace. Complete cycles (STW backup trace, or a concurrent finish
+// where CompleteClosureOverMarked ran) are mark-authoritative so dead cycles are
+// reclaimed; other concurrent finishes skip the O(live-heap) closure and rely on
+// RC to keep missed-live objects (parse-free AnyRCNonZeroInRange), collecting
+// dead cycles only on the next complete cycle. 1 => mark-authoritative sweep.
+static volatile LONG g_traceCompleteThisCycle = 0;
 static std::vector<uint8_t*>* g_snapUsedEnd = nullptr; // per-region snapshot high-water
 static size_t   g_snapChunkCount = 0;
 static uint8_t* g_concWatermark  = nullptr;   // heap high-water at snapshot
@@ -810,7 +817,41 @@ bool LXRCollector::AnyMarkedInRange(uint8_t* start, uint8_t* end) const
     return false;
 }
 
-// Diagnostic (LXR_VERIFY_TRACE=1): after marking, walk the whole heap and, for
+// RC-authoritative counterpart of AnyMarkedInRange. The RC table is one
+// saturating byte per 8-byte granule, reserved-only and committed lazily on
+// first RC set. An uncommitted page therefore means "no granule in that page
+// ever had a non-zero RC" -> treat as all-zero (skip it, don't fault). Within a
+// committed page any non-zero byte is a live (RC>=1) object start.
+bool LXRCollector::AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const
+{
+    if (start < m_heapBase) start = m_heapBase;
+    if (end <= start) return false;
+    if (end > m_heapBase + m_heapBytes) end = m_heapBase + m_heapBytes;
+    size_t gStart = (size_t)(start - m_heapBase) / lxr::kObjectGranule;
+    size_t gEnd   = (size_t)(end - m_heapBase + lxr::kObjectGranule - 1) / lxr::kObjectGranule;
+    uint8_t* rcStart = m_rcTable + gStart;                 // one byte per granule
+    uint8_t* rcEnd   = m_rcTable + gEnd;
+    uintptr_t pageMask = (uintptr_t)g_pageSize - 1;
+    uint8_t* p = (uint8_t*)((uintptr_t)rcStart & ~pageMask);
+    while (p < rcEnd)
+    {
+        uint8_t* pageEnd = p + g_pageSize;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
+        {
+            p = pageEnd; // reserved/uncommitted -> all RC zero here
+            continue;
+        }
+        uint8_t* scanFrom = (p < rcStart) ? rcStart : p;
+        uint8_t* scanTo   = (pageEnd < rcEnd) ? pageEnd : rcEnd;
+        for (uint8_t* q = scanFrom; q < scanTo; q++)
+            if (*q != 0)
+                return true;
+        p = pageEnd;
+    }
+    return false;
+}
+
 // every MARKED object, check that each of its in-heap referents is ALSO marked.
 // A marked object pointing at an unmarked in-heap object is a trace-completeness
 // bug: that referent will be swept/reused while still reachable, dangling the
@@ -1618,19 +1659,47 @@ void LXRCollector::ConcurrentTraceFinish()
     // (UAF/AV in e.g. DispatchContinuations). Closing the closure here retains
     // exactly the reachable set and never over-retains dead objects. The returned
     // gap size is the residual-completeness signal (0 == trace already complete).
-    int64_t closureGap = CompleteClosureOverMarked();
-    if (closureGap != 0)
+    // LXR difference #2 - pace the O(live-heap) closure. Because the sweep is now
+    // RC-authoritative (AnyRCNonZeroInRange keeps any RC>=1 region), a concurrent
+    // finish that SKIPS the closure is still safe: every live object the trace
+    // missed is heap-referenced (RC>=1) and so its region is retained. We only
+    // need a complete trace to reclaim dead CYCLES (RC>=1 but unreachable), which
+    // can be deferred. Run the full closure - the authoritative, cycle-collecting
+    // pass - only every LXR_CYCLE_EVERY-th finish (default 4); other finishes
+    // return immediately, turning the per-finish cost from O(live heap) into an
+    // occasional amortized one. LXR_CYCLE_EVERY=1 restores closure every finish.
+    static int s_cycleEvery = -1;
+    if (s_cycleEvery < 0)
     {
-        InterlockedExchangeAdd64(&g_lxrCounters.ClosureGapMarked, closureGap);
-        if (getenv("LXR_VERIFY_TRACE") != nullptr)
-            fprintf(stderr, "LXRGC: [conc-finish] closure-completion marked %lld live object(s) the concurrent trace missed\n",
-                    (long long)closureGap);
+        const char* e = getenv("LXR_CYCLE_EVERY");
+        s_cycleEvery = (e != nullptr) ? atoi(e) : 4;
+        if (s_cycleEvery < 1) s_cycleEvery = 1;
     }
+    static volatile LONG s_finishCounter = 0;
+    LONG finishNo = InterlockedIncrement(&s_finishCounter);
+    bool runClosure = (finishNo % s_cycleEvery) == 0;
+    InterlockedExchange(&g_traceCompleteThisCycle, runClosure ? 1 : 0);
 
-    if (getenv("LXR_VERIFY_TRACE") != nullptr)
+    if (runClosure)
     {
-        fprintf(stderr, "LXRGC: [conc-finish] verifying after allocate-black\n");
-        VerifyTraceComplete();
+        int64_t closureGap = CompleteClosureOverMarked();
+        if (closureGap != 0)
+        {
+            InterlockedExchangeAdd64(&g_lxrCounters.ClosureGapMarked, closureGap);
+            if (getenv("LXR_VERIFY_TRACE") != nullptr)
+                fprintf(stderr, "LXRGC: [conc-finish] closure-completion marked %lld live object(s) the concurrent trace missed\n",
+                        (long long)closureGap);
+        }
+
+        if (getenv("LXR_VERIFY_TRACE") != nullptr)
+        {
+            fprintf(stderr, "LXRGC: [conc-finish] verifying after allocate-black\n");
+            VerifyTraceComplete();
+        }
+    }
+    else if (getenv("LXR_VERIFY_TRACE") != nullptr)
+    {
+        fprintf(stderr, "LXRGC: [conc-finish] closure skipped (RC-authoritative sweep this cycle)\n");
     }
 
     // Close the window: stop logging deletions, allow block reuse again, clear
@@ -1664,7 +1733,19 @@ void LXRCollector::SweepAndSelectDefrag()
         // mutating graphs, e.g. the growing-cache workload). Mark bits are set
         // only at granule-aligned live-object starts, so "any mark bit set in
         // [Start,UsedEnd)" is an exact liveness test with no parsing.
-        bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd);
+        // RC-authoritative liveness (LXR difference #2). A region is reclaimable
+        // only if it holds NO kept object. On a COMPLETE-trace cycle
+        // (g_traceCompleteThisCycle: STW backup trace, or a concurrent finish
+        // that ran CompleteClosureOverMarked) "kept" = marked, so unmarked dead
+        // cycles - RC>=1 but unreachable - are reclaimed (mark-authoritative).
+        // On a fast concurrent finish that skipped the closure, "kept" also
+        // includes RC>=1: an object the concurrent SATB trace missed is still
+        // referenced (RC>=1, e.g. a Kestrel MemoryPoolBlock held in a
+        // ConcurrentQueue slot), so its region is kept without relying on the
+        // (possibly incomplete) trace. Both tests are parse-free side-table
+        // scans, so a misparse can never wrongly reclaim a live region.
+        bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd) ||
+                       (!g_traceCompleteThisCycle && AnyRCNonZeroInRange(c.Start, c.UsedEnd));
         if (anyLive)
             continue;
 
@@ -2627,6 +2708,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (s_concFinishFullTrace)
         {
             g_lxrCollector.BackupTrace();
+            // A full STW re-trace is complete by construction -> mark-authoritative
+            // sweep (reclaims dead cycles). (ConcurrentTraceFinish sets this flag
+            // itself, based on whether it ran the closure this cycle.)
+            InterlockedExchange(&g_traceCompleteThisCycle, 1);
             // Close the SATB window that ConcurrentTraceSnapshot opened.
             g_lxrCollector.SetSatbActive(false);
             InterlockedExchange(&g_traceWindowOpen, 0);
@@ -2676,6 +2761,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         }
         if (phase == LXRPhase::TracePause)
         {
+            // STW backup trace is complete by construction (no mutator window) ->
+            // mark-authoritative sweep, which reclaims dead cycles. If tracing is
+            // disabled (LXR_NO_TRACE diagnostic) fall back to the RC-authoritative
+            // sweep so a stale/empty mark table can never free a live region.
+            InterlockedExchange(&g_traceCompleteThisCycle, doTrace ? 1 : 0);
             if (doTrace)
             {
                 LXRSetPhase("stw:backuptrace");
