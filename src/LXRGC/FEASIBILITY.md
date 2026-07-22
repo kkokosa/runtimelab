@@ -817,6 +817,42 @@ Two follow-up findings closed this properly:
    the trace provably complete.
 
 
+##### RESOLVED (2026-07-23) — concurrent / lazy RC decrements off the pause (difference #1)
+
+Paper-LXR replays the coalescing-RC **decrements** and the recursive free on a
+background collector thread, *between* pauses; only the bounded buffer snapshot is
+stop-the-world. Ours previously ran the whole `ProcessModifiedBuffers` (RC replay)
++ `DrainZeroCountWorkList` (recursive cascade) under `SuspendEE`.
+
+Fix (concurrent path, gated by `LXR_CONC_DECREMENTS`):
+
+- **Snapshot at the STW snapshot pause** (`SnapshotModifiedBuffers`): detach every
+  mutator's modified buffer into `g_rcSnap*`, capturing `(oldValue, newValue=*slot)`
+  while mutators are stopped so both reads are stable, then reset each buffer.
+  Pause cost is a bounded copy proportional to the epoch's mutations — no RC
+  arithmetic, no cascade.
+- **Replay off-pause during the concurrent drain window**
+  (`ProcessSnapshotDecrements`): apply **all** increments, then **all** decrements
+  (strict coalescing-RC ordering — a referent incremented by a later store is never
+  transiently freed by an earlier store's decrement), then run the zero-count
+  cascade.
+
+*Why sound off-pause:* (a) only the collector ever mutates the RC side table — the
+barrier merely *logs* — so there is no RC race with mutators; (b) aligned pointer
+loads of a possibly-resurrected dead object's fields are atomic on amd64 (no torn
+read); (c) reclamation stays gated on the sweep, which is **mark-authoritative**
+every concurrent cycle (see the 2026-07-22 fix), so even a rare mutator
+resurrection racing a decrement — transiently corrupting a count — cannot free a
+reachable object (the sweep frees by *mark*, not by RC, that cycle).
+
+*Verified* (`LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_LINE_REUSE=1
+LXR_CONC_DECREMENTS=1`, `DOTNET_ReadyToRun=0`, 60 s WebApi): `av=0`, and with
+`LXR_VERIFY_TRACE=1` every finish reports `gap=0 offenders=0` — off-pause decrements
+do not perturb trace completeness. STW path (unchanged, `LXR_CONCURRENT=0`) still
+`av=0`. (One run wedged in the pre-existing intermittent `SuspendEE` hang —
+difference #5, unrelated to correctness.)
+
+
 #### Resolved bug — large-object chunk recycled as a small chunk (growing-cache)
 
 On a continuously-growing multi-GB object graph containing very large reference

@@ -6,7 +6,8 @@ param(
     [int]$Evac = 1,
     [int]$VerifyTrace = 0,
     [int]$ReadyToRun = 1,
-    [int]$LineReuse = 0
+    [int]$LineReuse = 0,
+    [int]$ConcDecrements = 0
 )
 Get-ChildItem Env: | Where-Object { ($_.Name -like 'LXR*' -and $_.Name -ne 'LXR_DUMP_ON_GAP') -or $_.Name -eq 'DOTNET_GCName' } | ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }
 $exe = "C:\github\runtimelab\src\LXRGC\samples\WebApi\publish\WebApi.exe"
@@ -16,6 +17,7 @@ $env:LXR_GC_THREADS = "$GcThreads"
 if ($Concurrent -ne 0) { $env:LXR_CONCURRENT = "1" }
 if ($Evac -ne 0) { $env:LXR_EVAC = "1" }
 if ($LineReuse -ne 0) { $env:LXR_LINE_REUSE = "1" }
+if ($ConcDecrements -ne 0) { $env:LXR_CONC_DECREMENTS = "1" }
 $env:LXR_REMSET = "1"
 $env:LXR_FAULT_DIAG = "1"
 if ($VerifyTrace -ne 0) { $env:LXR_VERIFY_TRACE = "1" }

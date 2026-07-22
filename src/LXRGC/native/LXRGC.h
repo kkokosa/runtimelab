@@ -205,6 +205,10 @@ public:
     // decrement old referents, then process the resulting zero-count work
     // list (recursive decrements). This is coalescing RC.
     void ProcessModifiedBuffers();
+    // #1 concurrent/lazy decrements: STW snapshot of the modified buffers, then
+    // off-pause replay of the coalescing-RC increments/decrements + recursive free.
+    void SnapshotModifiedBuffers();
+    void ProcessSnapshotDecrements();
 
     // --- SATB (snapshot-at-the-beginning) deletion barrier (P2) ---
     //

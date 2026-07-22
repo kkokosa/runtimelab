@@ -248,6 +248,26 @@ static Object** g_zeroCountStack = nullptr;
 static size_t g_zeroCountTop = 0;
 static size_t g_zeroCountCap = 0;
 
+// --- Concurrent / lazy RC decrements (LXR difference #1) -------------------
+// Paper-LXR replays the coalescing-RC decrements and runs the recursive free
+// OFF the stop-the-world pause, on a background collector thread, so only the
+// (bounded) buffer *snapshot* costs pause time. We approximate this in the
+// concurrent trace path: at the snapshot STW pause we detach the per-thread
+// modified buffers into g_rcSnap* (capturing (oldValue, newValue=*slot) while
+// mutators are stopped, so the reads are stable), then replay the increments
+// and decrements + zero-count cascade off-pause during the concurrent drain
+// window. Actual memory reclamation is unchanged: it stays gated on the sweep,
+// which is mark-authoritative every concurrent cycle (g_traceCompleteThisCycle),
+// so even if a rare mutator resurrection races an off-pause decrement and
+// transiently corrupts a reference count, no reachable object can be freed -
+// the sweep frees by mark, not by RC, that cycle. Gated by LXR_CONC_DECREMENTS
+// and only ever taken on the concurrent path.
+static volatile LONG g_concDecrements = 0; // env LXR_CONC_DECREMENTS
+struct RCSnapshotEntry { Object* OldValue; Object* NewValue; };
+static RCSnapshotEntry* g_rcSnapEntries = nullptr;
+static size_t g_rcSnapCount = 0;
+static size_t g_rcSnapCap = 0;
+
 // Backup-trace mark stack (grown on demand; STW so no locking needed while draining).
 static Object** g_markStack = nullptr;
 static size_t g_markTop = 0;
@@ -640,6 +660,9 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // pauses + off-pause marking). The SATB window is opened per-trace, so
     // g_satbActive is NOT forced on here.
     if (getenv("LXR_CONCURRENT") != nullptr) g_concurrentEnabled = 1;
+    // #1: replay coalescing-RC decrements + the recursive free OFF the STW
+    // pause (concurrent path only). Only the bounded buffer snapshot is paused.
+    if (getenv("LXR_CONC_DECREMENTS") != nullptr) g_concDecrements = 1;
     // P5: parallel mark worker count. Clamped to [1, 64]; 1 keeps the verified
     // single-threaded closure.
     if (const char* t = getenv("LXR_GC_THREADS"))
@@ -1753,8 +1776,68 @@ void LXRCollector::ProcessModifiedBuffers()
     InterlockedExchange(&g_modifiedOverflow, 0);
 }
 
-// Concurrent-marking-race reconciliation (LXR difference #3). The off-pause
-// concurrent drain can scan an object BEFORE a mutator installs a new reference
+// #1 concurrent/lazy decrements - STW half. Detach every mutator's coalescing-RC
+// modified buffer into g_rcSnap*, capturing (oldValue, newValue=*slot) while the
+// mutators are stopped so both reads are stable, then reset each buffer so
+// logging resumes into fresh space. This is the only part that costs pause time
+// (a bounded copy proportional to the epoch's mutations); the RC arithmetic and
+// the recursive free run off-pause in ProcessSnapshotDecrements. Must be called
+// under STW (the concurrent snapshot pause).
+void LXRCollector::SnapshotModifiedBuffers()
+{
+    EnterCriticalSection(&g_buffersLock);
+    for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
+    {
+        for (size_t i = 0; i < buf->Count; i++)
+        {
+            if (g_rcSnapCount == g_rcSnapCap)
+            {
+                size_t newCap = g_rcSnapCap ? g_rcSnapCap * 2 : 4096;
+                RCSnapshotEntry* grown = (RCSnapshotEntry*)realloc(
+                    g_rcSnapEntries, newCap * sizeof(RCSnapshotEntry));
+                if (grown == nullptr) { buf->Count = 0; continue; }
+                g_rcSnapEntries = grown;
+                g_rcSnapCap = newCap;
+            }
+            g_rcSnapEntries[g_rcSnapCount].OldValue = buf->Entries[i].OldValue;
+            g_rcSnapEntries[g_rcSnapCount].NewValue = *(buf->Entries[i].Slot);
+            g_rcSnapCount++;
+        }
+        buf->Count = 0; // epoch consumed (snapshotted)
+    }
+    LeaveCriticalSection(&g_buffersLock);
+    InterlockedExchange(&g_modifiedOverflow, 0);
+}
+
+// #1 concurrent/lazy decrements - off-pause half. Replay the snapshotted epoch
+// with strict coalescing-RC ordering (ALL increments before ANY decrement, so a
+// referent incremented by a later store is never transiently freed by an earlier
+// store's decrement), then run the recursive zero-count cascade. Runs while
+// mutators execute; sound because (a) only the collector ever mutates the RC
+// side table (the barrier merely logs), so no RC race with mutators, and (b)
+// reclamation stays gated on the mark-authoritative sweep, so a rare resurrection
+// racing a decrement cannot free a reachable object. Aligned pointer loads of a
+// possibly-resurrected dead object's fields are atomic on amd64 (no torn read).
+void LXRCollector::ProcessSnapshotDecrements()
+{
+    EnterCriticalSection(&m_collectLock);
+    for (size_t i = 0; i < g_rcSnapCount; i++)
+    {
+        Object* newValue = g_rcSnapEntries[i].NewValue;
+        if (newValue != nullptr)
+            RCIncrement(newValue);
+    }
+    for (size_t i = 0; i < g_rcSnapCount; i++)
+    {
+        Object* oldValue = g_rcSnapEntries[i].OldValue;
+        if (oldValue != nullptr && RCDecrement(oldValue))
+            EnqueueZeroCount(oldValue);
+    }
+    g_rcSnapCount = 0;
+    DrainZeroCountWorkList();
+    LeaveCriticalSection(&m_collectLock);
+}
+
 // into it; under a Yuasa/SATB *deletion* barrier the newly installed referent is
 // not otherwise greyed, so it can be transiently missed (empirically ~1 object
 // per cycle). Rather than reconcile with an O(live-heap) closure over every
@@ -3082,7 +3165,15 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         g_theGCToCLR->SuspendEE(SUSPEND_FOR_GC);
         LXRSetPhase("conc:snapshot-buffers");
         if (doBuffers)
-            g_lxrCollector.ProcessModifiedBuffers();
+        {
+            // #1: with concurrent decrements, only DETACH the modified buffers
+            // here (bounded pause); the RC replay + recursive free run off-pause
+            // in the drain window below. Otherwise process them STW as before.
+            if (g_concDecrements)
+                g_lxrCollector.SnapshotModifiedBuffers();
+            else
+                g_lxrCollector.ProcessModifiedBuffers();
+        }
         LXRSetPhase("conc:snapshot");
         g_lxrCollector.ConcurrentTraceSnapshot();
         LXRSetPhase("conc:restart-snapshot");
@@ -3101,6 +3192,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         static int s_noDrain = (getenv("LXR_CONC_NO_DRAIN") != nullptr) ? 1 : 0;
         if (!s_noDrain)
             g_lxrCollector.ConcurrentTraceDrain();
+        // #1: replay the coalescing-RC increments/decrements + recursive free of
+        // the buffers snapshotted at the pause, off-pause alongside the trace drain.
+        if (g_concDecrements && doBuffers)
+            g_lxrCollector.ProcessSnapshotDecrements();
         QueryPerformanceCounter(&a1);
         int64_t drainMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent drain done (%lldus off-pause)\n", (long long)drainMicros); fflush(stderr); }
