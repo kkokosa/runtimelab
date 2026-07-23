@@ -1903,26 +1903,42 @@ bool LXRCollector::ConservativelyKeepAliveInterior(uint8_t* interior)
 
 void LXRCollector::ProcessModifiedBuffers()
 {
-    // Coalescing reference counting (Levanoni-Petrank): for every logged
-    // (slot, oldValue), increment the NEW referent currently in the slot and
-    // decrement the OLD referent that was there when first logged. Objects
-    // whose count hits zero are queued for recursive freeing.
+    // Coalescing reference counting (Levanoni-Petrank, paper A/§3.2.1). For the
+    // period t_n -> t_{n+1} it is sufficient to apply, per MODIFIED FIELD, exactly
+    // ONE decrement of the referent at t_n (the FIRST logged old value) and ONE
+    // increment of the referent at t_{n+1} (the field's final value), ignoring all
+    // intermediate referents. Our field-logging barrier records every store (no
+    // per-field unlogged bit yet - see A(ii)), so a field written N times appears
+    // N times here; we coalesce at processing time into one (oldValue,*slot) pair
+    // per slot. Without this a repeatedly-written field over-increments its final
+    // referent and spuriously decrements transients, making RC imprecise. The map
+    // keeps the FIRST old value per slot (append order == store order within a
+    // thread), which is the t_n value; *slot (read under STW) is the t_{n+1} value.
     EnterCriticalSection(&m_collectLock);
     EnterCriticalSection(&g_buffersLock);
+    std::unordered_map<Object**, Object*> coalesced;
     for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
     {
         for (size_t i = 0; i < buf->Count; i++)
-        {
-            Object* newValue = *(buf->Entries[i].Slot);
-            Object* oldValue = buf->Entries[i].OldValue;
-            if (newValue != nullptr)
-                RCIncrement(newValue);
-            if (oldValue != nullptr && RCDecrement(oldValue))
-                EnqueueZeroCount(oldValue);
-        }
+            coalesced.emplace(buf->Entries[i].Slot, buf->Entries[i].OldValue);
         buf->Count = 0; // epoch consumed
     }
     LeaveCriticalSection(&g_buffersLock);
+    // Increments before decrements (paper B/§3.2.1): apply ALL increments of the
+    // final referents first, so an object that gains a new reference this epoch is
+    // never transiently driven to zero (and freed) by an earlier field's decrement.
+    for (const auto& kv : coalesced)
+    {
+        Object* newValue = *(kv.first);
+        if (newValue != nullptr)
+            RCIncrement(newValue);
+    }
+    for (const auto& kv : coalesced)
+    {
+        Object* oldValue = kv.second;
+        if (oldValue != nullptr && RCDecrement(oldValue))
+            EnqueueZeroCount(oldValue);
+    }
     DrainZeroCountWorkList();
     LeaveCriticalSection(&m_collectLock);
     InterlockedExchange(&g_modifiedOverflow, 0);
@@ -1938,24 +1954,32 @@ void LXRCollector::ProcessModifiedBuffers()
 void LXRCollector::SnapshotModifiedBuffers()
 {
     EnterCriticalSection(&g_buffersLock);
+    // Coalesce per field (paper A/§3.2.1) exactly as ProcessModifiedBuffers: keep
+    // the FIRST logged old value per slot (the t_n referent) and pair it with the
+    // final *slot (the t_{n+1} referent, read here under STW so it is stable), one
+    // (old,new) pair per modified field this epoch. ProcessSnapshotDecrements then
+    // replays these off-pause with all-increments-before-decrements ordering.
+    std::unordered_map<Object**, Object*> coalesced;
     for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
     {
         for (size_t i = 0; i < buf->Count; i++)
-        {
-            if (g_rcSnapCount == g_rcSnapCap)
-            {
-                size_t newCap = g_rcSnapCap ? g_rcSnapCap * 2 : 4096;
-                RCSnapshotEntry* grown = (RCSnapshotEntry*)realloc(
-                    g_rcSnapEntries, newCap * sizeof(RCSnapshotEntry));
-                if (grown == nullptr) { buf->Count = 0; continue; }
-                g_rcSnapEntries = grown;
-                g_rcSnapCap = newCap;
-            }
-            g_rcSnapEntries[g_rcSnapCount].OldValue = buf->Entries[i].OldValue;
-            g_rcSnapEntries[g_rcSnapCount].NewValue = *(buf->Entries[i].Slot);
-            g_rcSnapCount++;
-        }
+            coalesced.emplace(buf->Entries[i].Slot, buf->Entries[i].OldValue);
         buf->Count = 0; // epoch consumed (snapshotted)
+    }
+    for (const auto& kv : coalesced)
+    {
+        if (g_rcSnapCount == g_rcSnapCap)
+        {
+            size_t newCap = g_rcSnapCap ? g_rcSnapCap * 2 : 4096;
+            RCSnapshotEntry* grown = (RCSnapshotEntry*)realloc(
+                g_rcSnapEntries, newCap * sizeof(RCSnapshotEntry));
+            if (grown == nullptr) { break; }
+            g_rcSnapEntries = grown;
+            g_rcSnapCap = newCap;
+        }
+        g_rcSnapEntries[g_rcSnapCount].OldValue = kv.second;
+        g_rcSnapEntries[g_rcSnapCount].NewValue = *(kv.first);
+        g_rcSnapCount++;
     }
     LeaveCriticalSection(&g_buffersLock);
     InterlockedExchange(&g_modifiedOverflow, 0);
