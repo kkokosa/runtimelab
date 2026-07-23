@@ -160,6 +160,9 @@ struct LXRCounters
     volatile int64_t EvacBytesCopied;       // bytes relocated
     volatile int64_t EvacFieldsForwarded;   // heap references rewritten to moved targets
     volatile int64_t EvacPinnedSkipped;     // live objects left in place (root/handle-pinned)
+    volatile int64_t EvacTimeBudgetHits;    // evac passes cut short by the wall-clock budget
+    volatile int64_t EvacRemsetFixups;      // moved-object refs forwarded via the scoped remset
+    volatile int64_t EvacFullWalkFallbacks; // evac cycles that fell back to the O(heap) fixup walk
 
     // P4 concurrency: SATB backup trace whose transitive mark runs while the
     // mutators execute, bracketed by two brief stop-the-world pauses.

@@ -3117,13 +3117,15 @@ void LXRCollector::Evacuate()
     bool verbose = getenv("LXR_VERBOSE") != nullptr;
 
     // Policy knobs.
-    static int64_t s_fragPct = -1, s_budgetBytes = -1;
+    static int64_t s_fragPct = -1, s_budgetBytes = -1, s_budgetMs = -1;
     if (s_fragPct < 0)
     {
         const char* f = getenv("LXR_EVAC_FRAG_PCT");
         s_fragPct = f ? _atoi64(f) : 50;              // evacuate regions >= this % dead
         const char* b = getenv("LXR_EVAC_BUDGET_MB");
         s_budgetBytes = (b ? _atoi64(b) : 32) * (int64_t)1024 * 1024; // copy at most this per pause
+        const char* ms = getenv("LXR_EVAC_BUDGET_MS");
+        s_budgetMs = ms ? _atoi64(ms) : 20;           // and stop after this wall-clock ms
     }
 
     // 1. Pin all root/handle referents (interior roots resolve to their base).
@@ -3144,14 +3146,19 @@ void LXRCollector::Evacuate()
         return;
     }
 
-    // 2. Select fragmented regions within the copy budget. Snapshot first so
-    //    that registering destination chunks (which may realloc g_chunks) cannot
-    //    invalidate the source list. Indices stay valid across realloc.
+    // 2. Select fragmented regions. Paper §3.3.4: the evacuation set is the N
+    //    LOWEST-occupancy blocks (most fragmented first) up to the copy budget,
+    //    NOT simply the first regions over the threshold - evacuating the least-
+    //    occupied blocks first maximises compaction (freed blocks) per live byte
+    //    copied. Gather every region >= s_fragPct dead, sort by occupancy ratio
+    //    (live/total) ascending, then take under the byte budget. Snapshot first
+    //    so registering destination chunks (which may realloc g_chunks) cannot
+    //    invalidate the source list; indices stay valid across realloc.
     struct EvacRegion { size_t index; uint8_t* start; uint8_t* usedEnd; };
-    std::vector<EvacRegion> evac;
-    int64_t liveBudget = s_budgetBytes;
+    struct EvacCand { size_t index; uint8_t* start; uint8_t* usedEnd; int64_t live; int64_t total; };
+    std::vector<EvacCand> cands;
     EnterCriticalSection(&g_chunkLock);
-    for (size_t i = 0; i < g_chunkCount && liveBudget > 0; i++)
+    for (size_t i = 0; i < g_chunkCount; i++)
     {
         ChunkRegion& c = g_chunks[i];
         if (!c.Committed || c.Owner != nullptr || c.UsedEnd <= c.Start)
@@ -3173,10 +3180,25 @@ void LXRCollector::Evacuate()
         int64_t deadPct = (int64_t)((total - live) * 100 / total);
         if (deadPct < s_fragPct)
             continue;
-        evac.push_back({ i, c.Start, c.UsedEnd });
-        liveBudget -= (int64_t)live;
+        cands.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
     }
     LeaveCriticalSection(&g_chunkLock);
+
+    // Lowest occupancy (live/total) first: a.live/a.total < b.live/b.total, via
+    // cross-multiplication (all terms positive) to avoid floating point.
+    std::sort(cands.begin(), cands.end(), [](const EvacCand& a, const EvacCand& b) {
+        return a.live * b.total < b.live * a.total;
+    });
+
+    std::vector<EvacRegion> evac;
+    int64_t liveBudget = s_budgetBytes;
+    for (const EvacCand& c : cands)
+    {
+        if (liveBudget <= 0)
+            break;
+        evac.push_back({ c.index, c.start, c.usedEnd });
+        liveBudget -= c.live;
+    }
 
     if (evac.empty())
     {
@@ -3220,8 +3242,26 @@ void LXRCollector::Evacuate()
     };
 
     std::vector<size_t> freeableEvacIndices;
+    // Time-budgeted incremental copy (paper §3.3.4): bound the STW copy by wall
+    // clock, checked only at region BOUNDARIES so a region is never left half-
+    // moved (a partially-copied region would have live, un-forwarded objects yet
+    // could be freed -> dangling). Regions not reached this pass stay put and are
+    // re-selected next evac cycle. s_budgetMs<=0 disables the time cap.
+    LARGE_INTEGER evClkFreq, evClk0;
+    QueryPerformanceFrequency(&evClkFreq);
+    QueryPerformanceCounter(&evClk0);
+    int64_t evBudgetTicks = (s_budgetMs > 0) ? (s_budgetMs * evClkFreq.QuadPart / 1000) : 0;
     for (const EvacRegion& er : evac)
     {
+        if (evBudgetTicks > 0)
+        {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            if (now.QuadPart - evClk0.QuadPart >= evBudgetTicks)
+            {
+                InterlockedIncrement64(&g_lxrCounters.EvacTimeBudgetHits);
+                break; // out of time this pause; remaining regions wait for next evac
+            }
+        }
         size_t skipped = 0, moved = 0;
         uint8_t* p = er.start;
         while (p < er.usedEnd)
