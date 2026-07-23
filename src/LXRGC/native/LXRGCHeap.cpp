@@ -301,6 +301,64 @@ static void RegisterRemsetBuffer(RemsetBuffer* nb)
     }
 }
 
+// --- Item F (F3): trace-bootstrapped, evac-scoped reference fix-up ---------
+// The pre-F3 Evacuate() fixed up references to moved objects by walking the
+// ENTIRE live heap (parse every region, scan every marked object's fields) -- an
+// O(live-heap) STW pass. The paper instead scopes fix-up to a remembered set of
+// inter-block edges, bootstrapped by the trace. We reproduce that faithfully:
+// during an evac cycle's STW backup-trace mark (which already scans every live
+// object's fields exactly once), each mark lane logs the SLOTS holding an
+// INTER-block reference into its own thread-local vector (no locks: distinct
+// threads write distinct vectors; the shared registry is touched once per thread
+// at first use). The mark runs in the SAME pause immediately before Evacuate()
+// with no mutator in between, so the union of the lane logs is a COMPLETE
+// remembered set of every live inter-block edge at evac time. Intra-block edges
+// never need external fix-up (source and target share a region and co-move -- the
+// destination-copy scan handles them), so they are deliberately excluded.
+// Evacuate() then fixes up only (a) the moved objects' destination copies and
+// (b) these recorded slots -- eliminating the whole-heap walk. Recording is
+// active only on evac cycles (g_recordEvacEdges). Safety net: a lane hitting its
+// cap, or a conservative-keep-alive cycle (objects marked without a field scan),
+// sets fall-back conditions so Evacuate() reverts to the sound full-heap walk;
+// LXR_VERIFY_TRACE's [verify-evac] pass still asserts 0 unforwarded refs.
+static volatile LONG g_recordEvacEdges = 0;       // set only during an evac-cycle mark
+static volatile LONG g_evacEdgeOverflow = 0;      // a lane hit its cap -> full-walk fallback
+static thread_local std::vector<Object**>* t_evacEdgeLog = nullptr; // this lane's log
+static std::vector<std::vector<Object**>*> g_evacEdgeLogs;          // registry of all lane logs
+static CRITICAL_SECTION g_evacEdgeLock;           // guards the registry (not the hot append)
+static const size_t kEvacEdgeLaneCap = 16u * 1024u * 1024u; // 16M slots/lane (~128MB) -> overflow
+
+// Append an inter-block slot to this lane's log. Lazily allocates + registers the
+// lane's vector on first use. Lock-free on the hot path (each thread owns its
+// vector); the one-time registration is under g_evacEdgeLock.
+static inline void RecordEvacEdge(Object** slot)
+{
+    std::vector<Object**>* log = t_evacEdgeLog;
+    if (log == nullptr)
+    {
+        log = new (std::nothrow) std::vector<Object**>();
+        if (log == nullptr) { InterlockedExchange(&g_evacEdgeOverflow, 1); return; }
+        log->reserve(1u << 16);
+        EnterCriticalSection(&g_evacEdgeLock);
+        g_evacEdgeLogs.push_back(log);
+        LeaveCriticalSection(&g_evacEdgeLock);
+        t_evacEdgeLog = log;
+    }
+    if (log->size() >= kEvacEdgeLaneCap) { InterlockedExchange(&g_evacEdgeOverflow, 1); return; }
+    log->push_back(slot);
+}
+
+// Clear all lane logs (retain capacity) and the overflow flag. Called under STW
+// at the start of an evac-cycle mark so each cycle's remembered set is fresh.
+static void ResetEvacEdges()
+{
+    EnterCriticalSection(&g_evacEdgeLock);
+    for (std::vector<Object**>* log : g_evacEdgeLogs)
+        log->clear();
+    LeaveCriticalSection(&g_evacEdgeLock);
+    InterlockedExchange(&g_evacEdgeOverflow, 0);
+}
+
 // --- Concurrent SATB trace (P4) --------------------------------------------
 // While a concurrent trace window is open, block reuse is suppressed so region
 // indices/starts stay stable for the allocate-black snapshot, and any region
@@ -903,6 +961,7 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     InitializeCriticalSection(&g_buffersLock);
     InitializeCriticalSection(&g_satbLock);
     InitializeCriticalSection(&g_remsetLock);
+    InitializeCriticalSection(&g_evacEdgeLock);
     InitializeCriticalSection(&g_chunkLock);
 
     // P2 barrier-extension gates. Off by default (zero barrier overhead); SATB is
@@ -1989,6 +2048,16 @@ void LXRCollector::DrainMarkStack()
         GCScanObjectRefs(o, osz, [this, o, verify](Object** ref)
         {
             Object* child = *ref;
+            // Item F (F3): on an evac-cycle mark, log inter-block reference slots
+            // so Evacuate() can scope its fix-up to the remembered set instead of
+            // walking the whole heap. Records the SLOT; intra-block edges (source
+            // and target co-move) are excluded.
+            if (g_recordEvacEdges && child != nullptr && InHeap(child))
+            {
+                uintptr_t sblk = (uintptr_t)ref   & ~(lxr::kBlockSize - 1);
+                uintptr_t tblk = (uintptr_t)child & ~(lxr::kBlockSize - 1);
+                if (sblk != tblk) RecordEvacEdge(ref);
+            }
             if (g_nurseryGuard > 0 && child != nullptr && InFreedYoung((uint8_t*)child))
             {
                 MethodTable* pmt = *(MethodTable**)o;
@@ -2061,6 +2130,15 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
             Object* c = *ref;
             if (c == nullptr)
                 return;
+            // Item F (F3): log inter-block reference slots on an evac-cycle mark
+            // (see DrainMarkStack). Per-lane thread-local log -> no lock on the
+            // hot path; distinct workers write distinct logs.
+            if (g_recordEvacEdges && InHeap(c))
+            {
+                uintptr_t sblk = (uintptr_t)ref & ~(lxr::kBlockSize - 1);
+                uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
+                if (sblk != tblk) RecordEvacEdge(ref);
+            }
             if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
             {
                 MethodTable* pmt = *(MethodTable**)o;
@@ -3349,29 +3427,99 @@ void LXRCollector::Evacuate()
             InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
         }
     };
-    for (size_t i = 0; i < g_chunkCount; i++)
+    // 4c. Apply the fix-up. Prefer the trace-bootstrapped, evac-scoped path
+    //     (F3): fix up (a) the moved objects' destination copies (their outgoing
+    //     edges) and (b) the inter-block slots recorded during this cycle's mark
+    //     (incoming edges from non-moved referrers). This replaces the O(live-
+    //     heap) full walk. Fall back to the sound full walk when the remembered
+    //     set may be incomplete: an overflowed lane log, or a conservative-keep-
+    //     alive cycle (objects kept live by an interior probe are marked WITHOUT a
+    //     field scan, so their out-edges were never recorded).
+    static int s_scopedFixup = -1;
+    if (s_scopedFixup < 0)
+        s_scopedFixup = (getenv("LXR_EVAC_SCOPED_FIXUP") != nullptr && getenv("LXR_EVAC_SCOPED_FIXUP")[0] == '0') ? 0 : 1;
+    bool useScoped = s_scopedFixup && g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0;
+
+    if (useScoped)
     {
-        ChunkRegion& c = g_chunks[i];
-        if (!c.Committed)
-            continue;
-        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-        uint8_t* p = c.Start;
-        while (p < end)
+        InterlockedIncrement64(&g_lxrCounters.EvacRemsetFixups);
+        // (a) Outgoing edges of moved objects: scan each destination copy. Bounded
+        //     by the evacuated live bytes (small), not the whole heap.
+        for (const MovedRange& r : movedRanges)
+            GCScanObjectRefs((Object*)r.newStart, (size_t)(r.oldEnd - r.oldStart), rebaseField);
+        // (b) Incoming edges from non-moved referrers: replay the recorded inter-
+        //     block slots. Skip any slot that lies inside a moved source range --
+        //     that source is retired and its copy's fields were fixed up in (a);
+        //     reading the stale source would just waste work. Binary-search the
+        //     sorted movedRanges to classify each slot.
+        EnterCriticalSection(&g_evacEdgeLock);
+        for (std::vector<Object**>* log : g_evacEdgeLogs)
         {
-            Object* o = (Object*)p;
-            size_t sz = LXRObjectSize(o);
-            if (sz == 0)
-                break;
-            p += sz;
-            if (forwarding.find(o) != forwarding.end())
-                continue; // dead source
-            if (!IsMarked(o))
-                continue; // unreachable garbage: sweep will handle
-            GCScanObjectRefs(o, sz, rebaseField);
+            for (Object** slot : *log)
+            {
+                uint8_t* sa = (uint8_t*)slot;
+                size_t lo = 0, hi = movedRanges.size();
+                while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                if (lo != 0)
+                {
+                    const MovedRange& mr = movedRanges[lo - 1];
+                    if (sa >= mr.oldStart && sa < mr.oldEnd)
+                        continue; // slot inside a moved source: handled by (a)
+                }
+                rebaseField(slot);
+            }
+        }
+        LeaveCriticalSection(&g_evacEdgeLock);
+        // (c) In-place survivors of the evac regions (pinned objects, or objects
+        //     that could not be evac-allocated) may hold INTRA-region references
+        //     to objects that DID move -- evacuation is per-OBJECT, so a pinned
+        //     object stays put while its same-block neighbour moves, leaving an
+        //     intra-block edge that the (inter-block) remembered set deliberately
+        //     excludes. Scan the evac regions' surviving marked objects directly.
+        //     Bounded by the evac-set size (the copy budget), NOT the whole heap.
+        for (const EvacRegion& er : evac)
+        {
+            uint8_t* p = er.start;
+            while (p < er.usedEnd)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0)
+                    break;
+                p += sz;
+                if (forwarding.find(o) != forwarding.end())
+                    continue; // moved source (its copy is scanned in (a))
+                if (!IsMarked(o))
+                    continue; // dead: freed with the region
+                GCScanObjectRefs(o, sz, rebaseField);
+            }
         }
     }
-
-    // 4b. VERIFY (LXR_VERIFY_TRACE): before freeing any source region, confirm
+    else
+    {
+        InterlockedIncrement64(&g_lxrCounters.EvacFullWalkFallbacks);
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed)
+                continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            uint8_t* p = c.Start;
+            while (p < end)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0)
+                    break;
+                p += sz;
+                if (forwarding.find(o) != forwarding.end())
+                    continue; // dead source
+                if (!IsMarked(o))
+                    continue; // unreachable garbage: sweep will handle
+                GCScanObjectRefs(o, sz, rebaseField);
+            }
+        }
+    }
     //     step 4 forwarded EVERY heap reference to a moved object. Any marked,
     //     non-source object whose field still points at a forwarding source is a
     //     miss that would dangle once the source region is decommitted. Log the
@@ -3451,10 +3599,12 @@ void LXRCollector::Evacuate()
 
     if (verbose)
     {
-        fprintf(stderr, "LXRGC: [evac] regions=%zu moved=%lld bytes=%lld pinnedSkipped=%lld fieldsForwarded=%lld freed=%zu\n",
+        fprintf(stderr, "LXRGC: [evac] regions=%zu moved=%lld bytes=%lld pinnedSkipped=%lld fieldsForwarded=%lld freed=%zu fixup=%s(scoped=%lld fullwalk=%lld)\n",
                 evac.size(), (long long)g_lxrCounters.EvacObjects, (long long)g_lxrCounters.EvacBytesCopied,
                 (long long)g_lxrCounters.EvacPinnedSkipped, (long long)g_lxrCounters.EvacFieldsForwarded,
-                freeableEvacIndices.size());
+                freeableEvacIndices.size(),
+                useScoped ? "scoped" : "fullwalk",
+                (long long)g_lxrCounters.EvacRemsetFixups, (long long)g_lxrCounters.EvacFullWalkFallbacks);
         fflush(stderr);
     }
 }
@@ -4942,7 +5092,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             if (doTrace)
             {
                 LXRSetPhase("stw:backuptrace");
+                // Item F (F3): on an evac cycle, bootstrap the evac remembered set
+                // from this mark. Reset the lane logs first (fresh set per cycle),
+                // record inter-block edges during the closure, then stop recording.
+                if (evacCycle) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
                 g_lxrCollector.BackupTrace();
+                if (evacCycle) InterlockedExchange(&g_recordEvacEdges, 0);
                 if (verbose) { fprintf(stderr, "LXRGC: [stage] BackupTrace done\n"); fflush(stderr); }
             }
             if (evacCycle)
