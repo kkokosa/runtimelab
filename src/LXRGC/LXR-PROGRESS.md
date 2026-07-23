@@ -76,8 +76,8 @@ LXR-vs-Server/Workstation comparison.
 ## Full-LXR benchmark config (once parity reached)
 
 `LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_LINE_REUSE=1 LXR_CONC_DECREMENTS=1`
-`LXR_YOUNG_RC=1 LXR_GC_THREADS=<#cores>` + `DOTNET_ReadyToRun=0`. vs Server GC and
-Workstation GC. Regenerate `results/report.html`.
+`LXR_YOUNG_RC=1 LXR_NURSERY=1 LXR_GC_THREADS=<#cores>` + `DOTNET_ReadyToRun=0`. vs Server GC
+and Workstation GC. Regenerate `results/report.html`.
 
 ---
 
