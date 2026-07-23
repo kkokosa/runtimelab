@@ -3173,6 +3173,197 @@ static void LXRNurseryRemsetSlot(Object** slot, void* /*ctx*/)
     LXRNurserySeed((uint8_t*)*slot);
 }
 
+// Diagnostic (LXR_NURSERY_DIAG): definitively classify any young liveness the
+// remembered-set closure misses versus a full-heap closure. CRASH-SAFE: it only
+// computes both closures and reports; it never decommits. For every young object
+// the full scan keeps but the remset closure misses, it locates a referrer and
+// reports whether that referrer is MATURE (=> a genuine mature->young remembered-
+// set / write-barrier gap) or YOUNG (=> a broken young->young chain), plus the
+// referrer's MethodTable and whether the edge is inter-block (barrier-visible).
+// From-roots full (any-path) reachability probe: seeds roots + handles and
+// follows ALL references (mature and young). Used by the nursery diagnostic to
+// decide whether a "missed" young object is genuinely LIVE (reachable from a
+// root => a real remembered-set/closure bug) or DEAD (only reachable from dead
+// unswept objects that the full-heap field scan conservatively retained).
+static std::unordered_set<Object*>* g_diagRootReach = nullptr;
+static std::vector<Object*>*        g_diagRootWork  = nullptr;
+static void DiagRootSeed(uint8_t* v)
+{
+    if (v == nullptr || g_diagRootReach == nullptr)
+        return;
+    Object* base = g_lxrCollector.ResolveInterior(v);
+    if (base != nullptr && g_diagRootReach->insert(base).second)
+        g_diagRootWork->push_back(base);
+}
+static void DiagRootRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t /*flags*/)
+{
+    if (*ppObj != nullptr) DiagRootSeed((uint8_t*)*ppObj);
+}
+static void DiagRootHandle(Object** ref, void* /*ctx*/) { DiagRootSeed((uint8_t*)*ref); }
+
+static void RunNurseryDiag()
+{
+    // (1) Remembered-set closure: roots + handles + remset + young->young.
+    NurseryClosure remsetClo;
+    g_nurseryClosure = &remsetClo;
+    ScanContext sc; sc.promotion = true;
+    g_theGCToCLR->GcScanRoots(&LXRNurseryRoot, 2, 2, &sc);
+    LXRGCHandleStore::ForEachLiveHandle(&LXRNurseryHandle, nullptr);
+    g_lxrCollector.EnumerateRemsetSlots(&LXRNurseryRemsetSlot, nullptr);
+    while (!remsetClo.work.empty())
+    {
+        Object* o = remsetClo.work.back(); remsetClo.work.pop_back();
+        size_t sz = LXRObjectSize(o); if (sz == 0) continue;
+        GCScanObjectRefs(o, sz, [](Object** ref) { LXRNurserySeed((uint8_t*)*ref); });
+    }
+
+    // (2) Full-heap closure: seed from every object's fields + young->young.
+    NurseryClosure fullClo;
+    g_nurseryClosure = &fullClo;
+    EnterCriticalSection(&g_chunkLock);
+    size_t n = g_chunkCount;
+    for (size_t i = 0; i < n; i++)
+    {
+        ChunkRegion c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < end)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            p += sz;
+            GCScanObjectRefs(o, sz, [](Object** ref) { LXRNurserySeed((uint8_t*)*ref); });
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    while (!fullClo.work.empty())
+    {
+        Object* o = fullClo.work.back(); fullClo.work.pop_back();
+        size_t sz = LXRObjectSize(o); if (sz == 0) continue;
+        GCScanObjectRefs(o, sz, [](Object** ref) { LXRNurserySeed((uint8_t*)*ref); });
+    }
+    g_nurseryClosure = nullptr;
+
+    // (3) Diff: young objects the full closure keeps but the remset closure misses.
+    std::unordered_set<Object*> missed;
+    for (Object* y : fullClo.live)
+        if (remsetClo.live.count(y) == 0)
+            missed.insert(y);
+    fprintf(stderr, "LXRGC: [nursery-diag] remsetLive=%zu fullLive=%zu missed=%zu\n",
+            remsetClo.live.size(), fullClo.live.size(), missed.size());
+    if (missed.empty()) { fflush(stderr); return; }
+
+    // (3b) From-roots full (any-path) reachability: the authoritative live test.
+    //      If missed young objects are reachable from a root, the remset closure
+    //      has a real gap (=> unsafe to reclaim). If NONE are, they are dead and
+    //      the remset closure is correct (the AV lies elsewhere).
+    std::unordered_set<Object*> rootReach;
+    std::vector<Object*> rootWork;
+    g_diagRootReach = &rootReach; g_diagRootWork = &rootWork;
+    ScanContext sc2; sc2.promotion = true;
+    g_theGCToCLR->GcScanRoots(&DiagRootRoot, 2, 2, &sc2);
+    LXRGCHandleStore::ForEachLiveHandle(&DiagRootHandle, nullptr);
+    while (!rootWork.empty())
+    {
+        Object* o = rootWork.back(); rootWork.pop_back();
+        size_t sz = LXRObjectSize(o); if (sz == 0) continue;
+        GCScanObjectRefs(o, sz, [](Object** ref) { DiagRootSeed((uint8_t*)*ref); });
+    }
+    g_diagRootReach = nullptr; g_diagRootWork = nullptr;
+    size_t missedLive = 0;
+    for (Object* y : missed)
+        if (rootReach.count(y) != 0)
+            missedLive++;
+    fprintf(stderr, "LXRGC: [nursery-diag] rootReach=%zu  missedReachableFromRoots=%zu / %zu  => %s\n",
+            rootReach.size(), missedLive, missed.size(),
+            missedLive == 0 ? "ALL-MISSED-ARE-DEAD (remset closure correct)"
+                            : "SOME-MISSED-ARE-LIVE (remset closure gap!)");
+
+    // (3c) Smoking-gun for the nursery AV: young objects the remset closure deems
+    //      DEAD (not live => reclaimable) but that a trace has MARKED. Freeing a
+    //      marked object makes a subsequent trace drain / sweep walk a decommitted
+    //      page. If this is > 0, the AV is a nursery-vs-trace (SATB) coordination
+    //      gap, NOT a remembered-set/barrier gap.
+    size_t youngTotal = 0, youngMarked = 0, youngDeadMarked = 0;
+    EnterCriticalSection(&g_chunkLock);
+    size_t n3 = g_chunkCount;
+    for (size_t i = 0; i < n3; i++)
+    {
+        ChunkRegion c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < end)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            p += sz;
+            if (!g_lxrCollector.IsYoung(o)) continue;
+            youngTotal++;
+            bool marked = g_lxrCollector.IsMarked(o);
+            if (marked) youngMarked++;
+            if (marked && remsetClo.live.count(o) == 0) youngDeadMarked++;
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    fprintf(stderr, "LXRGC: [nursery-diag] youngTotal=%zu youngMarked=%zu youngDeadMarked=%zu  => %s\n",
+            youngTotal, youngMarked, youngDeadMarked,
+            youngDeadMarked == 0 ? "no dead-but-marked young"
+                                 : "DEAD-BUT-MARKED YOUNG (nursery-vs-trace SATB gap => AV source)");
+
+    // (4) Locate + classify EXTERNAL referrers of the missed young objects
+    //     (referrers not themselves in the missed set) — the true entry points.
+    int64_t matureRef = 0, youngInRemset = 0, youngNotRemset = 0;
+    int matched = 0;
+    EnterCriticalSection(&g_chunkLock);
+    size_t n2 = g_chunkCount;
+    for (size_t i = 0; i < n2 && matched < 64; i++)
+    {
+        ChunkRegion c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < end && matched < 64)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            p += sz;
+            if (missed.count(o) != 0) continue; // internal edge: not an entry point
+            GCScanObjectRefs(o, sz, [&](Object** ref) {
+                if (matched >= 64) return;
+                uint8_t* v = (uint8_t*)*ref;
+                if (v == nullptr) return;
+                Object* base = (missed.count((Object*)v) != 0) ? (Object*)v : nullptr;
+                if (base == nullptr)
+                {
+                    if (!g_lxrCollector.IsYoung((Object*)v)) return; // O(1) reject
+                    base = g_lxrCollector.ResolveInterior(v);
+                    if (base == nullptr || missed.count(base) == 0) return;
+                }
+                bool oYoung = g_lxrCollector.IsYoung(o);
+                bool oInRemset = (remsetClo.live.count(o) != 0);
+                if (!oYoung) matureRef++;
+                else if (oInRemset) youngInRemset++;
+                else youngNotRemset++;
+                uintptr_t sblk = (uintptr_t)ref  & ~(lxr::kBlockSize - 1);
+                uintptr_t tblk = (uintptr_t)base  & ~(lxr::kBlockSize - 1);
+                fprintf(stderr, "LXRGC: [nursery-diag]  ENTRY O=%p MT=%p young=%d inRemsetClo=%d interBlock=%d slot=%p -> Y=%p\n",
+                        (void*)o, (void*)o->GetGCSafeMethodTable(), (int)oYoung, (int)oInRemset,
+                        (int)(sblk != tblk), (void*)ref, (void*)base);
+                matched++;
+            });
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    fprintf(stderr, "LXRGC: [nursery-diag] EXTERNAL entries: mature=%lld youngInRemsetClo=%lld youngNotInRemsetClo=%lld (matched<=64)\n",
+            (long long)matureRef, (long long)youngInRemset, (long long)youngNotRemset);
+    fflush(stderr);
+}
+
 // Young/nursery collection, run under the RC-pause STW. Reclaims young regions
 // that hold no reachable young object. Reclaim-only (no copying): survivors stay
 // young and are compacted/promoted by the trace-cycle Evacuate. Sound because the
@@ -3188,6 +3379,17 @@ void LXRCollector::CollectNursery()
     // in-flight concurrent trace (whose marks/allocate-black also keep young
     // alive) would make freeing young unsafe -> fall back to the authoritative
     // trace, which reclaims young at the next trace cycle as today.
+    // Crash-safe classification diagnostic: report exactly what the remembered-set
+    // closure misses vs a full-heap closure (and whether misses are live/dead and
+    // dead-but-marked), then return WITHOUT reclaiming. Runs before the trace
+    // guards so it can observe in-flight trace marks. Zero AV risk.
+    static int s_diag = (getenv("LXR_NURSERY_DIAG") != nullptr) ? 1 : 0;
+    if (s_diag)
+    {
+        RunNurseryDiag();
+        return;
+    }
+
     if (g_remsetOverflow || g_traceWindowOpen)
     {
         InterlockedIncrement64(&g_lxrCounters.NurserySkipped);
