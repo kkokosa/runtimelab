@@ -224,6 +224,7 @@ public:
     // wholesale-clears the committed prefix on a buffer-overflow epoch.
     bool TryFirstLogField(Object** slot);
     void ClearLoggedBit(Object** slot);
+    void ClearLoggedRange(uint8_t* start, uint8_t* end);
     void ResetLoggedTable();
 
     // Extend the committed logged-table (unlogged-bit) prefix to cover
