@@ -342,10 +342,13 @@ static volatile LONG g_concDecrements = 0;  // env LXR_CONC_DECREMENTS (declared
 static volatile LONG g_multiEpoch      = 0;  // env LXR_MULTIEPOCH: span trace over RC epochs
 static volatile LONG g_traceState      = TRACE_IDLE;
 static volatile LONG g_markerQuiescent = 0;  // marker finished its drain-to-quiescence
+static volatile LONG g_snapshotConsumed = 0; // marker has replayed the meStart snapshot decrements (safe for spanned epochs to drain)
 static volatile LONG g_markerStop      = 0;  // shutdown request for the marker thread
 static HANDLE  g_markerThread    = nullptr;
 static HANDLE  g_markerStartEvent = nullptr; // auto-reset: wakes the marker to drain
 static volatile LONG64 g_multiEpochSpans = 0; // diagnostic: RC epochs spanned across traces
+
+static void RequestLXRCollection(bool wait, bool forceTrace); // fwd (defined below)
 
 // Persistent background marker: waits for a snapshot to open a trace, marks the
 // transitive closure to quiescence (ConcurrentTraceDrain, which itself yields so
@@ -360,17 +363,26 @@ static DWORD WINAPI LXRMarkerThreadProc(void*)
         WaitForSingleObject(g_markerStartEvent, INFINITE);
         if (g_markerStop)
             break;
-        g_lxrCollector.ConcurrentTraceDrain();
-        // #1 off-pause decrement replay (mirrors the legacy concurrent branch):
+        // #1 off-pause decrement replay FIRST (before the long closure drain):
         // consume the buffers detached at the meStart snapshot (SnapshotModified-
-        // Buffers) - RC arithmetic + recursive free - here, off the pause. Must
-        // run before the next epoch's ProcessModifiedBuffers so g_rcSnap and the
-        // root-deferral rotation are consumed exactly once. Spanned RC epochs skip
-        // ProcessModifiedBuffers while MARKING, so this is the sole snapshot
-        // consumer until the finish pause.
+        // Buffers) so the coalescing-RC root-deferral rotation (m_rootDeferredPrev)
+        // returns to a clean state. Publishing g_snapshotConsumed then lets spanned
+        // RC epochs safely run a full ProcessModifiedBuffers to DRAIN the mutation
+        // accumulating during this (possibly long) marking window - bounding the
+        // finish pause instead of batching the whole window's RC work + free
+        // cascade into one giant STW ProcessModifiedBuffers at the finish.
         if (g_concDecrements)
             g_lxrCollector.ProcessSnapshotDecrements();
+        InterlockedExchange(&g_snapshotConsumed, 1);
+        g_lxrCollector.ConcurrentTraceDrain();
         InterlockedExchange(&g_markerQuiescent, 1);
+        // Finalize PROMPTLY: request an RC pause now so meFinish runs right after
+        // the drain instead of waiting for the next allocation trigger. Without
+        // this the meStart->meFinish window stretches to the next growth/increment
+        // trigger, letting the marking window's modified buffers (hence the finish
+        // detach + the off-pause RC replay) grow unbounded. A prompt finalize
+        // bounds the finish epoch to the drain window's mutations.
+        RequestLXRCollection(/*wait*/ false, /*forceTrace*/ false);
     }
     return 0;
 }
@@ -430,7 +442,7 @@ static size_t g_zeroCountCap = 0;
 // the sweep frees by mark, not by RC, that cycle. Gated by LXR_CONC_DECREMENTS
 // and only ever taken on the concurrent path. (Declared above near the trace
 // state so the multi-epoch marker thread can gate its off-pause decrement replay.)
-struct RCSnapshotEntry { Object* OldValue; Object* NewValue; };
+struct RCSnapshotEntry { Object** Slot; Object* OldValue; Object* NewValue; };
 static RCSnapshotEntry* g_rcSnapEntries = nullptr;
 static size_t g_rcSnapCount = 0;
 static size_t g_rcSnapCap = 0;
@@ -490,6 +502,19 @@ static volatile int64_t g_epochsSinceTrace = 0;   // RC epochs since the last fu
 static volatile int64_t g_lastTraceCommitted = 0; // committed-in-use right after the last trace
 static volatile int64_t g_traceBudgetBytes = -1;  // -1 = uninitialized; growth before forcing a trace
 static volatile int64_t g_traceEveryEpochs = -1;  // force a trace at least every N epochs (0 = off)
+
+// Item E — LXR collection-trigger predictors (paper §3.2.2/§3.2.5).
+// (a) increment-count RC trigger: fire an RC pause once N reference-count
+//     increments have been logged since the last pause (reuses the existing
+//     ModifiedBufferEntries counter, so no new hot-path cost). (b) wastage-based
+//     trace trigger: escalate to a trace once the PROJECTED floating garbage
+//     (WastagePctEwma applied to allocation since the last trace) reaches a % of
+//     the heap. Both predictors use the paper's asymmetric ("biased") exponential
+//     decay: react fast to a rising signal (¾ new), decay slowly on a falling one
+//     (¼ new), which is conservative (never under-provisions the collector).
+static volatile int64_t g_incrementBaseline = 0;  // ModifiedBufferEntries snapshot at last RC pause
+static volatile int64_t g_incrementTrigger  = -1; // env LXR_INCREMENT_TRIGGER: RC pause after N increments (0=off)
+static volatile int64_t g_wastageTriggerPct = -1; // env LXR_WASTAGE_PCT: trace when projected floating garbage >= % of heap (0=off)
 
 // Young-object nursery (LXR difference #6). g_traceEpoch is a monotonic counter
 // bumped once per completed trace cycle; every allocation region is stamped with
@@ -2373,48 +2398,52 @@ void LXRCollector::ProcessModifiedBuffers()
 void LXRCollector::SnapshotModifiedBuffers()
 {
     EnterCriticalSection(&g_buffersLock);
-    // Coalesce per field (paper A/§3.2.1) exactly as ProcessModifiedBuffers: keep
-    // the FIRST logged old value per slot (the t_n referent) and pair it with the
-    // final *slot (the t_{n+1} referent, read here under STW so it is stable), one
-    // (old,new) pair per modified field this epoch. ProcessSnapshotDecrements then
-    // replays these off-pause with all-increments-before-decrements ordering.
-    std::unordered_map<Object**, Object*> coalesced;
+    // FLAT detach (paper §3.2.5 SSB swap): copy the raw (slot, oldValue, *slot)
+    // triples out of every mutator buffer WITHOUT coalescing. The final referent
+    // (*slot, the t_{n+1} value) MUST be read here under STW so it is stable, but
+    // the O(#modified fields) hash-map coalescing is deferred to the off-pause
+    // ProcessSnapshotDecrements. This keeps the snapshot/finish PAUSE proportional
+    // to a flat array copy (no per-field node allocation), so a large epoch -
+    // e.g. a survival-paced multi-epoch trace window that accumulated millions of
+    // mutations - no longer produces a multi-second STW coalescing cliff. Repeated
+    // writes to one slot appear as multiple triples all carrying the SAME *slot
+    // (read once here), so off-pause coalescing (first old + this new) is exact.
     for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
     {
         bool hadData = buf->Count > 0;
         for (size_t i = 0; i < buf->Count; i++)
-            coalesced.emplace(buf->Entries[i].Slot, buf->Entries[i].OldValue);
+        {
+            Object** slot = buf->Entries[i].Slot;
+            if (g_rcSnapCount == g_rcSnapCap)
+            {
+                size_t newCap = g_rcSnapCap ? g_rcSnapCap * 2 : 4096;
+                RCSnapshotEntry* grown = (RCSnapshotEntry*)realloc(
+                    g_rcSnapEntries, newCap * sizeof(RCSnapshotEntry));
+                if (grown == nullptr) { break; }
+                g_rcSnapEntries = grown;
+                g_rcSnapCap = newCap;
+            }
+            g_rcSnapEntries[g_rcSnapCount].Slot = slot;
+            g_rcSnapEntries[g_rcSnapCount].OldValue = buf->Entries[i].OldValue;
+            g_rcSnapEntries[g_rcSnapCount].NewValue = *slot; // t_{n+1}, stable under STW
+            g_rcSnapCount++;
+            // Restore the unlogged-bit invariant before mutators resume logging
+            // into the fresh epoch (redundant per-slot clears are harmless).
+            if (!g_modifiedOverflow)
+                ClearLoggedBit(slot);
+        }
         buf->Count = 0; // epoch consumed (snapshotted)
         if (hadData && buf->InUse == 0)
             PushFreeModifiedBuffer(buf);
-    }
-    for (const auto& kv : coalesced)
-    {
-        if (g_rcSnapCount == g_rcSnapCap)
-        {
-            size_t newCap = g_rcSnapCap ? g_rcSnapCap * 2 : 4096;
-            RCSnapshotEntry* grown = (RCSnapshotEntry*)realloc(
-                g_rcSnapEntries, newCap * sizeof(RCSnapshotEntry));
-            if (grown == nullptr) { break; }
-            g_rcSnapEntries = grown;
-            g_rcSnapCap = newCap;
-        }
-        g_rcSnapEntries[g_rcSnapCount].OldValue = kv.second;
-        g_rcSnapEntries[g_rcSnapCount].NewValue = *(kv.first);
-        g_rcSnapCount++;
     }
     // Deferred-RC root capture at this STW snapshot pause (paper §3.2.1): stash the
     // current root set for the off-pause replay in ProcessSnapshotDecrements, which
     // increments it and rotates the deferred-decrement chain.
     CaptureRoots(m_rootDeferredSnap);
-    // Restore the unlogged-bit invariant (see ProcessModifiedBuffers): STW here
-    // (the snapshot pause), so clear the consumed fields' bits (or wholesale on a
-    // buffer overflow) before mutators resume logging into the fresh epoch.
+    // On a buffer overflow some first-logs set a bit without leaving an entry, so
+    // wholesale-clear rather than per-slot (see ProcessModifiedBuffers).
     if (g_modifiedOverflow)
         ResetLoggedTable();
-    else
-        for (const auto& kv : coalesced)
-            ClearLoggedBit(kv.first);
     LeaveCriticalSection(&g_buffersLock);
     InterlockedExchange(&g_modifiedOverflow, 0);
 }
@@ -2431,17 +2460,32 @@ void LXRCollector::SnapshotModifiedBuffers()
 void LXRCollector::ProcessSnapshotDecrements()
 {
     EnterCriticalSection(&m_collectLock);
+    // Off-pause coalescing (moved here from the STW pause): keep the FIRST logged
+    // old value per slot (t_n) paired with the *slot read at the pause (t_{n+1}).
+    // emplace keeps the first insertion per key, and the flat snapshot preserves
+    // per-buffer store order, so this reproduces the paper's per-field coalescing
+    // exactly - but the hash-map cost is now borne while mutators run, not at the
+    // pause. All triples for one slot carry the same NewValue (read once under
+    // STW), so any is correct.
+    std::unordered_map<Object**, std::pair<Object*, Object*>> coalesced;
+    coalesced.reserve(g_rcSnapCount);
     for (size_t i = 0; i < g_rcSnapCount; i++)
+        coalesced.emplace(g_rcSnapEntries[i].Slot,
+                          std::make_pair(g_rcSnapEntries[i].OldValue, g_rcSnapEntries[i].NewValue));
+    // Increments before decrements: apply ALL final-referent increments first so
+    // an object that gained a reference this epoch is never transiently freed by
+    // an earlier field's decrement.
+    for (const auto& kv : coalesced)
     {
-        Object* newValue = g_rcSnapEntries[i].NewValue;
+        Object* newValue = kv.second.second;
         if (newValue != nullptr)
             RCIncrement(newValue);
     }
     for (Object* r : m_rootDeferredSnap)  // root increments captured at the pause
         RCIncrement(r);
-    for (size_t i = 0; i < g_rcSnapCount; i++)
+    for (const auto& kv : coalesced)
     {
-        Object* oldValue = g_rcSnapEntries[i].OldValue;
+        Object* oldValue = kv.second.first;
         if (oldValue != nullptr && RCDecrement(oldValue))
             EnqueueZeroCount(oldValue);
     }
@@ -4221,7 +4265,15 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
         int64_t adaptive = (live * g_gcGrowthPct) / 100;
         if (adaptive > budget) budget = adaptive;
         int64_t grown = g_committedInUse - live;
-        if (grown >= budget)
+        // Item E increment-count RC trigger (paper §3.2.2): also fire a pause once
+        // enough reference-count increments have been logged since the last pause,
+        // so a mutation-heavy but allocation-light phase (which would grow the
+        // heap slowly, delaying the growth trigger) still gets its RC processed and
+        // its dead young reclaimed promptly. Reuses the existing ModifiedBuffer-
+        // Entries counter (delta since g_incrementBaseline) - no new barrier cost.
+        bool incTrigger = g_incrementTrigger > 0 &&
+            (g_lxrCounters.ModifiedBufferEntries - g_incrementBaseline) >= g_incrementTrigger;
+        if (grown >= budget || incTrigger)
             RequestLXRCollection(/*wait*/ false, /*forceTrace*/ false);
     }
 
@@ -4440,6 +4492,23 @@ static void EnsureTracePolicy()
         const char* e = getenv("LXR_TRACE_EVERY_EPOCHS");
         g_traceEveryEpochs = e ? _atoi64(e) : 8;
     }
+    if (g_incrementTrigger < 0)
+    {
+        // Item E increment-count RC trigger. Default ON: an RC pause is forced
+        // once this many reference-count increments have been logged since the
+        // last pause, bounding per-pause RC work on mutation-heavy/alloc-light
+        // phases where the allocation-growth trigger alone would fire too rarely.
+        const char* e = getenv("LXR_INCREMENT_TRIGGER");
+        g_incrementTrigger = e ? _atoi64(e) : 2000000; // ~2M increments (0 disables)
+    }
+    if (g_wastageTriggerPct < 0)
+    {
+        // Item E wastage-based trace trigger (paper default 5%). A trace is
+        // escalated once the projected floating garbage reaches this % of the
+        // committed heap. 0 disables (pace traces purely by epoch cap + growth).
+        const char* e = getenv("LXR_WASTAGE_PCT");
+        g_wastageTriggerPct = e ? _atoi64(e) : 5;
+    }
 }
 
 // Decide whether this epoch is a light RC pause or a full backup-trace pause.
@@ -4468,6 +4537,21 @@ static LXRPhase DecidePhase(bool forceTrace)
     int64_t growth = g_committedInUse - g_lastTraceCommitted;
     if (g_traceBudgetBytes > 0 && growth >= g_traceBudgetBytes)
         return LXRPhase::TracePause;
+
+    // Item E wastage predictor (paper §3.2.5): escalate to a trace once the
+    // PROJECTED floating garbage since the last trace reaches g_wastageTriggerPct
+    // of the committed heap. Floating garbage is the dead memory RC cannot reclaim
+    // (cycles + stuck counts); we estimate its accrual rate as WastagePctEwma (the
+    // biased-decay average of the fraction each past trace actually recovered) and
+    // apply it to the memory allocated since the last trace. This fires a trace
+    // exactly when RC-uncollectable garbage is predicted to have grown "too large"
+    // - the paper's wastage-driven trigger - rather than on a fixed schedule.
+    if (g_wastageTriggerPct > 0 && g_lxrCounters.WastagePctEwma > 0 && g_committedInUse > 0)
+    {
+        int64_t projectedWaste = (growth * g_lxrCounters.WastagePctEwma) / 100;
+        if (projectedWaste * 100 >= g_committedInUse * g_wastageTriggerPct)
+            return LXRPhase::TracePause;
+    }
 
     return LXRPhase::RCPause;
 }
@@ -4609,6 +4693,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXREnsureMarkerThread();
         InterlockedExchange(&g_traceCompleteThisCycle, 0);
         InterlockedExchange(&g_markerQuiescent, 0);
+        InterlockedExchange(&g_snapshotConsumed, 0);
         InterlockedExchange(&g_traceState, TRACE_MARKING);
         SetEvent(g_markerStartEvent);
         LXRSetPhase("me:restart-snapshot");
@@ -4629,24 +4714,54 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("me:suspend-finish");
         LXRSuspendEE();
         LXRSetPhase("me:finish");
+        LARGE_INTEGER tf0, tf1, tf2, tf3;
+        QueryPerformanceCounter(&tf0);
         g_lxrCollector.ConcurrentTraceFinish();
+        QueryPerformanceCounter(&tf1);
+        // Lazy decrements (paper §3.2.5): do NOT replay the marking-window RC +
+        // recursive free cascade synchronously at the pause - that made the finish
+        // pause O(window mutations) and produced multi-second STW cliffs when E's
+        // aggressive cadence enlarged the window. Instead detach the buffers CHEAPLY
+        // here under STW (SnapshotModifiedBuffers, a bounded copy) and replay the RC
+        // arithmetic + free cascade OFF-PAUSE after RestartEE (ProcessSnapshot-
+        // Decrements below). ConcurrentTraceFinish already consumed the buffers'
+        // NEW values for SATB reconciliation (MarkModifiedNewValues, read-only),
+        // so detaching them now is safe. This is the same lazy-decrement machinery
+        // the concurrent snapshot path uses, applied to the finish pause.
         LXRSetPhase("me:finish-buffers");
         if (doBuffers)
-            g_lxrCollector.ProcessModifiedBuffers();
+            g_lxrCollector.SnapshotModifiedBuffers();
+        QueryPerformanceCounter(&tf2);
         LXRSetPhase("me:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
+        QueryPerformanceCounter(&tf3);
+        if (verbose) { fprintf(stderr, "LXRGC: [stage]   finish breakdown: finish=%lldus bufs=%lldus sweep=%lldus\n", (long long)((tf1.QuadPart-tf0.QuadPart)*1000000/freq.QuadPart), (long long)((tf2.QuadPart-tf1.QuadPart)*1000000/freq.QuadPart), (long long)((tf3.QuadPart-tf2.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
         if (g_remsetActive)
             g_lxrCollector.ResetRemsets();
         InterlockedExchange(&g_traceState, TRACE_IDLE);
         LXRSetPhase("me:restart-finish");
         LXRRestartEE();
-        LXRSetPhase("idle");
-        QueryPerformanceCounter(&t1);
+        QueryPerformanceCounter(&t1);   // TRUE pause end: mutators run from here
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+        // Off-pause: replay the detached marking-window RC increments/decrements +
+        // recursive zero-count free cascade while mutators run. Sound even though
+        // the sweep above may have decommitted reclaimed chunks: reclaimed regions
+        // have RC cleared to 0 (ClearRCRange at every decommit site) and Drain-
+        // ZeroCountWorkList guards every deref with a committed-VirtualQuery check
+        // (commit 80b6ffb), so a deferred decrement into a swept chunk neither
+        // underflows nor faults. Single-driver serialization keeps the next
+        // collection from starting until this replay completes.
+        LXRSetPhase("me:finish-decrements");
+        LARGE_INTEGER td0, td1;
+        QueryPerformanceCounter(&td0);
+        if (doBuffers)
+            g_lxrCollector.ProcessSnapshotDecrements();
+        QueryPerformanceCounter(&td1);
+        LXRSetPhase("idle");
         phase = LXRPhase::TracePause; // account the finish epoch as a trace pause
-        if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace finish (pause=%lldus spans=%lld)\n",
-                               (long long)pauseMicros, (long long)g_multiEpochSpans); fflush(stderr); }
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace finish (pause=%lldus offpauseDec=%lldus spans=%lld)\n",
+                               (long long)pauseMicros, (long long)((td1.QuadPart-td0.QuadPart)*1000000/freq.QuadPart), (long long)g_multiEpochSpans); fflush(stderr); }
     }
     else if (useConcurrent)
     {
@@ -4761,16 +4876,17 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                                phase == LXRPhase::TracePause ? "trace" : "rc", (int)suspended); fflush(stderr); }
 
         LXRSetPhase("stw:buffers");
-        // While a multi-epoch trace is MARKING, an outstanding meStart snapshot
-        // (g_rcSnap + root-deferral rotation) has not yet been consumed by the
-        // marker's ProcessSnapshotDecrements. Running ProcessModifiedBuffers here
-        // would rotate m_rootDeferredPrev out of turn and corrupt/drop that
-        // snapshot's deferred decrements. Skip it: the buffers accumulate (bounded
-        // by the shared-queue spares) and are drained at the finish pause. This
-        // keeps the spanned RC epoch a pure "is the marker done yet" poll, and
-        // defers this epoch's RC lazily - sound (reclamation stays gated on the
-        // mark-authoritative sweep at finish).
-        bool skipBuffersForSpan = g_multiEpoch && g_traceState == TRACE_MARKING;
+        // Multi-epoch spanned RC epoch: DRAIN the modified buffers accumulated so
+        // far in the marking window (paper: RC pauses continue during a spanning
+        // trace). Safe to run a full ProcessModifiedBuffers once the marker has
+        // consumed the meStart snapshot (g_snapshotConsumed) - the root-deferral
+        // rotation is then clean, ProcessModifiedBuffers takes m_collectLock while
+        // ConcurrentTraceDrain takes none (no contention), and DrainZeroCountWork-
+        // List never decommits inside the trace window (g_traceWindowOpen), so the
+        // concurrent marker never races a free. Incremental draining bounds the
+        // finish pause. Only in the tiny window BEFORE the snapshot is consumed do
+        // we defer (skip) to avoid corrupting the outstanding snapshot's rotation.
+        bool skipBuffersForSpan = g_multiEpoch && g_traceState == TRACE_MARKING && !g_snapshotConsumed;
         if (doBuffers && !skipBuffersForSpan)
         {
             g_lxrCollector.ProcessModifiedBuffers();
@@ -4834,19 +4950,37 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     InterlockedIncrement64(&g_lxrCounters.Epochs);
     g_lxrCounters.LastCollectCommitted = g_committedInUse;
+    // Item E: reset the increment-count trigger accumulator at every pause (both
+    // RC and trace consume the logged increments), so the next pause is paced by
+    // increments logged from here on.
+    g_incrementBaseline = g_lxrCounters.ModifiedBufferEntries;
 
     if (phase == LXRPhase::TracePause)
     {
         InterlockedIncrement64(&g_lxrCounters.TracePauses);
         InterlockedExchangeAdd64(&g_lxrCounters.TracePausePauseMicros, pauseMicros);
-        // Survival-rate prediction: fraction of committed memory that survived
-        // this trace, folded into an EWMA (7:1) to pace future trace cadence.
+        // Item E predictors, both using the paper's asymmetric ("biased")
+        // exponential decay (§3.2.5): react fast to a rising signal (¾ new, ¼ old)
+        // and decay slowly on a falling one (¼ new, ¾ old) so the collector never
+        // under-provisions. Survival % paces the trace cadence (DecidePhase epoch
+        // cap); wastage % (the floating garbage each trace recovers) drives the
+        // wastage-based trace trigger.
         if (committedBefore > 0)
         {
             int64_t survivalPct = (g_committedInUse * 100) / committedBefore;
             if (survivalPct > 100) survivalPct = 100;
-            int64_t prev = g_lxrCounters.SurvivalPctEwma;
-            g_lxrCounters.SurvivalPctEwma = (prev < 0) ? survivalPct : (prev * 7 + survivalPct) / 8;
+            if (survivalPct < 0) survivalPct = 0;
+            int64_t prevS = g_lxrCounters.SurvivalPctEwma;
+            if (prevS <= 0)                    g_lxrCounters.SurvivalPctEwma = survivalPct;
+            else if (survivalPct > prevS)      g_lxrCounters.SurvivalPctEwma = (3 * survivalPct + prevS) / 4;
+            else                               g_lxrCounters.SurvivalPctEwma = (survivalPct + 3 * prevS) / 4;
+
+            int64_t wastagePct = 100 - survivalPct; // % of the pre-trace heap this trace reclaimed (RC-uncollectable garbage)
+            if (wastagePct < 0) wastagePct = 0;
+            int64_t prevW = g_lxrCounters.WastagePctEwma;
+            if (prevW <= 0)                    g_lxrCounters.WastagePctEwma = wastagePct;
+            else if (wastagePct > prevW)       g_lxrCounters.WastagePctEwma = (3 * wastagePct + prevW) / 4;
+            else                               g_lxrCounters.WastagePctEwma = (wastagePct + 3 * prevW) / 4;
         }
         g_lastTraceCommitted = g_committedInUse;
         g_epochsSinceTrace = 0;
@@ -4871,9 +5005,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     if (phase == LXRPhase::TracePause)
         InterlockedIncrement64(&g_lxrCounters.Collections);
 
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%% satbEntries=%lld satbMarks=%lld remsetEntries=%lld)\n",
+    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%% wastageEwma=%lld%% satbEntries=%lld satbMarks=%lld remsetEntries=%lld)\n",
                            phase == LXRPhase::TracePause ? "trace" : "rc",
                            (long long)pauseMicros, (long long)g_lxrCounters.SurvivalPctEwma,
+                           (long long)g_lxrCounters.WastagePctEwma,
                            (long long)g_lxrCounters.SatbEntries, (long long)g_lxrCounters.SatbMarks,
                            (long long)g_lxrCounters.RemsetEntries); fflush(stderr); }
 
