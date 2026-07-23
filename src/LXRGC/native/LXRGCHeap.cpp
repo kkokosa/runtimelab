@@ -1753,6 +1753,126 @@ void LXRCollector::CarveFreeRuns(size_t i)
     }
 }
 
+// Item ★ Stage 2 — RC-authoritative dead-object-run carving (see header). Mirrors
+// CarveFreeRuns' re-tiling, but enumerates dead runs by walking real object
+// boundaries and consulting the RC table (+ roots) instead of the stale line
+// marks, so it is sound OUTSIDE a trace window. Returns bytes carved for reuse.
+int64_t LXRCollector::CarveDeadRunsByRC(size_t i, const std::vector<uint8_t*>& rootSorted)
+{
+    uint8_t* Start = g_chunks[i].Start;
+    uint8_t* End   = g_chunks[i].UsedEnd;
+    if (End <= Start)
+        return 0;
+    size_t minRun = g_lineReuseMinBytes ? g_lineReuseMinBytes : (4 * lxr::kLineSize);
+
+    auto rootInRange = [&](uint8_t* s, uint8_t* e) -> bool {
+        auto it = std::lower_bound(rootSorted.begin(), rootSorted.end(), s);
+        return it != rootSorted.end() && *it < e;
+    };
+    // Page-cached RC read: an object never incremented has a reserved-but-
+    // uncommitted RC page (definitionally RC 0); guard the read so a dormant page
+    // never faults the walk.
+    uint8_t* rcCacheBase = nullptr; size_t rcCacheLen = 0; bool rcCacheCommitted = false;
+    auto rcValue = [&](Object* o) -> uint8_t {
+        uint8_t* slot = RCSlot(o);
+        if (slot < rcCacheBase || slot >= rcCacheBase + rcCacheLen)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(slot, &mbi, sizeof(mbi)) == 0) return 0;
+            rcCacheBase = (uint8_t*)mbi.BaseAddress;
+            rcCacheLen = mbi.RegionSize;
+            rcCacheCommitted = (mbi.State == MEM_COMMIT);
+        }
+        return rcCacheCommitted ? *slot : (uint8_t)0;
+    };
+
+    // Linear-walk object boundaries, coalescing consecutive DEAD objects into free
+    // segments. Snapped to real object starts on both ends => parse stays valid.
+    struct Seg { uint8_t* a; uint8_t* b; };
+    Seg segs[512];
+    int nseg = 0;
+    uint8_t* runStart = nullptr;
+    uint8_t* p = Start;
+    while (p < End)
+    {
+        Object* o = (Object*)p;
+        size_t sz = LXRObjectSize(o);
+        if (sz == 0)
+            return 0;                       // unparseable: never carve this region
+        // Live if RC>0 (incl. stuck 0xFF), young, or covered by a raw root.
+        bool live = (rcValue(o) != 0) || IsYoung(o) || rootInRange(p, p + sz);
+        if (!live)
+        {
+            if (runStart == nullptr) runStart = p;
+        }
+        else if (runStart != nullptr)
+        {
+            if ((size_t)(p - runStart) >= minRun && nseg < (int)(sizeof(segs)/sizeof(segs[0])))
+                segs[nseg++] = { runStart, p };
+            runStart = nullptr;
+        }
+        p += sz;
+    }
+    if (runStart != nullptr && (size_t)(End - runStart) >= minRun &&
+        nseg < (int)(sizeof(segs)/sizeof(segs[0])))
+        segs[nseg++] = { runStart, End };
+    if (nseg == 0)
+        return 0;
+
+    // Re-tile [Start, End) into ordered sub-regions: live segments interleaved with
+    // the carved dead segments (mirrors CarveFreeRuns exactly). Plug each dead run
+    // as one free object so an incidental linear parse stays valid, list it for
+    // reuse. May realloc g_chunks -> caller must not touch a prior g_chunks ref.
+    int64_t carved = 0;
+    bool firstWritten = false;
+    uint8_t* cursor = Start;
+    for (int s = 0; s < nseg; s++)
+    {
+        uint8_t* fa = segs[s].a;
+        uint8_t* fb = segs[s].b;
+        if (cursor < fa) // live segment before this dead run
+        {
+            if (!firstWritten)
+            {
+                g_chunks[i].Start = cursor; g_chunks[i].UsedEnd = fa;
+                g_chunks[i].Size = (size_t)(fa - cursor); g_chunks[i].Owner = nullptr;
+                g_chunks[i].Committed = true; g_chunks[i].FreeRun = false;
+                firstWritten = true;
+            }
+            else AppendRegionLocked(cursor, fa, (size_t)(fa - cursor), /*freeRun*/ false);
+        }
+        PlugFreeRange(fa, (size_t)(fb - fa));
+        ClearLoggedRange(fa, fb);           // reused dead run must start unlogged
+        ClearRCRange(fa, fb);               // reused range starts at RC 0
+        int fidx;
+        if (!firstWritten)
+        {
+            g_chunks[i].Start = fa; g_chunks[i].UsedEnd = fb;
+            g_chunks[i].Size = (size_t)(fb - fa); g_chunks[i].Owner = nullptr;
+            g_chunks[i].Committed = true; g_chunks[i].FreeRun = true;
+            firstWritten = true;
+            fidx = (int)i;
+        }
+        else fidx = AppendRegionLocked(fa, fb, (size_t)(fb - fa), /*freeRun*/ true);
+        if (fidx >= 0) PushFreeRunLocked((size_t)fidx);
+        InterlockedIncrement64(&g_carveRunsTotal);
+        InterlockedExchangeAdd64(&g_carveBytesTotal, (int64_t)(fb - fa));
+        carved += (int64_t)(fb - fa);
+        cursor = fb;
+    }
+    if (cursor < End) // trailing live segment
+    {
+        if (!firstWritten)
+        {
+            g_chunks[i].Start = cursor; g_chunks[i].UsedEnd = End;
+            g_chunks[i].Size = (size_t)(End - cursor); g_chunks[i].FreeRun = false;
+            firstWritten = true;
+        }
+        else AppendRegionLocked(cursor, End, (size_t)(End - cursor), /*freeRun*/ false);
+    }
+    return carved;
+}
+
 bool LXRCollector::AnyMarkedInRange(uint8_t* start, uint8_t* end) const
 {
     if (start < m_heapBase) start = m_heapBase;
@@ -4413,6 +4533,177 @@ void LXRCollector::CollectNursery()
 }
 
 // ===========================================================================
+//  Item ★ — primary-RC MATURE reclamation at the RC pause (paper §3.3).
+//
+//  Before this, ALL mature memory return happened at the (occasional) backup
+//  trace via SweepAndSelectDefrag / CarveFreeRuns / Evacuate; DrainZeroCountWorkList
+//  only decremented counts and never returned a byte. That inverts LXR's thesis:
+//  RC is meant to be the PRIMARY reclaimer, the trace only an occasional cyclic
+//  backstop. ReclaimMatureByRC restores that: at every RC pause it decommits /
+//  recycles mature regions whose reference counts have all dropped to zero.
+//
+//  Soundness (outside a trace window RC is authoritative):
+//   * The pluggable barrier counts EVERY ref store (incl. the patched Interlocked
+//     CAS/Exchange, SpanHelpers.ClearWithReferences, bulk moves, VM
+//     SetObjectReferenceUnchecked), so a heap-reachable mature object has RC>=1.
+//   * ProcessModifiedBuffers has already run this pause, so RC is fully reconciled
+//     and the zero-count free cascade drained.
+//   * A raw root (incl. unresolvable interior/byref that RC deferral skipped) into
+//     a region pins it.
+//   * Young objects legitimately sit at RC 0 -> young regions are skipped (the
+//     nursery's domain).
+//   * Stuck (saturated 0xFF) objects are non-zero -> kept for the trace to resolve.
+//   * Dead CYCLES keep RC>=1 (mutual refs) -> kept for the trace (correct: RC can't
+//     collect cycles, by design).
+//  Therefore an RC==0, non-root, non-young mature region is provably dead.
+//
+//  CRITICAL: unlike CollectNursery, this must NOT consult mark bits. Outside a
+//  trace window marks are STALE (set at the last trace, only cleared at the next
+//  ResetMarks), so a mature object that died since the last trace still carries its
+//  old mark; AnyMarkedInRange would over-retain and block nearly all mature RC
+//  reclamation, defeating the whole point of ★. RC is the authority here.
+//
+//  Deferred entirely while g_traceWindowOpen (marker mutating marks / RC not yet
+//  reconciled) or g_youngRCIncomplete (a first-log was dropped -> possible RC
+//  undercount) -- the same guards the nursery uses.
+// ===========================================================================
+void LXRCollector::ReclaimMatureByRC()
+{
+    static int s_rcReclaim = -1;
+    if (s_rcReclaim < 0)
+    {
+        const char* e = getenv("LXR_RC_RECLAIM");
+        s_rcReclaim = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+    }
+    if (!s_rcReclaim || g_theGCToCLR == nullptr)
+        return;
+
+    InterlockedIncrement64(&g_lxrCounters.MatureRCPasses);
+
+    static int s_dbg = (getenv("LXR_RC_RECLAIM_DBG") != nullptr) ? 1 : 0;
+
+    // Marks in flux / RC not reconciled -> defer to a later, quiescent RC pause.
+    if (g_traceWindowOpen || g_youngRCIncomplete)
+    {
+        if (s_dbg)
+        {
+            fprintf(stderr, "LXRGC: [rc-reclaim] DEFER pass=%lld traceWindow=%d youngIncomplete=%d\n",
+                    (long long)g_lxrCounters.MatureRCPasses, (int)g_traceWindowOpen, (int)g_youngRCIncomplete);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (s_dbg)
+    {
+        fprintf(stderr, "LXRGC: [rc-reclaim] RUN pass=%lld\n", (long long)g_lxrCounters.MatureRCPasses);
+        fflush(stderr);
+    }
+
+    // Raw root referent addresses (interior/byref UNresolved) under the STW pause.
+    // Any region a root points into is pinned, exactly as the nursery does.
+    std::vector<uint8_t*> rootAddrs;
+    g_nurseryRootAddrs = &rootAddrs;
+    LXRGCHandleStore::ForEachLiveHandle(&LXRNurseryCollectHandleAddr, nullptr);
+    ScanContext rsc;
+    rsc.promotion = true;
+    g_theGCToCLR->GcScanRoots(&LXRNurseryCollectRootAddr, 2, 2, &rsc);
+    g_nurseryRootAddrs = nullptr;
+    std::sort(rootAddrs.begin(), rootAddrs.end());
+    auto rootInRange = [&](uint8_t* start, uint8_t* end) -> bool {
+        auto it = std::lower_bound(rootAddrs.begin(), rootAddrs.end(), start);
+        return it != rootAddrs.end() && *it < end;
+    };
+
+    int64_t regionsReclaimed = 0, bytesReclaimed = 0, runsCarved = 0, carveBytes = 0;
+    // Item ★ Stage 2 (RC line-carving) rides the Immix free-run allocator, so it is
+    // only useful when line reuse is enabled; gate on it (env resolved elsewhere).
+    bool carve = (g_lineReuse > 0);
+    EnterCriticalSection(&g_chunkLock);
+    size_t sweepCount = g_chunkCount;
+    for (size_t i = 0; i < sweepCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.Owner != nullptr || c.FreeRun)
+            continue;                       // uncommitted, active, or a carved free run
+        if (c.UsedEnd <= c.Start)
+            continue;
+
+        // Young regions belong to the nursery (young objects legitimately sit at
+        // RC 0). Skip any region that contains a young block.
+        bool anyYoung = false;
+        for (uint8_t* b = (uint8_t*)((uintptr_t)c.Start & ~((uintptr_t)lxr::kBlockSize - 1));
+             b < c.UsedEnd; b += lxr::kBlockSize)
+        {
+            if (IsYoung((Object*)b)) { anyYoung = true; break; }
+        }
+        if (anyYoung)
+            continue;
+
+        bool wholeDead = !AnyRCNonZeroInRange(c.Start, c.UsedEnd);
+        bool rooted = rootInRange(c.Start, c.UsedEnd);
+
+        if (wholeDead && !rooted)
+        {
+            // Whole-region dead by RC: decommit its page-aligned interior + recycle
+            // it (mirrors the sweep / nursery decommit path). NO mark bits -- they
+            // are stale outside a trace window.
+            uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
+            uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
+            if (dend > dbeg)
+            {
+                VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+                InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
+                InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
+                bytesReclaimed += (int64_t)(dend - dbeg);
+            }
+            c.Committed = false;
+            // Reclaimed => RC 0 invariant + reused range must start unlogged (same
+            // as the sweep/nursery decommit sites; closes the decommit-vs-decrement
+            // race together with DrainZeroCountWorkList's committed-VirtualQuery
+            // guard).
+            ClearRCRange(c.Start, c.UsedEnd);
+            ClearLoggedRange(c.Start, c.UsedEnd);
+            if (g_freeChunkTop == g_freeChunkCap)
+            {
+                size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
+                size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
+                if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
+            }
+            if (g_freeChunkTop < g_freeChunkCap)
+                g_freeChunks[g_freeChunkTop++] = i;
+            regionsReclaimed++;
+        }
+        else if (carve)
+        {
+            // Partially-dead mature region: carve its dead object-runs for reuse by
+            // RC authority (Stage 2). Root-covered live objects are protected
+            // per-object inside CarveDeadRunsByRC, so a rooted region can still
+            // yield its dead runs. NOTE: this may realloc g_chunks -> 'c' is dead
+            // after this call; we do not touch it again this iteration.
+            int64_t cb = CarveDeadRunsByRC(i, rootAddrs);
+            if (cb > 0) { carveBytes += cb; runsCarved++; }
+        }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    InterlockedExchangeAdd64(&g_lxrCounters.MatureRCRegionsReclaimed, regionsReclaimed);
+    InterlockedExchangeAdd64(&g_lxrCounters.MatureRCBytesReclaimed, bytesReclaimed);
+    InterlockedExchangeAdd64(&g_lxrCounters.MatureRCRunsCarved, runsCarved);
+    InterlockedExchangeAdd64(&g_lxrCounters.MatureRCCarveBytes, carveBytes);
+    if (regionsReclaimed > 0 || carveBytes > 0)
+    {
+        fprintf(stderr, "LXRGC: [rc-reclaim] mature regions=%lld bytes=%lld carvedRuns=%lld carvedBytes=%lld "
+                "(totRegions=%lld totBytes=%lld totCarveBytes=%lld)\n",
+                (long long)regionsReclaimed, (long long)bytesReclaimed,
+                (long long)runsCarved, (long long)carveBytes,
+                (long long)g_lxrCounters.MatureRCRegionsReclaimed,
+                (long long)g_lxrCounters.MatureRCBytesReclaimed,
+                (long long)g_lxrCounters.MatureRCCarveBytes);
+        fflush(stderr);
+    }
+}
+
+// ===========================================================================
 //                              LXRGCHeap
 // ===========================================================================
 LXRGCHeap* LXRGCHeap::CreateAndInitialize()
@@ -5322,7 +5613,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             if (g_remsetActive)
                 g_lxrCollector.ResetRemsets();
         }
-        else if (g_youngRC && g_nurseryActive)
+        else
         {
             // Item D: young/nursery collection at the RC pause (paper §3.3). Young
             // objects are reference-counted from birth; after this pause's
@@ -5330,8 +5621,18 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             // decrements are applied, any young object still at RC 0 is implicitly
             // dead and its region is reclaimed. Guards on g_traceWindowOpen so it
             // never frees under an in-flight concurrent trace.
-            LXRSetPhase("stw:nursery");
-            g_lxrCollector.CollectNursery();
+            if (g_youngRC && g_nurseryActive)
+            {
+                LXRSetPhase("stw:nursery");
+                g_lxrCollector.CollectNursery();
+            }
+            // Item ★: primary-RC MATURE reclamation at the RC pause (paper §3.3).
+            // ProcessModifiedBuffers above has fully reconciled RC + drained the
+            // zero-count free cascade, so any mature region with no RC>0 object is
+            // dead and is returned NOW by RC authority -- not deferred to the
+            // occasional backup trace. This makes RC the primary reclaimer.
+            LXRSetPhase("stw:rc-reclaim");
+            g_lxrCollector.ReclaimMatureByRC();
         }
 
         LXRSetPhase("stw:restart");

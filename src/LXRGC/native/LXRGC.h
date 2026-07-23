@@ -183,6 +183,15 @@ struct LXRCounters
     volatile int64_t NurseryRegionsReclaimed; // young regions reclaimed (no live young)
     volatile int64_t NurseryBytesReclaimed; // young bytes decommitted by the nursery
     volatile int64_t NurseryLiveYoung;      // live young objects retained at the last nursery pass
+
+    // Item ★ (primary-RC mature reclamation): mature memory returned at the RC
+    // pause by RC authority (RC==0), NOT by the backup trace's mark-sweep. This
+    // is what makes RC the PRIMARY reclaimer (paper §3.3) rather than the trace.
+    volatile int64_t MatureRCPasses;          // RC-pause mature-reclamation passes run
+    volatile int64_t MatureRCRegionsReclaimed;// mature regions decommitted by RC (whole-region dead)
+    volatile int64_t MatureRCBytesReclaimed;  // mature bytes decommitted at RC pauses by RC
+    volatile int64_t MatureRCRunsCarved;      // mature dead line-runs carved for reuse at RC pauses
+    volatile int64_t MatureRCCarveBytes;      // mature bytes recovered by RC line-carving
 };
 extern LXRCounters g_lxrCounters;
 
@@ -331,6 +340,17 @@ public:
     // open, so freeing young can never dangle a live mature->young edge.
     void CollectNursery();
 
+    // Item ★ (primary-RC mature reclamation, paper §3.3): at each RC pause,
+    // return MATURE memory whose reference count has dropped to zero, WITHOUT
+    // waiting for the backup trace. RC is authoritative outside a trace window
+    // (all ref stores are counted by the coalescing barrier, roots are pinned,
+    // young is the nursery's domain, stuck 0xFF objects are kept), so a mature
+    // region/line with no RC>0 object is dead and is decommitted / carved for
+    // reuse here. This is the change that makes RC the PRIMARY reclaimer rather
+    // than the trace. Deferred entirely while a concurrent trace window is open
+    // (marks in flux) or an RC undercount is possible (g_youngRCIncomplete).
+    void ReclaimMatureByRC();
+
     lxr::BlockMeta* MetaForBlock(uint8_t* blockAddr);
     // Young-object nursery (LXR difference #6). StampBornEpoch marks the blocks
     // spanned by a freshly (re)registered allocation region with the current
@@ -391,6 +411,15 @@ public:
     // (O(lines)); splits the region at object boundaries; may realloc g_chunks,
     // so the caller must not touch a prior g_chunks reference afterwards.
     void CarveFreeRuns(size_t regionIndex);
+    // Item ★ Stage 2: RC-authoritative dead-object-run carving for a partially
+    // dead MATURE region at an RC pause. Linear-walks real object boundaries
+    // (parse-safe, like the nursery/sweep) classifying each object live (RC>0 /
+    // stuck / root-covered / young) or dead, coalesces runs of consecutive dead
+    // objects >= the reuse threshold, and plugs+lists them for reuse -- returning
+    // mature memory by RC authority WITHOUT waiting for the mark-driven trace.
+    // Uses NO mark bits (stale outside a trace window). Returns bytes carved.
+    // Caller holds g_chunkLock. rootSorted must be the sorted raw-root address vec.
+    int64_t CarveDeadRunsByRC(size_t regionIndex, const std::vector<uint8_t*>& rootSorted);
     void ResetMarks();                  // decommits the mark side-table (all bits -> 0)
     void PushMark(Object* obj);         // MarkObject + push onto the mark stack
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs

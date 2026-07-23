@@ -29,7 +29,7 @@ Legend: ✅ conformant · ⚠️ partial / approximated · ❌ divergent (shortc
 | **F** | Remsets **scoped to the evacuation set**, bootstrapped by the first SATB trace, kept updated by the barrier, **line-reuse-counter** stale-entry tagging; evac set = blocks <50% occupancy, N lowest; **incremental, time-budgeted**, STW (§3.3.4) | **LANDED & VERIFIED (2026-07-25).** Three parts, all paper-faithful: **(F1) N-lowest-occupancy evac set** — gather every region ≥`LXR_EVAC_FRAG_PCT` dead, sort by occupancy ratio (live/total) ascending, take the most-fragmented first under the byte budget (max compaction per live byte), not first-over-threshold. **(F2) time-budgeted incremental copy** (`LXR_EVAC_BUDGET_MS`, default 20 ms) checked only at region **boundaries** so a region is never left half-moved (dangling). **(F3) trace-bootstrapped, evac-scoped fix-up** — the O(live-heap) whole-heap field-fix-up walk is **eliminated**: during the evac cycle's STW mark (which already scans every live object's fields once) each mark lane logs the **inter-block reference slots** it sees into its own thread-local vector (lock-free; registry touched once/thread). The mark runs in the SAME pause immediately before `Evacuate()`, so the union is a **complete remembered set of live inter-block edges** at evac time. Fix-up = (a) scan moved objects' destination copies (outgoing edges), (b) replay the recorded inter-block slots (incoming edges from non-moved referrers, skipping slots inside a moved source), (c) scan the evac regions' **in-place survivors** — pinned/alloc-failed objects that hold *intra*-block edges to same-block neighbours that DID move (evac is per-OBJECT). All three are bounded by the evac-set size, NOT the heap. Automatic full-walk **fallback** on lane-log overflow or a conservative-keep-alive cycle (objects marked without a field scan). Verified: 11/11 WebApi iters full config `LXR_VERIFY_TRACE` **[verify-evac] misses=0, av=0**, `fixup=scoped fullwalk=0`; the (c) gap (16-17 unforwarded pinned-referrer intra-block edges) was **root-caused and fixed**, not masked. `EnumerateRemsetSlots` per-interval remset still consumed by the nursery (D). No runtime change. Envs `LXR_EVAC_BUDGET_MS`, `LXR_EVAC_SCOPED_FIXUP` (A/B). | ✅ |
 | **G** | **Parallelism in every phase**; very large reference arrays partitioned for increment scalability (§3.5) | **LANDED & VERIFIED (2026-07-25)** (env `LXR_PARALLEL_RC`, default-ON). The persistent worker pool (built once at Initialize, never during a pause) is generalized from mark-only to a **generic parallel-for** (`RunOnPool(lanes, fn, ctx)`; lane 0 = caller, pooled workers = lanes 1..n; the worker proc branches on `g_poolWorkKind`: mark-drain vs. parallel-for). **RC apply is now parallel** (`ApplyRCEpoch`): both RC paths (`ProcessModifiedBuffers` STW + `ProcessSnapshotDecrements` off-pause) build flat increment/decrement lists and stride-partition them across the pool, so a large coalesced epoch — e.g. **a big reference array filled/cleared → one RC entry per element** — distributes across the GC threads instead of serializing on one (this IS the §3.5 large-reference-array increment scalability, applied at the RC-entry granularity where the work actually is). Ordering preserved: **all increments, then all decrements** (two `RunOnPool` calls, which join between them = the required barrier). RC slot updates use **atomic CAS** variants (`RCIncrementAtomic`/`RCDecrementAtomic`, `_InterlockedCompareExchange8`, saturating at 0xFF / floored at 0, exactly-once 1→0 edge) so concurrent lanes touching the same object's count never lose an update; RC-table pages are **pre-committed serially** (deduped by page) so the atomic apply never calls `VirtualAlloc` under contention. The free cascade (`DrainZeroCountWorkList`) stays **serial** (parallel recursive free is highest-risk/lowest-reward, runs after the barrier). A dedicated `g_poolLock` serializes the shared pool between the item-C background marker's mark-drain and a spanned-RC-epoch's parallel apply (no nesting → no deadlock). Small epochs (< 8192 entries) stay serial (wake/join not amortised). Verified: full unified config `LXR_GC_THREADS=16`, 8+ WebApi iters, **av=0/hang=0**, `LXR_VERIFY_TRACE` **offenders=0**; parallel path exercised (`rcApply[par>0]`); A/B `LXR_PARALLEL_RC=0` equivalent (all-serial, clean). Parallel mark was already present (`ParallelDrainMarkStack`). Single-huge-array **mark**-side partitioning across lanes (work-stealing on one giant array) remains a bounded refinement, not implemented: the current pool is static seed-partitioning, and RC-entry parallelism already delivers the paper's large-array *increment* scalability. | ✅ |
 | — | Immix block/line heap; single field barrier serving RC + SATB + remset; SATB collects cycles + stuck counts; **copy only during STW**; stuck count → resolved by trace | All present ✅ (stuck at 0xFF vs paper's 2-bit count — variant, higher fidelity). | ✅ |
-| **★** | **PRIMARY-RC RECLAMATION** (LXR's core thesis): mature garbage reclaimed **promptly at RC pauses** when RC→0 (line/block returned to the allocator); the SATB trace runs **only occasionally**, to collect **cycles** + reset **stuck** counts | **NOT REALIZED — mature reclamation is trace-driven, not RC-driven.** `DrainZeroCountWorkList` (the RC free cascade, every RC pause) only decrements counts + `meta->liveObjects` (**which is never read anywhere** — verified by grep; dead bookkeeping); it returns **zero mature memory**. ALL mature memory return happens at **`TracePause`** cycles via `SweepAndSelectDefrag` (mark-authoritative region decommit + `CarveFreeRuns` line recycling) and `Evacuate`. Only the **young nursery** (D) returns memory at RC pauses. So we **trace frequently** and let the trace do essentially all mature reclamation, with RC acting as a young-liveness + keep-alive signal — the **inverse** of the paper's cost model. Every A–G *mechanism* is present, but the primary-RC identity is not. Sound (memory IS reclaimed, at trace cadence), but not 1:1. | ❌ |
+| **★** | **PRIMARY-RC RECLAMATION** (LXR's core thesis): mature garbage reclaimed **promptly at RC pauses** when RC→0 (line/block returned to the allocator); the SATB trace runs **only occasionally**, to collect **cycles** + reset **stuck** counts | **LANDED & VERIFIED (2026-07-24)** (env `LXR_RC_RECLAIM`, default ON): new `ReclaimMatureByRC()` runs STW at **every RC pause** (after `ProcessModifiedBuffers` has fully reconciled RC + drained the zero-count cascade) and **returns mature memory by RC authority — no trace required**. Two granularities: **(1)** whole-region decommit + free-chunk recycle for any mature 128 KB region with **no** RC>0 object (`!AnyRCNonZeroInRange`), and **(2)** `CarveDeadRunsByRC` — RC-authoritative Immix line-carving that linear-walks real object boundaries, coalesces runs of consecutive **dead** (RC 0, non-young, non-root) objects ≥ the reuse threshold, and plugs+lists them as free runs for the allocator (mirrors `CarveFreeRuns`' re-tiling). **Soundness:** outside a trace window RC is authoritative (the pluggable barrier counts every ref store incl. the patched Interlocked/bulk/ClearWithReferences forms; roots pinned; young = nursery's domain; stuck 0xFF kept; dead cycles keep RC≥1 for the trace). **CRITICAL — consults NO mark bits** (unlike the nursery): marks are stale outside a trace window, so using them would over-retain and block nearly all mature RC reclamation. Deferred while `g_traceWindowOpen` (marks in flux / RC not reconciled) or `g_youngRCIncomplete` (possible undercount). Decommit-vs-decrement race closed by `ClearRCRange` + `DrainZeroCountWorkList`'s committed-`VirtualQuery` guard (as at the sweep sites). **Verified:** full unified config `LXR_GC_THREADS=16 LXR_VERIFY_TRACE=1`, **8/8 WebApi iters ~55 s: av=0, offenders=0, hang=0, Errors=0**; `[rc-reclaim]` fired on the real benchmark returning **37–54 mature regions (≈3.5–6.9 MB) + 8–9 carved dead line-runs (~0.1 MB) per firing at RC pauses without a trace**, proving RC now returns mature memory. A/B `LXR_RC_RECLAIM=0` disables it cleanly. Mature reclamation is now RC-primary; the trace remains the occasional cyclic/stuck backstop, matching the paper's cost model. **NOTE (out-of-scope pre-existing finding):** a synthetic heavy-early-mature-allocation demo (80 MB burst at startup) exposed an **LXRGC startup AV** in EventSource/reflection type-init that reproduces in **every** LXRGC config **and with ★ off** (`LXR_RC_RECLAIM=0`) while running fine under the stock GC — a pre-existing GC bug unrelated to ★, flagged for separate root-cause. | ✅ |
 
 ### Honest bottom line (revised 2026-07-23 re-audit)
 The engine is a **sound, structurally-LXR** collector, faithful on the big choices
@@ -38,21 +38,18 @@ copying, parallel mark) and on the individual A–G mechanisms. **A/B are genuin
 fixed** (precise coalescing RC + inc-before-dec + root deferral) — the earlier
 "RC imprecise/advisory" critique no longer applies at the barrier level.
 
-**The real remaining divergence is structural, not per-item (row ★):** even with
-precise counts, the **RC free cascade returns no mature memory** — it decrements
-counts and a never-read `liveObjects`, and **all** mature reclamation (region
-decommit, line carve, evacuation) happens at the **occasional-but-actually-frequent
-`TracePause`**, not at the RC pause. Only the **young nursery (D)** reclaims at RC
-pauses, and **D is itself partial** (implicitly-dead-young reclaim done; the
-survivor-copy-at-RC-pause defragmentation half is not). So reclamation still **leans
-on the mark trace far more than the paper**: we trace often and sweep, rather than
-reclaim mature garbage promptly by RC and trace only to break cycles / reset stuck
-counts. **E/F/G** are precision/perf refinements, orthogonal to this.
+**The primary-RC divergence (row ★) is now CLOSED (2026-07-24):** `ReclaimMatureByRC()`
+returns mature memory **at the RC pause** by RC authority — whole-region decommit for
+fully-dead 128 KB regions plus `CarveDeadRunsByRC` RC-authoritative Immix line-carving
+for partially-dead regions — with **no mark-bit dependence** and **no trace required**.
+Verified firing on the real WebApi benchmark (37–54 regions + carved runs per firing,
+av=0/offenders=0). The SATB trace is back to its paper role (cycles + stuck reset) as
+the occasional backstop. Only **D-copy** (young-survivor copy-at-RC-pause
+defragmentation, §3.3.1–3) remains open; **E/F/G** are precision/perf refinements,
+orthogonal to this.
 
-Reaching 1:1 parity now means **(★) making RC the primary mature reclaimer** —
-free/recycle lines and blocks at the RC pause when their objects hit RC 0, so the
-SATB trace can drop back to its paper role (cycles + stuck only) at a much lower
-cadence — and **(D-copy)** copying young survivors at the RC pause.
+Reaching full 1:1 parity now means only **(D-copy)** copying young survivors at the
+RC pause; the primary-RC mature reclaimer (★) is done.
 
 ---
 
@@ -87,26 +84,27 @@ cadence — and **(D-copy)** copying young survivors at the RC pause.
    stays serial; `g_poolLock` serializes pool use vs. the item-C marker drain. Verified
    16-thread full config av=0/offenders=0, parallel path exercised, A/B-clean. Single
    huge-array mark-side work-stealing left as a bounded refinement.)
-8. **★ PRIMARY-RC MATURE RECLAMATION (the core identity gap, NOT yet done).** Make the
-   RC free cascade actually **return mature memory at the RC pause**: when an object's
-   RC→0, free its slot and, when a line/block empties (`liveObjects`→0, currently
-   decremented-but-never-read), recycle that line/block to the allocator **without
-   waiting for a trace** — soundly w.r.t. an in-flight SATB trace (defer only inside
-   `g_traceWindowOpen`) and w.r.t. decommit-vs-decrement races (the `ClearRCRange` +
-   committed-`VirtualQuery` guards already exist). Then drop the SATB trace back to its
-   paper cadence (cycles + stuck-count reset only), rather than being the primary
-   sweeper. This is the change that turns "frequent-trace mark-sweep with RC assist"
-   back into "primary RC, occasional trace" — LXR's actual thesis. **UNDONE.**
+8. **★ PRIMARY-RC MATURE RECLAMATION — DONE (2026-07-24).** `ReclaimMatureByRC()` now
+   **returns mature memory at the RC pause**: whole-region decommit + free-chunk
+   recycle for fully-dead 128 KB regions (`!AnyRCNonZeroInRange`), and
+   `CarveDeadRunsByRC` RC-authoritative Immix line-carving (object-boundary walk,
+   coalesce consecutive RC-0/non-young/non-root runs, plug+list for reuse) for
+   partially-dead regions — **no trace required, no mark bits** (stale outside a trace
+   window). Sound w.r.t. an in-flight SATB trace (defer inside `g_traceWindowOpen` /
+   `g_youngRCIncomplete`) and decommit-vs-decrement races (`ClearRCRange` +
+   committed-`VirtualQuery` guards). The SATB trace is back to its paper role (cycles +
+   stuck reset) as the occasional backstop. Verified: 8/8 WebApi full-config iters
+   av=0/offenders=0, `[rc-reclaim]` firing (37–54 regions + carved runs per firing).
+   Env `LXR_RC_RECLAIM` (default ON). **✅ DONE.**
 9. **D-copy — young-survivor copy at the RC pause** (§3.3.1–3): copy the 0→1 young
    survivors at the RC pause to defragment, instead of leaving them in place for the
    later trace-cycle `Evacuate`. **UNDONE** (implicitly-dead-young reclaim is done).
 
-Only after 1–4 (identity-restoring) land do the full benchmarks become a faithful
-LXR-vs-Server/Workstation comparison. **1–4 are ✅** (A `f9f7031`, B `2599d3f`,
-D-reclaim `d7a3b78`, C multi-epoch), and E/F/G ✅ — **BUT the deeper identity item ★
-(primary-RC mature reclamation) and D-copy remain open.** Benchmarks run today measure
-a *sound, structurally-LXR* collector whose mature reclamation is still trace-driven;
-they are informative but not yet a 1:1 LXR-vs-Server comparison until ★ lands.
+**★ (primary-RC mature reclamation) is now ✅** (commit — see changelog), so mature
+reclamation is RC-primary and the full benchmarks measure a structurally-faithful
+"primary RC, occasional trace" collector. Only **D-copy** (young-survivor
+defragmenting copy) remains before full 1:1 parity. **1–4 are ✅** (A `f9f7031`,
+B `2599d3f`, D-reclaim `d7a3b78`, C multi-epoch), E/F/G ✅, and ★ ✅.
 
 ---
 
@@ -129,6 +127,28 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-26** — **★ PRIMARY-RC MATURE RECLAMATION LANDED → ★ ✅.** New
+  `ReclaimMatureByRC()` runs STW at every RC pause (after `ProcessModifiedBuffers`
+  reconciles RC) and returns mature memory by RC authority — **no trace required**:
+  **(1)** whole-region decommit + free-chunk recycle for fully-dead 128 KB regions
+  (`!AnyRCNonZeroInRange`), and **(2)** `CarveDeadRunsByRC` — RC-authoritative Immix
+  line-carving that walks real object boundaries, coalesces consecutive dead
+  (RC 0 / non-young / non-root) object runs ≥ the reuse threshold, and plugs+lists
+  them for allocator reuse (mirrors `CarveFreeRuns`' re-tiling). **Consults NO mark
+  bits** (stale outside a trace window — using them would over-retain and defeat ★);
+  defers inside `g_traceWindowOpen`/`g_youngRCIncomplete`; decommit-vs-decrement race
+  closed by `ClearRCRange` + the committed-`VirtualQuery` guard. Wired into the driver
+  RC-pause branch alongside the nursery. Counters `MatureRC*`; env `LXR_RC_RECLAIM`
+  (default ON). **Verified:** full unified config `LXR_GC_THREADS=16
+  LXR_VERIFY_TRACE=1`, 8/8 WebApi ~55 s iters **av=0/offenders=0/hang=0/Errors=0**,
+  `[rc-reclaim]` firing on the real benchmark (37–54 mature regions ≈3.5–6.9 MB + 8–9
+  carved line-runs per firing, returned at RC pauses without a trace); A/B
+  `LXR_RC_RECLAIM=0` clean. Mature reclamation is now RC-primary; trace is the
+  occasional cyclic/stuck backstop (paper cost model). **Out-of-scope finding:** a
+  synthetic 80 MB-startup-burst demo exposed a pre-existing **LXRGC startup AV** in
+  EventSource/reflection type-init that reproduces in every LXRGC config and with ★
+  OFF while the stock GC runs it fine — unrelated to ★, flagged for separate
+  root-cause. Only **D-copy** remains open for full parity.
 - **2026-07-23** — **Independent evidence-based re-audit (code, not doc).** Ticked A–G
   against the actual reclamation paths and found two honest corrections to the
   all-✅ status: **(1) D downgraded ✅→⚠️** — implicitly-dead-young reclaim is done, but
