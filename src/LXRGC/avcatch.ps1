@@ -7,6 +7,7 @@ $env:LXR_GC_THREADS = "16"
 $env:LXR_CONCURRENT = "1"; $env:LXR_EVAC = "1"; $env:LXR_REMSET = "1"
 $env:LXR_LINE_REUSE = "1"; $env:LXR_CONC_DECREMENTS = "1"; $env:LXR_YOUNG_RC = "1"
 $env:LXR_AV_STACKS = "1"
+$env:LXR_AV_ANY = "1"
 $env:DOTNET_ReadyToRun = "0"
 $env:LXRGC_BENCH_DURATION_SECONDS = "$Duration"
 $timeoutSec = $Duration + 40
@@ -26,10 +27,13 @@ for ($i = 1; $i -le $MaxTries; $i++) {
     $out = $sbO.ToString(); $errtxt = $sbE.ToString()
     $hasResult = $out -match '##RESULT##'
     $hasAvDump = $errtxt -match '\[AV\]'
-    if ($hasAvDump -or ($exited -and $code -ne 0 -and -not $hasResult)) {
+    $crashed = ($code -eq 'HANG') -or (-not $hasResult) -or ($exited -and $code -ne 0)
+    if ($hasAvDump -or $crashed) {
         Set-Content -Path $err -Value ($out + "`n===STDERR===`n" + $errtxt)
-        Write-Host "  try $i CRASH code=$code avDump=$hasAvDump -> $err"
-        if ($hasAvDump) { Write-Host "=== AV STACK CAPTURED at try $i ==="; break }
+        Write-Host "  try $i CRASH code=$code avDump=$hasAvDump crashed=$crashed -> $err"
+        # Only break when a dump coincides with an actual crash (a benign
+        # first-chance wild AV that the runtime recovers from is NOT our bug).
+        if ($hasAvDump -and $crashed) { Write-Host "=== AV STACK CAPTURED at try $i ==="; break }
     } else {
         Write-Host "  try $i OK (code=$code)"
     }

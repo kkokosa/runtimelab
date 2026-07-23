@@ -166,6 +166,7 @@ struct LXRCounters
     volatile int64_t ConcMarkedObjects;     // objects marked during the concurrent drain
     volatile int64_t ConcAllocBlack;        // objects retained by allocate-black (born mid-trace)
     volatile int64_t ClosureGapMarked;      // live objects the conc trace missed, marked by closure-completion
+    volatile int64_t FinalRescanMarked;     // live root-reachable objects rescued by the final root rescan
     volatile int64_t ConcSnapshotMicros;    // cumulative STW snapshot-pause time (us)
     volatile int64_t ConcFinishMicros;      // cumulative STW finish-pause time (us)
     volatile int64_t ConcDrainMicros;       // cumulative concurrent (non-pause) drain time (us)

@@ -817,7 +817,52 @@ Two follow-up findings closed this properly:
    the trace provably complete.
 
 
-##### RESOLVED (2026-07-23) — concurrent / lazy RC decrements off the pause (difference #1)
+##### RESOLVED (2026-07-24) — the last residual: a live object reachable only from a mutator ROOT (final root rescan)
+
+The 2026-07-22 reconciliation made the trace complete for objects reachable
+*through the heap*, but a ~1/100 `RuntimeAsyncTask.DispatchContinuations` access
+violation (fault **outside** the heap reservation — a type-confused wild pointer)
+survived it. Root cause, isolated by instrumenting a **final root rescan** at the
+finish pause (`LXRPromoteRootFinal` counts objects still white when a live root
+reaches them, `FinalRescanMarked`):
+
+- `MarkModifiedNewValues()` marks the current value of every written **heap** slot,
+  and `DrainSatbBuffers()` covers heap-slot **deletions**. Neither covers a live
+  object whose **sole surviving reference migrated into a mutator root** (a
+  register / stack slot) during the window: the snapshot scanned that thread's
+  roots at their *old* values, and a plain root overwrite fires no write barrier.
+- Worse, on a `g_modifiedOverflow`-only finish (a mutator's modified buffer filled)
+  the old code took the `needFullClosure` branch but **only `g_satbOverflow`
+  re-seeded roots** — so a dropped store that left an object reachable *only* from a
+  root was never re-greyed, and `CompleteClosureOverMarked` (a marked→unmarked
+  *heap* closure) cannot see a root→unmarked edge either.
+- .NET 11 runtime-async makes this concrete: `DispatchContinuations` walks a heap
+  continuation chain while advancing a root (`asyncDispatcherInfo.NextContinuation`),
+  and a resumed frame can hold the only reference to a snapshot-era object in a
+  register. Missed → mark-authoritative sweep frees it → its bytes are reused by a
+  different-typed object → a stale continuation ref becomes a wild pointer → AV.
+
+**Fix — a bounded final root rescan (the standard concurrent-mark completion
+pause).** `ConcurrentTraceFinish` now unconditionally re-scans **all roots +
+handles** (mutators are STW-stopped) and drains the closure, after allocate-black
+and before the modified-set reconciliation. Cost is proportional to root count plus
+the tiny missed subgraph, **not** the live heap — so it stays within the user's
+"no O(live-heap) crutch" constraint while making the trace complete for
+root-reachable objects too. This is exactly what CoreCLR's own background GC does
+(a final STW mark that rescans stack roots + handles). No runtime-fork change was
+needed: the .NET 11 continuation spills already barrier correctly (ordinary
+`STOREIND(TYP_REF)` / GC-struct block stores); the gap was a *root* the concurrent
+snapshot could not keep stable, which only a finish-time root rescan can close.
+
+*Verified:* full unified config (`LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1
+LXR_LINE_REUSE=1 LXR_CONC_DECREMENTS=1 LXR_YOUNG_RC=1 LXR_GC_THREADS=16`,
+`DOTNET_ReadyToRun=0`) — **136 consecutive clean WebApi iterations, av=0**, where
+the pre-fix build reproduced the `DispatchContinuations` AV by ~try 50/100.
+`LXR_VERIFY_TRACE=1` runs report non-overflow finishes with `gap=0` (no unbarriered
+heap store exists), confirming the residual was purely the root-migration case now
+closed by the rescan.
+
+
 
 Paper-LXR replays the coalescing-RC **decrements** and the recursive free on a
 background collector thread, *between* pauses; only the bounded buffer snapshot is

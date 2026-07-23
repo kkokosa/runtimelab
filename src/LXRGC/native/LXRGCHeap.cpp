@@ -2166,6 +2166,43 @@ void LXRCollector::ConcurrentTraceDrain()
     }
 }
 
+// promote_func for the FINAL root rescan at the concurrent finish pause. Marks
+// like LXRPromoteRoot but counts objects that were still WHITE (unmarked) when a
+// root reached them - i.e. live objects the concurrent trace missed and which the
+// following mark-authoritative sweep would otherwise reclaim (a use-after-free).
+static volatile LONG64 g_finalRescanMarked = 0;
+static int             g_finalRescanReported = 0;
+static void LXRPromoteRootFinal(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
+{
+    Object* o = *ppObj;
+    if (o == nullptr)
+        return;
+    if (flags & GC_CALL_INTERIOR)
+    {
+        uint8_t* interior = (uint8_t*)o;
+        o = g_lxrCollector.ResolveInterior(interior);
+        if (o == nullptr)
+        {
+            g_lxrCollector.ConservativelyKeepAliveInterior(interior);
+            return;
+        }
+    }
+    if (!g_lxrCollector.IsMarked(o))
+    {
+        InterlockedIncrement64(&g_finalRescanMarked);
+        static int s_verify = (getenv("LXR_VERIFY_TRACE") != nullptr) ? 1 : 0;
+        if (s_verify && g_finalRescanReported < 16)
+        {
+            g_finalRescanReported++;
+            MethodTable* mt = o->GetGCSafeMethodTable();
+            fprintf(stderr, "LXRGC: [final-rescan] MISSED live root object %p mt=%p comp=%d bornInWindow=%d\n",
+                    (void*)o, (void*)mt, mt && mt->HasComponentSize() ? 1 : 0,
+                    LXRBornInWindow((uint8_t*)o) ? 1 : 0);
+        }
+    }
+    g_lxrCollector.PushMark(o);
+}
+
 // Called under the STW *finish* pause. Consumes residual SATB, finishes the
 // closure, then applies allocate-black: every object allocated since the
 // snapshot (at/above its region's snapshot high-water) is retained this cycle so
@@ -2245,6 +2282,38 @@ void LXRCollector::ConcurrentTraceFinish()
     // Trace the transitive closure of every allocate-black object just pushed, so
     // their referents (incl. snapshot-era objects they solely reference) are marked.
     DrainClosure();
+
+    // FINAL ROOT RESCAN (the concurrent-mark completion pause). A Yuasa SATB
+    // deletion barrier keeps every object reachable *through the heap* at snapshot
+    // markable, but it does NOT cover a live object whose sole surviving reference
+    // migrated into a mutator ROOT (a register/stack slot) during the window: the
+    // snapshot scanned that thread's roots at their OLD values, and a plain root
+    // overwrite fires no write barrier, so such an object is never greyed. .NET 11
+    // runtime-async makes this concrete - DispatchContinuations walks a heap
+    // continuation chain while advancing a root (asyncDispatcherInfo.NextContinuation),
+    // and a resumed frame can hold the only reference to a snapshot-era object in a
+    // register. Re-scanning ALL roots + handles here (mutators are STW-stopped)
+    // re-greys anything a live root still points at, then we close over it. This is
+    // the standard concurrent-collector final mark pause and is bounded by root
+    // count + the tiny missed subgraph, NOT the live heap - so it REPLACES the
+    // O(live-heap) CompleteClosureOverMarked backstop as the soundness guarantee.
+    {
+        LXRGCHandleStore::ForEachLiveHandle(&LXRMarkHandleRef, nullptr);
+        ScanContext sc;
+        sc.promotion = true;
+        int64_t rescanBefore = g_finalRescanMarked;
+        g_theGCToCLR->GcScanRoots(&LXRPromoteRootFinal, 2, 2, &sc);
+        DrainClosure();
+        int64_t rescanNew = g_finalRescanMarked - rescanBefore;
+        if (rescanNew > 0)
+        {
+            InterlockedExchangeAdd64(&g_lxrCounters.FinalRescanMarked, rescanNew);
+            static int s_verify = (getenv("LXR_VERIFY_TRACE") != nullptr) ? 1 : 0;
+            if (s_verify)
+                fprintf(stderr, "LXRGC: [final-rescan] rescued %lld live root-reachable object(s) the concurrent trace missed\n",
+                        (long long)rescanNew);
+        }
+    }
 
     // Concurrent-marking-race reconciliation (LXR difference #3). The off-pause
     // drain can scan an object before a mutator installs a new reference into it;
@@ -3681,9 +3750,17 @@ static LONG CALLBACK LXRAvVectoredHandler(EXCEPTION_POINTERS* ep)
     uint8_t* faultAddr = (er->NumberParameters >= 2) ? (uint8_t*)er->ExceptionInformation[1] : nullptr;
     uint8_t* base  = g_lxrCollector.HeapBase();
     size_t   bytes = g_lxrCollector.HeapBytes();
-    // Only OUR bug: a fault INSIDE the LXR heap reservation (a UAF of a
-    // decommitted chunk). Managed null derefs fault near 0 - pass them through.
-    if (base == nullptr || faultAddr < base || faultAddr >= base + bytes)
+    bool inHeap = (base != nullptr && faultAddr >= base && faultAddr < base + bytes);
+    // Default: only OUR classic bug - a fault INSIDE the LXR heap reservation (a
+    // UAF of a decommitted chunk). Managed null derefs fault near 0 and are
+    // handled by the runtime's own VEH - pass them through. With LXR_AV_ANY=1 we
+    // also capture *wild-pointer* faults above the null-guard page (a corrupted
+    // ref-field read - e.g. the concurrent-SATB DispatchContinuations AV, whose
+    // fault lands OUTSIDE the heap), to get a native stack for diagnosis.
+    static int s_any = -1;
+    if (s_any < 0) s_any = (getenv("LXR_AV_ANY") != nullptr) ? 1 : 0;
+    bool wild = (s_any && faultAddr >= (uint8_t*)0x10000);
+    if (!inHeap && !wild)
         return EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedCompareExchange(&g_lxrAvDumped, 1, 0) != 0)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -3691,11 +3768,12 @@ static LONG CALLBACK LXRAvVectoredHandler(EXCEPTION_POINTERS* ep)
     HANDLE proc = GetCurrentProcess();
     LXREnsureSymForFault(proc);
     DWORD rw = (er->NumberParameters >= 1) ? (DWORD)er->ExceptionInformation[0] : 0;
-    fprintf(stderr, "LXRGC: [AV] ===== access violation in LXR heap =====\n");
-    fprintf(stderr, "LXRGC: [AV] fault %s addr=%p (heap [%p,%p) off=+0x%llx) rip=%p tid=%lu\n",
+    fprintf(stderr, "LXRGC: [AV] ===== access violation (%s) =====\n",
+            inHeap ? "in LXR heap" : "wild pointer / outside heap");
+    fprintf(stderr, "LXRGC: [AV] fault %s addr=%p (heap [%p,%p) %s) rip=%p tid=%lu\n",
             rw == 1 ? "WRITE" : (rw == 8 ? "EXEC" : "READ"), (void*)faultAddr,
-            (void*)base, (void*)(base + bytes), (unsigned long long)(faultAddr - base),
-            (void*)ep->ContextRecord->Rip, GetCurrentThreadId());
+            (void*)base, (void*)(base + bytes),
+            inHeap ? "IN-HEAP" : "outside", (void*)ep->ContextRecord->Rip, GetCurrentThreadId());
 
     // Classify the containing chunk state at the moment of the fault.
     __try
@@ -3713,6 +3791,26 @@ static LONG CALLBACK LXRAvVectoredHandler(EXCEPTION_POINTERS* ep)
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { }
+
+    // Write a full-memory minidump *with the faulting exception context* so the
+    // managed stack and the corrupted object can be inspected offline with
+    // dotnet-dump / SOS. One-shot (g_lxrAvDumped already claimed above).
+    {
+        const wchar_t* path = L"C:\\temp\\lxr-av.dmp";
+        HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            MINIDUMP_EXCEPTION_INFORMATION mei;
+            mei.ThreadId = GetCurrentThreadId();
+            mei.ExceptionPointers = ep;
+            mei.ClientPointers = FALSE;
+            BOOL ok = MiniDumpWriteDump(proc, GetCurrentProcessId(), h,
+                                        MiniDumpWithFullMemory, &mei, nullptr, nullptr);
+            CloseHandle(h);
+            fprintf(stderr, "LXRGC: [AV] wrote %ls ok=%d\n", path, ok);
+        }
+    }
 
     // Walk the faulting thread's stack from the exception CONTEXT (copy it -
     // StackWalk64 mutates the CONTEXT it is given).
