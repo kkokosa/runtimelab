@@ -928,6 +928,60 @@ repeats. `LXR_NO_REUSE=1` remains available as a diagnostic knob.
 
 ---
 
+##### RESOLVED (2026-07-23) — concurrent decommit-UAF in `DrainZeroCountWorkList`
+
+A residual ~1/40 access violation under the full unified config
+(`LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_GC_THREADS=16`, WebApi warmup) was
+root-caused with an on-fault Vectored Exception Handler (`LXR_AV_STACKS=1`) that
+dumps the faulting native stack only when the fault address lies **inside** the
+LXR heap reservation (a use-after-free, as opposed to a managed null-deref). The
+captured stack was consistently:
+
+```
+LXRCollector::DrainZeroCountWorkList+0x66   (reading a dead object's MethodTable)
+LXRCollector::ProcessModifiedBuffers
+RunLXRCollection  /  LXRCollectorThreadProc
+```
+
+with a round, 4 GiB-aligned fault address inside the reservation but in a
+**decommitted** region.
+
+**Root cause — RC-vs-trace authority desync.** The coalescing-RC recursive-free
+worklist (`DrainZeroCountWorkList`) dereferences the memory of every object whose
+reference count reaches zero. But a mark-authoritative backup trace reclaims
+(`MEM_DECOMMIT`) dead chunks *by mark bits, ignoring RC* — so the RC side table
+keeps a **stale count for an object whose backing page is already gone**. A later
+decrement (e.g. replaying a modified-buffer old value captured *before* that
+sweep) drives the stale count to zero, enqueues the now-dangling pointer, and the
+recursive-free scan reads the decommitted page → AV. (A wild pointer from a
+misparsed field can likewise index a coincidentally-nonzero RC slot.) RC is
+*advisory* between traces; its entries can legitimately reference
+trace-reclaimed memory.
+
+**Fix (two parts, GC-side only, no runtime change).**
+1. **Maintain the invariant `reclaimed ⇒ RC 0`.** Both decommit sites (the sweep
+   in `SweepAndSelectDefrag` and the evacuation free in `Evacuate`) now call
+   `ClearRCRange(Start, UsedEnd)`, zeroing the RC side-table bytes for the
+   reclaimed region (page-walked like `AnyRCNonZeroInRange`, skipping uncommitted
+   RC pages). No stale count survives into a decommitted range.
+2. **Reconcile at the point of use.** `DrainZeroCountWorkList` now confirms each
+   popped object still lies in **committed** memory (one-entry cached
+   `VirtualQuery`, on the STW collection path only) before touching its
+   MethodTable/fields; a decrement targeting already-reclaimed memory is a no-op.
+   This is the correct RC/trace reconciliation — operating only on live memory —
+   not a mask: the object is definitively gone and has no children to release.
+
+**Verified:** rebuilt Release + redeployed; **100 WebApi iterations** (45 s each,
+full unified config, `LXR_AV_STACKS=1`) → **zero in-heap `DrainZeroCountWorkList`
+AVs** (this class fired ~1/40 before, i.e. ~2–3 expected in 100). ConsoleApp
+reclamation smoke clean (`exit 0`, committed footprint stable, not ballooning).
+The one remaining crash observed (1/100) is the *separate*, already-documented
+`DispatchContinuations` concurrent-SATB / .NET 11 runtime-async barrier-bypass
+wall (§ above) — its fault is *outside* the heap reservation (`avDump=false`) and
+is a distinct root cause, still open.
+
+---
+
 **Conclusion: LXR is implementable on the standalone-GC ABI given two small,
 generic, GC-agnostic runtime facilities** — a pluggable write barrier (§5,
 surfaces the old field value; #barrier) and an object-reference-scanning header

@@ -187,6 +187,9 @@ class LXRCollector
 public:
     bool Initialize(uint8_t* heapBase, size_t heapReservedBytes);
 
+    uint8_t* HeapBase()  const { return m_heapBase; }
+    size_t   HeapBytes() const { return m_heapBytes; }
+
     // --- RC side table (1 byte of saturating count per 8-byte granule) ---
     uint8_t* RCSlot(Object* obj) const;
     void RCIncrement(Object* obj);
@@ -305,6 +308,15 @@ public:
     // makes concurrent-trace incompleteness harmless (missed-live objects have
     // RC>=1 and so are protected without relying on the trace).
     bool AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const;
+    // Zero the RC side-table bytes for every granule in [start,end). Called when
+    // a region is reclaimed (decommitted) by the sweep/evac: a reclaimed region's
+    // memory is gone, so its objects' reference counts MUST become zero to keep
+    // the invariant "reclaimed => RC 0". Without this a stale RC>0 survives in a
+    // decommitted range; a later decrement (e.g. a modified-buffer old value
+    // captured before the sweep) drives it to zero, enqueues the now-dangling
+    // pointer, and the recursive-free scan reads the decommitted page -> AV.
+    // Skips uncommitted RC pages (already all-zero); never faults.
+    void ClearRCRange(uint8_t* start, uint8_t* end);
     void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
     int64_t CompleteClosureOverMarked(); // finish pause: close closure over all marked objects
     int64_t MarkModifiedNewValues();     // finish pause: reconcile concurrent-marking race via modified set

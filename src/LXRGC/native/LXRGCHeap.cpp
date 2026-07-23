@@ -263,6 +263,7 @@ static volatile LONG64 g_lxrPhaseSeq = 0;
 static volatile LONG g_lxrWatchdog = 0;
 static LARGE_INTEGER g_lxrQpcFreq = {};
 static void LXRWatchdogThreadProc(void*);
+static LONG CALLBACK LXRAvVectoredHandler(EXCEPTION_POINTERS* ep);
 static inline void LXRSetPhase(const char* name)
 {
     // Single plain pointer store: negligible perturbation, readable post-mortem
@@ -994,9 +995,34 @@ void LXRCollector::DrainZeroCountWorkList()
     // reference; decrement them and cascade. The reference fields are located
     // with the generic runtime object-scanning facility (GCScanObjectRefs),
     // exactly matching the runtime's own go_through_object walk.
+    //
+    // RC vs trace authority: an object's RC can reach zero here for an object the
+    // mark-authoritative backup trace already reclaimed (decommitted) in a prior
+    // cycle - RC is advisory between traces, so the RC side table can still hold
+    // a stale count (or a wild pointer can index a coincidentally-live RC slot).
+    // Dereferencing such a pointer reads a decommitted page and faults. Before
+    // touching any object memory, confirm the address is still committed; if not,
+    // its region is gone and there is nothing to recurse into. A one-entry
+    // VirtualQuery cache keeps this cheap (successive pops usually hit the same
+    // committed region); this runs on the STW collection path, not the barrier.
+    uint8_t* cacheBase = nullptr; size_t cacheLen = 0; bool cacheCommitted = false;
     while (g_zeroCountTop > 0)
     {
         Object* dead = g_zeroCountStack[--g_zeroCountTop];
+        uint8_t* a = (uint8_t*)dead;
+        if (a < m_heapBase || a >= m_heapBase + m_heapBytes)
+            continue; // not our heap
+        if (a < cacheBase || a >= cacheBase + cacheLen)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(a, &mbi, sizeof(mbi)) == 0)
+                continue;
+            cacheBase = (uint8_t*)mbi.BaseAddress;
+            cacheLen = mbi.RegionSize;
+            cacheCommitted = (mbi.State == MEM_COMMIT);
+        }
+        if (!cacheCommitted)
+            continue; // region decommitted (already reclaimed by the trace)
         // A stale/half-initialized referent (null or corrupt MethodTable) must
         // not be dereferenced by the object scan; LXRObjectSize returns 0 for
         // such granules. Skip it - its region was reclaimed or it is not yet a
@@ -1264,6 +1290,38 @@ bool LXRCollector::AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const
         p = pageEnd;
     }
     return false;
+}
+
+// Zero the RC side-table bytes for [start,end) when the region is reclaimed.
+// Symmetric to AnyRCNonZeroInRange: walk the RC-table pages covering the range,
+// skip uncommitted pages (already all-zero), and memset the committed portion so
+// no stale reference count survives into a decommitted region.
+void LXRCollector::ClearRCRange(uint8_t* start, uint8_t* end)
+{
+    if (start < m_heapBase) start = m_heapBase;
+    if (end <= start) return;
+    if (end > m_heapBase + m_heapBytes) end = m_heapBase + m_heapBytes;
+    size_t gStart = (size_t)(start - m_heapBase) / lxr::kObjectGranule;
+    size_t gEnd   = (size_t)(end - m_heapBase + lxr::kObjectGranule - 1) / lxr::kObjectGranule;
+    uint8_t* rcStart = m_rcTable + gStart;                 // one byte per granule
+    uint8_t* rcEnd   = m_rcTable + gEnd;
+    uintptr_t pageMask = (uintptr_t)g_pageSize - 1;
+    uint8_t* p = (uint8_t*)((uintptr_t)rcStart & ~pageMask);
+    while (p < rcEnd)
+    {
+        uint8_t* pageEnd = p + g_pageSize;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
+        {
+            p = pageEnd; // reserved/uncommitted -> RC already all-zero here
+            continue;
+        }
+        uint8_t* scanFrom = (p < rcStart) ? rcStart : p;
+        uint8_t* scanTo   = (pageEnd < rcEnd) ? pageEnd : rcEnd;
+        if (scanTo > scanFrom)
+            memset(scanFrom, 0, (size_t)(scanTo - scanFrom));
+        p = pageEnd;
+    }
 }
 
 // every MARKED object, check that each of its in-heap referents is ALSO marked.
@@ -2340,7 +2398,12 @@ void LXRCollector::SweepAndSelectDefrag()
             InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
         }
         c.Committed = false;
-
+        // Reclaimed => RC 0. Clear this region's RC bytes so no stale count
+        // survives into the decommitted range (a later decrement of a
+        // pre-sweep-logged old value would otherwise resurrect a dangling
+        // pointer and fault in DrainZeroCountWorkList). Only [Start,UsedEnd)
+        // ever held objects/RC; beyond UsedEnd the RC table is already zero.
+        ClearRCRange(c.Start, c.UsedEnd);
         if (g_freeChunkTop == g_freeChunkCap)
         {
             size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
@@ -2700,6 +2763,9 @@ void LXRCollector::Evacuate()
             InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
         }
         c.Committed = false;
+        // Reclaimed => RC 0 (see the sweep decommit site). Bounded to the used
+        // extent that actually held objects/RC.
+        ClearRCRange(c.Start, c.UsedEnd);
         if (g_freeChunkTop == g_freeChunkCap)
         {
             size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
@@ -2900,6 +2966,10 @@ HRESULT LXRGCHeap::Initialize()
             g_theGCToCLR->CreateThread(&LXRWatchdogThreadProc, nullptr, /*is_suspendable*/ false, ".NET LXR watchdog");
         }
         (void)&LXRWatchdogThreadProc;
+        // Diagnostic (LXR_AV_STACKS=1): install a first-chance handler that dumps
+        // the faulting thread's native stack on an AV inside the LXR heap (a UAF).
+        if (getenv("LXR_AV_STACKS") != nullptr)
+            AddVectoredExceptionHandler(1, &LXRAvVectoredHandler);
 
         // Bring up the persistent parallel-mark worker pool now (init time, not
         // during a pause) so parallel drains never create threads under STW.
@@ -3574,6 +3644,107 @@ static void LXRDumpAllThreadStacks()
     CloseHandle(snap);
     fprintf(stderr, "LXRGC: [stacks] ===== end stack dump =====\n");
     fflush(stderr);
+}
+
+// --- On-fault native stack dumper (diagnostic; LXR_AV_STACKS=1) -------------
+// A Vectored Exception Handler that fires on an access violation whose faulting
+// address lies inside the LXR heap reservation - i.e. a use-after-free of a
+// decommitted/reclaimed chunk (our bug), as opposed to a managed
+// NullReferenceException (which faults near address 0 and must pass through
+// untouched). It walks the FAULTING thread's native+managed stack from the
+// exception CONTEXT and classifies the faulting chunk's state, then lets the
+// normal crash path proceed (EXCEPTION_CONTINUE_SEARCH). One-shot.
+static volatile LONG g_lxrAvDumped = 0;
+
+static void LXREnsureSymForFault(HANDLE proc)
+{
+    static volatile LONG s_symInited = 0;
+    if (InterlockedCompareExchange(&s_symInited, 1, 0) != 0)
+        return;
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    const char* symPath =
+        "C:\\github\\runtimelab\\src\\LXRGC\\samples\\WebApi\\publish;"
+        "C:\\github\\runtime\\artifacts\\bin\\coreclr\\windows.x64.Release\\PDB;"
+        "C:\\github\\runtime\\artifacts\\bin\\coreclr\\windows.x64.Release";
+    SymInitialize(proc, symPath, TRUE);
+}
+
+static LONG CALLBACK LXRAvVectoredHandler(EXCEPTION_POINTERS* ep)
+{
+    static int s_enabled = -1;
+    if (s_enabled < 0) s_enabled = (getenv("LXR_AV_STACKS") != nullptr) ? 1 : 0;
+    if (!s_enabled)
+        return EXCEPTION_CONTINUE_SEARCH;
+    EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er == nullptr || er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uint8_t* faultAddr = (er->NumberParameters >= 2) ? (uint8_t*)er->ExceptionInformation[1] : nullptr;
+    uint8_t* base  = g_lxrCollector.HeapBase();
+    size_t   bytes = g_lxrCollector.HeapBytes();
+    // Only OUR bug: a fault INSIDE the LXR heap reservation (a UAF of a
+    // decommitted chunk). Managed null derefs fault near 0 - pass them through.
+    if (base == nullptr || faultAddr < base || faultAddr >= base + bytes)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedCompareExchange(&g_lxrAvDumped, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    HANDLE proc = GetCurrentProcess();
+    LXREnsureSymForFault(proc);
+    DWORD rw = (er->NumberParameters >= 1) ? (DWORD)er->ExceptionInformation[0] : 0;
+    fprintf(stderr, "LXRGC: [AV] ===== access violation in LXR heap =====\n");
+    fprintf(stderr, "LXRGC: [AV] fault %s addr=%p (heap [%p,%p) off=+0x%llx) rip=%p tid=%lu\n",
+            rw == 1 ? "WRITE" : (rw == 8 ? "EXEC" : "READ"), (void*)faultAddr,
+            (void*)base, (void*)(base + bytes), (unsigned long long)(faultAddr - base),
+            (void*)ep->ContextRecord->Rip, GetCurrentThreadId());
+
+    // Classify the containing chunk state at the moment of the fault.
+    __try
+    {
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (faultAddr >= c.Start && faultAddr < c.Start + c.Size)
+            {
+                fprintf(stderr, "LXRGC: [AV] chunk[%zu] [%p,%p) committed=%d freeRun=%d owner=%p usedEnd=%p\n",
+                        i, (void*)c.Start, (void*)(c.Start + c.Size), c.Committed ? 1 : 0,
+                        c.FreeRun ? 1 : 0, (void*)c.Owner, (void*)c.UsedEnd);
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+
+    // Walk the faulting thread's stack from the exception CONTEXT (copy it -
+    // StackWalk64 mutates the CONTEXT it is given).
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 sf; memset(&sf, 0, sizeof(sf));
+    sf.AddrPC.Offset = ctx.Rip;    sf.AddrPC.Mode = AddrModeFlat;
+    sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+    sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+    HANDLE th = GetCurrentThread();
+    for (int frame = 0; frame < 50; frame++)
+    {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, th, &sf, &ctx,
+                         nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+            break;
+        if (sf.AddrPC.Offset == 0) break;
+        DWORD64 disp = 0;
+        char symbuf[sizeof(SYMBOL_INFO) + 512];
+        SYMBOL_INFO* sym = (SYMBOL_INFO*)symbuf;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 512;
+        char modname[128] = "?";
+        DWORD64 modbase = SymGetModuleBase64(proc, sf.AddrPC.Offset);
+        IMAGEHLP_MODULE64 mi; mi.SizeOfStruct = sizeof(mi);
+        if (modbase && SymGetModuleInfo64(proc, modbase, &mi))
+            strncpy(modname, mi.ModuleName, sizeof(modname) - 1);
+        if (SymFromAddr(proc, sf.AddrPC.Offset, &disp, sym))
+            fprintf(stderr, "LXRGC: [AV]     %-16s %s+0x%llx\n", modname, sym->Name, (unsigned long long)disp);
+        else
+            fprintf(stderr, "LXRGC: [AV]     %-16s 0x%llx\n", modname, (unsigned long long)sf.AddrPC.Offset);
+    }
+    fprintf(stderr, "LXRGC: [AV] ===== end AV dump =====\n");
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void LXRWatchdogThreadProc(void*)
