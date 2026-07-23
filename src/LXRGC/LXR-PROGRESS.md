@@ -22,7 +22,7 @@ Legend: ✅ conformant · ⚠️ partial / approximated · ❌ divergent (shortc
 | # | Paper mechanism (citation) | Our code | Status |
 |---|---|---|---|
 | **A** | **Coalescing field-logging barrier**: per-field **unlogged bit**; log each field **once per epoch** (first write pushes old→`decbuf`, addr→`modbuf`); ignore intermediate referents; unlogged bit reset at RC pause; new objects born "logged" so barrier elides young (§3.4, Fig.3) | **A(i)+A(ii) landed** (`parity-a1`, `parity-a2`): the barrier now carries a per-field **unlogged-bit side table** (`m_loggedTable`, 1 bit/8-byte slot) — `TryFirstLogField` test-and-sets it so RC-`modbuf` + SATB append **exactly once per field per epoch** (`LogModifiedField`); bits are cleared per-consumed-field at each RC pause (`ClearLoggedBit`, O(modified fields)) or wholesale on a buffer-overflow epoch (`ResetLoggedTable`). Logged pages are committed off the barrier on the alloc path (`EnsureLoggedUpTo`). Coalescing is now at the **source** (Levanoni-Petrank), matching the paper; this drastically cuts buffer traffic and the overflow→O(heap) fallback frequency. (Young still handled via `LXR_YOUNG_RC` RC-skip, not birth-logged elision — see D.) | ✅ |
-| **B** | RC pause applies **all increments, then all decrements** (§3.2.1); **root deferral** — increment root-reachable at tₙ, buffer matching decrement for tₙ₊₁ (§2.1) | **Ordering fixed** (`ProcessModifiedBuffers` now applies all increments before any decrement, matching the concurrent path). **Root deferral still pending** — roots kept live only by the mark trace, so RC cannot yet stand alone. | ⚠️ |
+| **B** | RC pause applies **all increments, then all decrements** (§3.2.1); **root deferral** — increment root-reachable at tₙ, buffer matching decrement for tₙ₊₁ (§2.1) | **Ordering + root deferral landed** (`parity-b`): all increments precede all decrements on both RC paths, and `CaptureRoots` now scans handles + stack/static/finalizer roots at each RC STW pause, increments each unique in-heap referent, and buffers a matching decrement for the next pause (`m_rootDeferredPrev`/`m_rootDeferredSnap`, rotated in `ProcessModifiedBuffers`/`ProcessSnapshotDecrements`). RC is now **self-standing** (root-reachable mature objects hold RC ≥ 1 for their rooted epoch) instead of relying on the mark trace to protect roots — the prerequisite for young-at-RC-pause reclaim (D). (Young referents are RC-skipped, per D.) | ✅ |
 | **C** | SATB trace **spans multiple RC epochs**; completes **concurrently, no STW finish** (checked at next RC pause); invariant: RC may never delete an unmarked object mid-trace → **mark+scan any mature object RC kills** if not already marked (§3.2.3) | Single snapshot→drain→**STW finish pause** per trace cycle (`ConcurrentTraceFinish`); does not span epochs; uses a final root+handle rescan + (overflow-only) closure instead of the mark-on-RC-death rule. Sound, but structurally different. | ⚠️ |
 | **D** | **Implicitly-dead young**: young objects with no increment are reclaimed **at the RC pause**, before decrements; young survivors (0→1 increment) **copied at that pause** to defragment (§2.1, §3.3.1–3) | Young excluded from RC (`IsYoung`), kept alive by trace/allocate-black, reclaimed only on a **trace/sweep** cycle; no young-survivor copy-at-RC-pause. Leans on the trace. | ⚠️ |
 | **E** | Triggers: RC = heap-full OR increment-threshold OR **young-survival predictor** (1:3 biased exp decay, 128 MB default); SATB = free-block threshold OR **wastage predictor** (live-block, 1:3 decay, 5% default) (§3.2.2, §3.2.5) | Allocation-growth trigger + a single **survival EWMA (7:1)** scaling the epoch cap + epochs-since-trace. No increment/wastage/free-block predictors. | ⚠️ |
@@ -51,7 +51,7 @@ identity issues. Reaching 1:1 parity means restoring **precise, primary RC** fir
    - **A(ii) full parity:** an **unlogged-bit side table** so the barrier logs each
      field **once per epoch** (matches the paper's 1.6% overhead, eliminates buffer
      bloat, and **subsumes the SATB/modified-buffer overflow → O(heap) fallback**). ✅
-2. **B —** inc-before-dec on the STW RC path + **root deferral** (RC accounts roots).
+2. **B —** inc-before-dec on the STW RC path + **root deferral** (RC accounts roots). ✅ **DONE**
 3. **D —** implicitly-dead-young reclaim + young-survivor copy at the RC pause.
 4. **C —** multi-epoch SATB + mark-on-RC-death; drop the STW finish closure.
 5. **E / F / G —** survival + wastage predictors; evac-set-scoped remsets with
@@ -103,3 +103,15 @@ Workstation GC. Regenerate `results/report.html`.
   (`EnsureLoggedUpTo`) — never from the cooperative-mode barrier (which cannot safely
   VirtualAlloc). A ⚠️→✅. Verified: build green, ConsoleApp smoke exit 0, WebApi 6/6
   clean (av=0) under the full unified config.
+- **2026-07-23** — **B root deferral landed → B complete.** Added `CaptureRoots`,
+  which scans handles + stack/static/finalizer roots (`GcScanRoots`, resolving
+  interior pointers) into a de-duplicated set at each RC STW pause. Each RC pause
+  now increments the current root referents and decrements the previous pause's set
+  (`m_rootDeferredPrev`, rotated in `ProcessModifiedBuffers` on the STW/finish path
+  and via `m_rootDeferredSnap` across `SnapshotModifiedBuffers`→`ProcessSnapshot-
+  Decrements` on the concurrent path). Root-reachable mature objects now hold RC ≥ 1
+  for their rooted epoch, so RC is self-standing rather than reliant on the mark
+  trace to protect roots (Deutsch-Bobrow deferral, paper §2.1/§3.2.1). The deferral
+  chain is balanced across every processing pause (each captured set is decremented
+  exactly once at the following pause). B ⚠️→✅. Verified: build green, ConsoleApp
+  smoke exit 0, WebApi 6/6 clean (av=0) under the full unified config.

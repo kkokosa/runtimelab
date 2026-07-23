@@ -233,6 +233,16 @@ public:
     void SnapshotModifiedBuffers();
     void ProcessSnapshotDecrements();
 
+    // Deferred reference counting for ROOTS (Deutsch-Bobrow; paper §2.1/§3.2.1).
+    // Root->heap pointers are not barriered, so at each RC pause LXR scans the
+    // roots, applies ONE increment to each root-reachable object, and buffers a
+    // matching decrement for the NEXT pause. This keeps a root-only-reachable
+    // (mature) object's count >= 1 for the epoch it is rooted, making RC
+    // self-standing instead of relying on the mark trace to protect roots.
+    // CaptureRoots collects the current unique in-heap root+handle referents; it
+    // MUST be called under STW (GcScanRoots requires a suspended EE).
+    void CaptureRoots(std::vector<Object*>& out);
+
     // --- SATB (snapshot-at-the-beginning) deletion barrier (P2) ---
     //
     // While a (future concurrent, P4) trace window is open, the barrier logs the
@@ -394,6 +404,13 @@ private:
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block
     size_t          m_blockCount = 0;
     volatile int64_t m_reclaimedBytes = 0;   // cumulative bytes decommitted by sweeps
+    // Deferred-RC root buffers (see CaptureRoots). Only ever touched by the single
+    // collection thread, at STW pauses or the serialized off-pause drain, so no
+    // lock is needed. m_rootDeferredPrev holds the objects incremented at the
+    // previous RC pause (to be decremented at the next); m_rootDeferredSnap holds
+    // the roots captured at a concurrent snapshot pause for the off-pause replay.
+    std::vector<Object*> m_rootDeferredPrev;
+    std::vector<Object*> m_rootDeferredSnap;
     CRITICAL_SECTION m_collectLock{};
 };
 extern LXRCollector g_lxrCollector;

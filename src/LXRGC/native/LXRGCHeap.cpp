@@ -2028,6 +2028,13 @@ void LXRCollector::ProcessModifiedBuffers()
         buf->Count = 0; // epoch consumed
     }
     LeaveCriticalSection(&g_buffersLock);
+    // Deferred-RC root capture (paper §3.2.1): scan the roots at this STW pause so
+    // root-reachable mature objects are incremented now and decremented at the
+    // next pause (m_rootDeferredPrev). This is what makes RC self-standing rather
+    // than reliant on the mark trace to protect roots. Safe here: ProcessModified-
+    // Buffers is only ever called under SuspendEE (STW / concurrent-finish pause).
+    std::vector<Object*> rootsNow;
+    CaptureRoots(rootsNow);
     // Increments before decrements (paper B/§3.2.1): apply ALL increments of the
     // final referents first, so an object that gains a new reference this epoch is
     // never transiently driven to zero (and freed) by an earlier field's decrement.
@@ -2037,12 +2044,18 @@ void LXRCollector::ProcessModifiedBuffers()
         if (newValue != nullptr)
             RCIncrement(newValue);
     }
+    for (Object* r : rootsNow)          // root increments (this epoch's root set)
+        RCIncrement(r);
     for (const auto& kv : coalesced)
     {
         Object* oldValue = kv.second;
         if (oldValue != nullptr && RCDecrement(oldValue))
             EnqueueZeroCount(oldValue);
     }
+    for (Object* r : m_rootDeferredPrev) // deferred root decrements (prior epoch)
+        if (RCDecrement(r))
+            EnqueueZeroCount(r);
+    m_rootDeferredPrev.swap(rootsNow);   // this epoch's roots -> next epoch's decs
     DrainZeroCountWorkList();
     // Restore the unlogged-bit invariant for the next epoch: every set logged bit
     // must correspond to a currently-buffered field. On a modified-buffer overflow
@@ -2095,6 +2108,10 @@ void LXRCollector::SnapshotModifiedBuffers()
         g_rcSnapEntries[g_rcSnapCount].NewValue = *(kv.first);
         g_rcSnapCount++;
     }
+    // Deferred-RC root capture at this STW snapshot pause (paper §3.2.1): stash the
+    // current root set for the off-pause replay in ProcessSnapshotDecrements, which
+    // increments it and rotates the deferred-decrement chain.
+    CaptureRoots(m_rootDeferredSnap);
     // Restore the unlogged-bit invariant (see ProcessModifiedBuffers): STW here
     // (the snapshot pause), so clear the consumed fields' bits (or wholesale on a
     // buffer overflow) before mutators resume logging into the fresh epoch.
@@ -2125,12 +2142,19 @@ void LXRCollector::ProcessSnapshotDecrements()
         if (newValue != nullptr)
             RCIncrement(newValue);
     }
+    for (Object* r : m_rootDeferredSnap)  // root increments captured at the pause
+        RCIncrement(r);
     for (size_t i = 0; i < g_rcSnapCount; i++)
     {
         Object* oldValue = g_rcSnapEntries[i].OldValue;
         if (oldValue != nullptr && RCDecrement(oldValue))
             EnqueueZeroCount(oldValue);
     }
+    for (Object* r : m_rootDeferredPrev)  // deferred root decrements (prior pause)
+        if (RCDecrement(r))
+            EnqueueZeroCount(r);
+    m_rootDeferredPrev.swap(m_rootDeferredSnap); // rotate the deferral chain
+    m_rootDeferredSnap.clear();
     g_rcSnapCount = 0;
     DrainZeroCountWorkList();
     LeaveCriticalSection(&m_collectLock);
@@ -2191,6 +2215,58 @@ static void LXRPromoteRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t f
         }
     }
     g_lxrCollector.PushMark(o);
+}
+
+// --- Deferred-RC root capture (paper §2.1/§3.2.1) --------------------------
+// Collect (not mark) the current unique in-heap root+handle referents so the RC
+// pause can increment them and defer a matching decrement to the next pause. The
+// collection target is a thread-local-free file static because GcScanRoots only
+// accepts a bare function pointer; CaptureRoots sets it around the scan and all
+// capture callbacks run on that single collector thread, under STW.
+static std::unordered_set<Object*>* g_rootDeferralCollect = nullptr;
+
+static void LXRCollectHandleRoot(Object** ref, void* /*ctx*/)
+{
+    Object* o = (ref != nullptr) ? *ref : nullptr;
+    if (o != nullptr && g_rootDeferralCollect != nullptr)
+        g_rootDeferralCollect->insert(o);
+}
+
+static void LXRCollectRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
+{
+    Object* o = *ppObj;
+    if (o == nullptr)
+        return;
+    if (flags & GC_CALL_INTERIOR)
+    {
+        // Resolve to the containing object. If it cannot be resolved, skip it for
+        // RC deferral: the mark trace already keeps such a region alive
+        // conservatively (ConservativelyKeepAliveInterior), so RC need not.
+        o = g_lxrCollector.ResolveInterior((uint8_t*)o);
+        if (o == nullptr)
+            return;
+    }
+    if (g_rootDeferralCollect != nullptr)
+        g_rootDeferralCollect->insert(o);
+}
+
+// Scan handles + stack/static/finalizer roots into `out` as a de-duplicated set
+// of referents. MUST run under STW (GcScanRoots requires a suspended EE). Young
+// and off-heap referents are collected too but are no-ops under RCIncrement/
+// RCDecrement, so callers need not filter them.
+void LXRCollector::CaptureRoots(std::vector<Object*>& out)
+{
+    out.clear();
+    if (g_theGCToCLR == nullptr)
+        return;
+    std::unordered_set<Object*> seen;
+    g_rootDeferralCollect = &seen;
+    LXRGCHandleStore::ForEachLiveHandle(&LXRCollectHandleRoot, nullptr);
+    ScanContext sc;
+    sc.promotion = true;
+    g_theGCToCLR->GcScanRoots(&LXRCollectRoot, 2, 2, &sc);
+    g_rootDeferralCollect = nullptr;
+    out.assign(seen.begin(), seen.end());
 }
 
 void LXRCollector::BackupTrace()
