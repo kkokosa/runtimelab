@@ -21,7 +21,7 @@ Legend: ✅ conformant · ⚠️ partial / approximated · ❌ divergent (shortc
 
 | # | Paper mechanism (citation) | Our code | Status |
 |---|---|---|---|
-| **A** | **Coalescing field-logging barrier**: per-field **unlogged bit**; log each field **once per epoch** (first write pushes old→`decbuf`, addr→`modbuf`); ignore intermediate referents; unlogged bit reset at RC pause; new objects born "logged" so barrier elides young (§3.4, Fig.3) | **A(i) landed** (`parity-a1`): both RC paths now **coalesce per field at processing time** — one decrement of the first-logged old value + one increment of the final `*slot` per modified field — so counts are **precise** (`ProcessModifiedBuffers`/`SnapshotModifiedBuffers`). **A(ii) pending:** barrier still logs every store (no per-field unlogged bit), so it does redundant work + can overflow the buffers → O(heap) fallback. | ⚠️ |
+| **A** | **Coalescing field-logging barrier**: per-field **unlogged bit**; log each field **once per epoch** (first write pushes old→`decbuf`, addr→`modbuf`); ignore intermediate referents; unlogged bit reset at RC pause; new objects born "logged" so barrier elides young (§3.4, Fig.3) | **A(i)+A(ii) landed** (`parity-a1`, `parity-a2`): the barrier now carries a per-field **unlogged-bit side table** (`m_loggedTable`, 1 bit/8-byte slot) — `TryFirstLogField` test-and-sets it so RC-`modbuf` + SATB append **exactly once per field per epoch** (`LogModifiedField`); bits are cleared per-consumed-field at each RC pause (`ClearLoggedBit`, O(modified fields)) or wholesale on a buffer-overflow epoch (`ResetLoggedTable`). Logged pages are committed off the barrier on the alloc path (`EnsureLoggedUpTo`). Coalescing is now at the **source** (Levanoni-Petrank), matching the paper; this drastically cuts buffer traffic and the overflow→O(heap) fallback frequency. (Young still handled via `LXR_YOUNG_RC` RC-skip, not birth-logged elision — see D.) | ✅ |
 | **B** | RC pause applies **all increments, then all decrements** (§3.2.1); **root deferral** — increment root-reachable at tₙ, buffer matching decrement for tₙ₊₁ (§2.1) | **Ordering fixed** (`ProcessModifiedBuffers` now applies all increments before any decrement, matching the concurrent path). **Root deferral still pending** — roots kept live only by the mark trace, so RC cannot yet stand alone. | ⚠️ |
 | **C** | SATB trace **spans multiple RC epochs**; completes **concurrently, no STW finish** (checked at next RC pause); invariant: RC may never delete an unmarked object mid-trace → **mark+scan any mature object RC kills** if not already marked (§3.2.3) | Single snapshot→drain→**STW finish pause** per trace cycle (`ConcurrentTraceFinish`); does not span epochs; uses a final root+handle rescan + (overflow-only) closure instead of the mark-on-RC-death rule. Sound, but structurally different. | ⚠️ |
 | **D** | **Implicitly-dead young**: young objects with no increment are reclaimed **at the RC pause**, before decrements; young survivors (0→1 increment) **copied at that pause** to defragment (§2.1, §3.3.1–3) | Young excluded from RC (`IsYoung`), kept alive by trace/allocate-black, reclaimed only on a **trace/sweep** cycle; no young-survivor copy-at-RC-pause. Leans on the trace. | ⚠️ |
@@ -44,13 +44,13 @@ identity issues. Reaching 1:1 parity means restoring **precise, primary RC** fir
 
 ## Fix roadmap (in priority order)
 
-1. **A — precise coalescing RC** (restores LXR's core identity):
+1. **A — precise coalescing RC** (restores LXR's core identity): ✅ **DONE**
    - **A(i) correctness:** dedup per field at processing — first logged `oldValue` +
      one increment of the final `*slot` — so counts are precise even with the current
-     per-store log. Small, isolated change in the RC processing loops.
+     per-store log. Small, isolated change in the RC processing loops. ✅
    - **A(ii) full parity:** an **unlogged-bit side table** so the barrier logs each
      field **once per epoch** (matches the paper's 1.6% overhead, eliminates buffer
-     bloat, and **subsumes the SATB/modified-buffer overflow → O(heap) fallback**).
+     bloat, and **subsumes the SATB/modified-buffer overflow → O(heap) fallback**). ✅
 2. **B —** inc-before-dec on the STW RC path + **root deferral** (RC accounts roots).
 3. **D —** implicitly-dead-young reclaim + young-survivor copy at the RC pause.
 4. **C —** multi-epoch SATB + mark-on-RC-death; drop the STW finish closure.
@@ -90,3 +90,16 @@ Workstation GC. Regenerate `results/report.html`.
   decrement. RC counts are now precise. A ❌→⚠️ (A(ii) unlogged bit still pending),
   B ❌→⚠️ (ordering fixed; root deferral pending). Verified: ConsoleApp reclaim smoke
   exit 0, WebApi 6/6 clean (av=0) under the full unified config.
+- **2026-07-23** — **A(ii) unlogged-bit side table landed → A complete.** Added a
+  per-field logged bitmap (`m_loggedTable`, 1 bit/8-byte slot, mirrors the mark
+  table). The barrier (`LogModifiedField`) now gates the RC modified-buffer append
+  and the SATB deletion append on `TryFirstLogField` (atomic test-and-set), so each
+  field is logged **exactly once per epoch** (source-level Levanoni-Petrank
+  coalescing); the remset append stays per-store (its membership depends on the new
+  value). Bits are cleared per consumed field at each RC pause (`ClearLoggedBit`) or
+  wholesale on a modified-buffer overflow (`ResetLoggedTable`), keeping the
+  set-bits==buffered-fields invariant so no stale bit crosses an epoch/trace start.
+  Bitmap pages are committed off the barrier on the allocation path
+  (`EnsureLoggedUpTo`) — never from the cooperative-mode barrier (which cannot safely
+  VirtualAlloc). A ⚠️→✅. Verified: build green, ConsoleApp smoke exit 0, WebApi 6/6
+  clean (av=0) under the full unified config.

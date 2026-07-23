@@ -687,6 +687,17 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     if (m_markTable == nullptr)
         return false;
 
+    // Coalescing "unlogged bit" side table (paper A(ii)): 1 bit per 8-byte field
+    // slot. Reserved only; the covering pages are committed on the allocation path
+    // (EnsureLoggedUpTo), never from the cooperative-mode barrier (which cannot
+    // safely VirtualAlloc). Bits are cleared per consumed field at each RC pause
+    // (and wholesale on an overflow epoch). Same geometry as the mark table (slots
+    // are 8-byte aligned on amd64).
+    size_t loggedTableBytes = (heapReservedBytes / lxr::kObjectGranule + 7) / 8;
+    m_loggedTable = (uint8_t*)VirtualAlloc(nullptr, loggedTableBytes, MEM_RESERVE, PAGE_READWRITE);
+    if (m_loggedTable == nullptr)
+        return false;
+
     // Per-block metadata: one entry per 32 KiB block. Small enough to commit.
     m_blockCount = heapReservedBytes / lxr::kBlockSize;
     size_t metaBytes = m_blockCount * sizeof(lxr::BlockMeta);
@@ -835,6 +846,80 @@ static void EnsureThreadBuffers()
     }
 }
 
+// Extend the committed logged-table prefix to cover [heapBase, addrEnd). Called
+// OFF the barrier, on the allocation/heap-commit path (a proper frame where
+// VirtualAlloc is safe), so the barrier itself never has to commit a reserved
+// bitmap page - doing so from the cooperative-mode barrier could deadlock
+// SuspendEE (VirtualAlloc takes the address-space lock). Because objects are
+// always allocated before their fields are stored, every field slot's logged
+// page is committed here before any barrier can touch it. Fresh MEM_COMMIT pages
+// are zero-filled by the OS (bit clear == "unlogged"), so no memset is needed.
+void LXRCollector::EnsureLoggedUpTo(uint8_t* addrEnd)
+{
+    if (m_loggedTable == nullptr || addrEnd <= m_heapBase)
+        return;
+    size_t usedBytes = (size_t)(addrEnd - m_heapBase);
+    size_t neededBytes = (usedBytes / lxr::kObjectGranule + 7) / 8;
+    neededBytes = (neededBytes + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
+    size_t cap = (m_heapBytes / lxr::kObjectGranule + 7) / 8;
+    if (neededBytes > cap)
+        neededBytes = cap;
+    if (neededBytes > m_loggedCommittedBytes)
+    {
+        uint8_t* from = m_loggedTable + m_loggedCommittedBytes;
+        size_t delta = neededBytes - m_loggedCommittedBytes;
+        if (VirtualAlloc(from, delta, MEM_COMMIT, PAGE_READWRITE) != nullptr)
+            m_loggedCommittedBytes = neededBytes; // publish AFTER the commit succeeds
+    }
+}
+
+// Unlogged-bit test-and-set (paper §3.4). Returns true the FIRST time a field is
+// stored this epoch (so the barrier logs it exactly once), false thereafter.
+// Off-heap slots always log (no coalescing metadata). If the covering bitmap page
+// is not yet committed (a store racing ahead of the allocation-path commit -
+// vanishingly rare), we log without coalescing rather than fault or commit here.
+// Hot path: one monotonic-watermark compare + one word read + at most one atomic.
+bool LXRCollector::TryFirstLogField(Object** slot)
+{
+    uint8_t* p = (uint8_t*)slot;
+    if (p < m_heapBase || p >= m_heapBase + m_heapBytes)
+        return true;
+    size_t granule = (size_t)(p - m_heapBase) / lxr::kObjectGranule;
+    size_t byteOff = granule >> 3;
+    if (byteOff >= m_loggedCommittedBytes)
+        return true; // logged-table page not committed yet: log uncoalesced (sound)
+    LONG* word = (LONG*)m_loggedTable + (granule >> 5);
+    LONG mask = (LONG)(1u << (granule & 31));
+    if (*(volatile LONG*)word & mask)
+        return false; // already logged this epoch
+    return (InterlockedOr(word, mask) & mask) == 0; // win iff we flipped 0->1
+}
+
+// Clear a single field's logged bit as its modified-buffer entry is consumed at
+// the RC pause (O(modified fields)). Non-atomic: called only under STW.
+void LXRCollector::ClearLoggedBit(Object** slot)
+{
+    uint8_t* p = (uint8_t*)slot;
+    if (p < m_heapBase || p >= m_heapBase + m_heapBytes)
+        return;
+    size_t granule = (size_t)(p - m_heapBase) / lxr::kObjectGranule;
+    size_t byteOff = granule >> 3;
+    if (byteOff >= m_loggedCommittedBytes)
+        return;
+    LONG* word = (LONG*)m_loggedTable + (granule >> 5);
+    *word &= ~(LONG)(1u << (granule & 31));
+}
+
+// Wholesale-clear the entire committed logged-table prefix. Used on a
+// buffer-overflow epoch, where some set bits have no consumable buffer entry, so
+// per-field ClearLoggedBit cannot restore the set-bits==buffered-fields invariant.
+// STW only (memset is non-atomic).
+void LXRCollector::ResetLoggedTable()
+{
+    if (m_loggedTable != nullptr && m_loggedCommittedBytes > 0)
+        memset(m_loggedTable, 0, m_loggedCommittedBytes);
+}
+
 // LXR write-barrier slow path. Reached from the runtime's generic Callback
 // write barrier (WriteBarrierKind::Callback) on every in-heap reference-field
 // store, carrying the OLD value the runtime just overwrote.
@@ -850,34 +935,50 @@ static void EnsureThreadBuffers()
 // force this cycle's trace to re-close from roots, rather than allocate here.
 void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* newValue)
 {
-    // (1) Coalescing-RC modified buffer: record (slot, oldValue) on mutation.
-    ModifiedBuffer* buf = t_modifiedBuffer;
-    if (buf != nullptr && buf->Count < ModifiedBuffer::kCapacity)
+    // Coalescing unlogged bit (paper §3.4): log each field at most once per epoch.
+    // The FIRST store this epoch captures the epoch-start referent (oldValue) for
+    // both the RC decrement and the SATB snapshot; later stores to the same field
+    // are elided - their intermediate old values net to zero for RC (processing
+    // re-reads the slot's final value) and are post-snapshot for SATB. The bit is
+    // cleared per consumed field at the RC pause. An epoch begins AT an RC pause,
+    // which is also where a trace snapshot is taken, so the first post-pause
+    // overwrite of a field yields exactly its snapshot-time value (Yuasa-correct).
+    bool firstLog = TryFirstLogField(slot);
+
+    // (1) Coalescing-RC modified buffer: record (slot, oldValue) on the first
+    //     mutation of this field this epoch.
+    if (firstLog)
     {
-        buf->Entries[buf->Count].Slot = slot;
-        buf->Entries[buf->Count].OldValue = oldValue;
-        buf->Count++;
-        InterlockedIncrement64(&g_lxrCounters.ModifiedBufferEntries);
-    }
-    else if (g_satbActive)
-    {
-        // Buffer absent/full during a trace window: a written slot is dropped, so
-        // the finish-pause modified-set race reconciliation (MarkModifiedNewValues)
-        // could miss a reference installed into an already-scanned object. Fall
-        // back to the full closure this cycle.
-        InterlockedExchange(&g_modifiedOverflow, 1);
+        ModifiedBuffer* buf = t_modifiedBuffer;
+        if (buf != nullptr && buf->Count < ModifiedBuffer::kCapacity)
+        {
+            buf->Entries[buf->Count].Slot = slot;
+            buf->Entries[buf->Count].OldValue = oldValue;
+            buf->Count++;
+            InterlockedIncrement64(&g_lxrCounters.ModifiedBufferEntries);
+        }
+        else
+        {
+            // First-log entry dropped (buffer absent/full): a logged bit is now
+            // set with no matching buffer entry, breaking the
+            // set-bits==buffered-fields invariant. Force a wholesale logged-table
+            // reset (ResetLoggedTable) + the sound full closure this epoch at the
+            // pause. Buffer-absent is vanishingly rare (a store before this
+            // thread's first allocation).
+            InterlockedExchange(&g_modifiedOverflow, 1);
+        }
     }
     // A production LXR flushes a full buffer into a shared queue; omitted here.
     // Once full we simply stop recording further entries this epoch.
 
     // (2) SATB deletion barrier (Yuasa): while a trace window is open, retain the
     //     overwritten referent so a concurrent marker (P4) cannot miss an object
-    //     unlinked mid-trace. Over-retention for one cycle is always safe;
-    //     dropping an entry is not (a lost old value is an object the concurrent
-    //     marker may never reach) - so on absence/overflow we set g_satbOverflow
-    //     and the STW finish pause falls back to a full, sound from-roots closure
-    //     (ConcurrentTraceFinish) that needs no SATB entry at all.
-    if (g_satbActive && oldValue != nullptr && InHeap(oldValue))
+    //     unlinked mid-trace. Gated on firstLog so the retained value is the
+    //     snapshot-time referent (the epoch/trace starts at the RC pause).
+    //     Over-retention for one cycle is always safe; dropping an entry is not -
+    //     so on absence/overflow we set g_satbOverflow and the STW finish pause
+    //     falls back to a full, sound from-roots closure (ConcurrentTraceFinish).
+    if (firstLog && g_satbActive && oldValue != nullptr && InHeap(oldValue))
     {
         SatbBuffer* sb = t_satbBuffer;
         if (sb != nullptr && sb->Count < SatbBuffer::kCapacity)
@@ -895,8 +996,11 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
 
     // (3) Remembered set: record slots that now hold an inter-block pointer, so
     //     evacuation (P3) can locate and rewrite references into a moved block.
-    //     A dropped entry is safe: Evacuate() also forwards the fields of every
-    //     marked object, so remsets are an optimization, not the sole fix-up path.
+    //     NOT coalesced on firstLog: a field's remset membership depends on the
+    //     NEW value's block, which changes store-to-store, so a later inter-block
+    //     store to an already-logged field must still be recorded. A dropped entry
+    //     is safe: Evacuate() also forwards the fields of every marked object, so
+    //     remsets are an optimization, not the sole fix-up path.
     if (g_remsetActive && newValue != nullptr && InHeap(newValue) && InHeap((Object*)slot))
     {
         uintptr_t sblk = (uintptr_t)slot     & ~(lxr::kBlockSize - 1);
@@ -1940,6 +2044,16 @@ void LXRCollector::ProcessModifiedBuffers()
             EnqueueZeroCount(oldValue);
     }
     DrainZeroCountWorkList();
+    // Restore the unlogged-bit invariant for the next epoch: every set logged bit
+    // must correspond to a currently-buffered field. On a modified-buffer overflow
+    // some first-logs set a bit without leaving a buffer entry, so wholesale-clear;
+    // otherwise clear exactly the coalesced (now-consumed) fields - O(modified
+    // fields), NOT O(heap). Under STW here, so the non-atomic clears are safe.
+    if (g_modifiedOverflow)
+        ResetLoggedTable();
+    else
+        for (const auto& kv : coalesced)
+            ClearLoggedBit(kv.first);
     LeaveCriticalSection(&m_collectLock);
     InterlockedExchange(&g_modifiedOverflow, 0);
 }
@@ -1981,6 +2095,14 @@ void LXRCollector::SnapshotModifiedBuffers()
         g_rcSnapEntries[g_rcSnapCount].NewValue = *(kv.first);
         g_rcSnapCount++;
     }
+    // Restore the unlogged-bit invariant (see ProcessModifiedBuffers): STW here
+    // (the snapshot pause), so clear the consumed fields' bits (or wholesale on a
+    // buffer overflow) before mutators resume logging into the fresh epoch.
+    if (g_modifiedOverflow)
+        ResetLoggedTable();
+    else
+        for (const auto& kv : coalesced)
+            ClearLoggedBit(kv.first);
     LeaveCriticalSection(&g_buffersLock);
     InterlockedExchange(&g_modifiedOverflow, 0);
 }
@@ -3188,6 +3310,10 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
                 return nullptr;
             th.CommitEnd += commitSize;
             InterlockedExchangeAdd64(&g_committedInUse, (int64_t)commitSize);
+            // Commit the covering unlogged-bit (logged-table) pages for the newly
+            // committed heap here, off the barrier, so the cooperative-mode barrier
+            // never faults on or has to commit a reserved bitmap page.
+            g_lxrCollector.EnsureLoggedUpTo(th.CommitEnd);
         }
 
         uint8_t* rawStart = th.NextFree;

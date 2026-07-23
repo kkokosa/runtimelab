@@ -208,6 +208,22 @@ public:
     //     runtime call this on ordinary field writes. See FEASIBILITY.md. ***
     void LogModifiedField(Object** slot, Object* oldValue, Object* newValue);
 
+    // Coalescing "unlogged bit" (paper A(ii), §3.4). TryFirstLogField returns true
+    // exactly once per field per epoch (the first store), so the barrier logs each
+    // modified field once (one RC dec of the t_n referent + one SATB snapshot
+    // entry), matching Levanoni-Petrank coalescing at the source instead of at
+    // processing time. ClearLoggedBit resets a field's bit as its buffer entry is
+    // consumed at the RC pause (O(modified fields), not O(heap)); ResetLoggedTable
+    // wholesale-clears the committed prefix on a buffer-overflow epoch.
+    bool TryFirstLogField(Object** slot);
+    void ClearLoggedBit(Object** slot);
+    void ResetLoggedTable();
+
+    // Extend the committed logged-table (unlogged-bit) prefix to cover
+    // [heapBase, addrEnd). Called on the allocation/heap-commit path so the
+    // cooperative-mode barrier never has to commit a reserved bitmap page.
+    void EnsureLoggedUpTo(uint8_t* addrEnd);
+
     // Replays every mutator's modified buffer: increment new referents,
     // decrement old referents, then process the resulting zero-count work
     // list (recursive decrements). This is coalescing RC.
@@ -360,6 +376,7 @@ private:
     // evacuation-destination space that sits above the trace-time high-water.
     void EnsureMarkCommitted(uint8_t* addrEnd);
 
+
     bool InHeap(Object* obj) const
     {
         return (uint8_t*)obj >= m_heapBase && (uint8_t*)obj < m_heapBase + m_heapBytes;
@@ -372,6 +389,8 @@ private:
     size_t          m_markCommittedBytes = 0; // committed+zeroed mark-table prefix (bytes)
     uint8_t*        m_lineMarkTable = nullptr;   // 1 bit / 256 B line (Immix line reuse)
     size_t          m_lineMarkCommittedBytes = 0; // committed+zeroed line-table prefix (bytes)
+    uint8_t*        m_loggedTable = nullptr;  // 1 bit / 8 heap bytes: per-field "logged this epoch" (coalescing unlogged bit, paper A(ii))
+    size_t          m_loggedCommittedBytes = 0; // committed logged-table prefix (bytes)
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block
     size_t          m_blockCount = 0;
     volatile int64_t m_reclaimedBytes = 0;   // cumulative bytes decommitted by sweeps
