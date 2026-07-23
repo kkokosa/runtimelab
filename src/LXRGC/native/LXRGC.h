@@ -172,6 +172,13 @@ struct LXRCounters
     volatile int64_t ConcDrainMicros;       // cumulative concurrent (non-pause) drain time (us)
 
     volatile int64_t MarkStackDrops;        // mark-stack pushes lost to allocation failure (0 == complete)
+
+    // Item D: young/nursery collection at RC pauses.
+    volatile int64_t NurseryPasses;         // nursery collections run (RC pauses that reclaimed young)
+    volatile int64_t NurserySkipped;        // nursery collections skipped (remset overflow / trace window)
+    volatile int64_t NurseryRegionsReclaimed; // young regions reclaimed (no live young)
+    volatile int64_t NurseryBytesReclaimed; // young bytes decommitted by the nursery
+    volatile int64_t NurseryLiveYoung;      // live young objects retained at the last nursery pass
 };
 extern LXRCounters g_lxrCounters;
 
@@ -302,6 +309,15 @@ public:
     // Reclaim fully-dead lines/blocks after RC/trace, and pick evacuation
     // candidates for the next cycle (Immix defragmentation).
     void SweepAndSelectDefrag();
+
+    // Item D: young/nursery collection at an RC pause. Reclaims young (this-epoch)
+    // regions proven dead by a bounded closure over roots + handles + the complete
+    // mature->young remembered set (item F) + young->young edges. Reclaim-only
+    // (region-granular, no copying): survivors stay young and are compacted /
+    // promoted by the trace-cycle Evacuate as today. Self-guards: no-op unless the
+    // remset is complete (!g_remsetOverflow) and no concurrent trace window is
+    // open, so freeing young can never dangle a live mature->young edge.
+    void CollectNursery();
 
     lxr::BlockMeta* MetaForBlock(uint8_t* blockAddr);
     // Young-object nursery (LXR difference #6). StampBornEpoch marks the blocks

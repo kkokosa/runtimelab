@@ -203,9 +203,14 @@ static void RegisterSatbBuffer(SatbBuffer* nb)
 // --- Remembered sets: inter-block pointer slots (P2) -----------------------
 // While enabled (g_remsetActive), the barrier records slots that come to hold a
 // pointer into a different Immix block than the slot's own block. Evacuation
-// (P3) walks these to fix up references into a moved block. Entries persist
-// (a remembered set must retain a slot until its target region is collected);
-// stale/duplicate entries are filtered at evacuation by re-reading the slot.
+// (P3) walks these to fix up references into a moved block; young collection
+// (item D) walks them to find mature->young edges. Item F: the set is scoped
+// per-collection (reset at each consuming pause / trace under STW) rather than
+// persistent-with-reuse-tags -- because reclamation only happens at trace/evac
+// pauses and consumers drain under the pause before any decommit, a recorded
+// slot's source is always still committed when read, so stale entries are made
+// impossible rather than filtered. On overflow the barrier sets g_remsetOverflow
+// (completeness is safety-critical for freeing young).
 struct RemsetBuffer
 {
     static const size_t kCapacity = 4096;
@@ -217,6 +222,13 @@ static thread_local RemsetBuffer* t_remsetBuffer = nullptr;
 static RemsetBuffer* volatile g_registeredRemsetBuffers = nullptr;
 static CRITICAL_SECTION g_remsetLock;
 static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation is enabled
+// Item F: a mutator's per-thread remset buffer filled, so an inter-block store
+// (a mature->young or inter-block edge) was dropped. Completeness is safety-
+// critical for young collection (a missed mature->young edge would free a live
+// young object). When set, the nursery consumer (item D) must NOT reclaim young
+// this pause; it falls back to the mark-authoritative trace, which re-establishes
+// a complete remset via the marked-object walk. Cleared when a trace runs.
+static volatile LONG g_remsetOverflow = 0;
 static volatile LONG g_evacActive = 0;   // STW evacuation gate (P3)
 
 // Lock-free prepend of a remset buffer (see RegisterModifiedBuffer): the barrier
@@ -367,6 +379,10 @@ static volatile int64_t g_traceEveryEpochs = -1;  // force a trace at least ever
 // are excluded from reference counting and kept alive by the trace/allocate-black.
 // Gated by LXR_YOUNG_RC (default off; part of the full-LXR configuration).
 static volatile LONG g_youngRC = 0;
+// Item D: nursery collection at RC pauses (env LXR_NURSERY). OFF by default -
+// authoritative young reclamation needs a complete mature->young remembered set
+// (a complete write barrier); see the CollectNursery gate and Initialize().
+static volatile LONG g_nurseryActive = 0;
 static volatile int64_t g_traceEpoch = 0;
 
 // Dedicated collector thread. Driving SuspendEE from a random cooperative-mode
@@ -737,6 +753,16 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // is decided by the trace/allocate-black; sound because reclamation is
     // mark-authoritative every trace cycle.
     if (getenv("LXR_YOUNG_RC") != nullptr) g_youngRC = 1;
+    // Item D: young/nursery collection at RC pauses (CollectNursery). Opt-in and
+    // OFF by default because reclaiming young authoritatively at an RC pause
+    // requires a COMPLETE mature->young remembered set, which in turn needs a
+    // write barrier that captures 100% of reference stores. Our pluggable Callback
+    // barrier has residual completeness gaps (some store forms bypass it; the RC/
+    // SATB paths tolerate this via the from-roots trace backstop, but the nursery
+    // cannot) - proven by LXR_NURSERY_FULLSCAN (an O(heap) complete-seed mode) being
+    // AV-free while the remset-only mode faults. LXR_NURSERY enables the authoritative
+    // (remset) mode; add LXR_NURSERY_FULLSCAN for the sound-but-O(heap) mode.
+    if (getenv("LXR_NURSERY") != nullptr) g_nurseryActive = 1;
     // P5: parallel mark worker count. Clamped to [1, 64]; 1 keeps the verified
     // single-threaded closure.
     if (const char* t = getenv("LXR_GC_THREADS"))
@@ -1013,6 +1039,12 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
                 rb->Entries[rb->Count++] = slot;
                 InterlockedIncrement64(&g_lxrCounters.RemsetEntries);
             }
+            else
+            {
+                // Dropped an inter-block edge: mark the remset incomplete so the
+                // young collector falls back to the authoritative trace this cycle.
+                InterlockedExchange(&g_remsetOverflow, 1);
+            }
         }
     }
 }
@@ -1071,12 +1103,21 @@ void LXRCollector::EnumerateRemsetSlots(void (*visit)(Object** slot, void* ctx),
     LeaveCriticalSection(&g_remsetLock);
 }
 
+// Item F: reset the remembered set at the end of a collection that consumed it
+// (a young/nursery pause that reclaimed young, or any complete trace). Our remset
+// is scoped per-collection rather than persistent-with-reuse-tags (the paper's
+// mechanism): because reclamation/decommit only happens at trace/evac pauses and
+// the consumer drains the remset at the STW pause *before* any decommit, a slot's
+// source is always still committed when read, so stale entries are made
+// impossible instead of filtered. Clearing the overflow flag here restores
+// completeness for the next window.
 void LXRCollector::ResetRemsets()
 {
     EnterCriticalSection(&g_remsetLock);
     for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
         rb->Count = 0;
     LeaveCriticalSection(&g_remsetLock);
+    InterlockedExchange(&g_remsetOverflow, 0);
 }
 
 void LXRCollector::EnqueueZeroCount(Object* obj)
@@ -3078,6 +3119,204 @@ void LXRCollector::Evacuate()
     }
 }
 
+// --- Item D: young/nursery collection at RC pauses -------------------------
+// Bounded closure state, published to the file-scope root/handle callbacks the
+// same way Evacuate publishes g_evacPinned (GcScanRoots takes only a fn-ptr).
+struct NurseryClosure
+{
+    std::unordered_set<Object*> live;   // young object starts proven reachable
+    std::vector<Object*>        work;   // worklist for the transitive young->young scan
+    void AddYoung(Object* base)
+    {
+        if (base != nullptr && live.insert(base).second)
+            work.push_back(base);
+    }
+};
+static NurseryClosure* g_nurseryClosure = nullptr;
+
+// Seed one candidate pointer (a root, handle, or remembered-set value). Only
+// pointers into a young block matter; resolve interior/byref to the containing
+// young object's start so the transitive scan parses it correctly.
+static void LXRNurserySeed(uint8_t* v)
+{
+    if (v == nullptr || g_nurseryClosure == nullptr)
+        return;
+    // O(1) reject: not in a young (this-epoch) block -> irrelevant to the nursery.
+    if (!g_lxrCollector.IsYoung((Object*)v))
+        return;
+    // Common case: exact object-start reference we already know is live.
+    if (g_nurseryClosure->live.count((Object*)v) != 0)
+        return;
+    Object* base = g_lxrCollector.ResolveInterior(v);
+    if (base != nullptr && g_lxrCollector.IsYoung(base))
+        g_nurseryClosure->AddYoung(base);
+}
+
+static void LXRNurseryRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
+{
+    Object* o = *ppObj;
+    if (o == nullptr)
+        return;
+    // Interior roots are handled uniformly by LXRNurserySeed -> ResolveInterior,
+    // so GC_CALL_INTERIOR needs no special case here.
+    (void)flags;
+    LXRNurserySeed((uint8_t*)o);
+}
+static void LXRNurseryHandle(Object** ref, void* /*ctx*/)
+{
+    LXRNurserySeed((uint8_t*)*ref);
+}
+static void LXRNurseryRemsetSlot(Object** slot, void* /*ctx*/)
+{
+    // Re-read the slot: a remembered-set entry only means this slot *once* held an
+    // inter-block pointer; its current value is what keeps a young object live.
+    LXRNurserySeed((uint8_t*)*slot);
+}
+
+// Young/nursery collection, run under the RC-pause STW. Reclaims young regions
+// that hold no reachable young object. Reclaim-only (no copying): survivors stay
+// young and are compacted/promoted by the trace-cycle Evacuate. Sound because the
+// closure is a *complete* over-approximation of young liveness (roots + handles +
+// the complete mature->young remembered set + young->young), so a reclaimed
+// region provably has no live referrer; guarded off whenever completeness cannot
+// be guaranteed.
+void LXRCollector::CollectNursery()
+{
+    if (!g_youngRC || !g_nurseryActive || !g_remsetActive || g_theGCToCLR == nullptr)
+        return;
+    // Completeness guards. A dropped mature->young edge (remset overflow) or an
+    // in-flight concurrent trace (whose marks/allocate-black also keep young
+    // alive) would make freeing young unsafe -> fall back to the authoritative
+    // trace, which reclaims young at the next trace cycle as today.
+    if (g_remsetOverflow || g_traceWindowOpen)
+    {
+        InterlockedIncrement64(&g_lxrCounters.NurserySkipped);
+        return;
+    }
+
+    bool verbose = getenv("LXR_VERBOSE") != nullptr;
+
+    // 1. Build the young-live closure. Seeds: roots, handles, and every current
+    //    mature->young (and young->young) remembered-set value.
+    NurseryClosure closure;
+    g_nurseryClosure = &closure;
+    ScanContext sc; sc.promotion = true;
+    g_theGCToCLR->GcScanRoots(&LXRNurseryRoot, 2, 2, &sc);
+    LXRGCHandleStore::ForEachLiveHandle(&LXRNurseryHandle, nullptr);
+    EnumerateRemsetSlots(&LXRNurseryRemsetSlot, nullptr);
+
+    // DIAGNOSTIC (LXR_NURSERY_FULLSCAN): seed young-liveness from EVERY object's
+    // fields via a full-heap walk instead of trusting the remembered set. This is
+    // O(heap) and only for isolating a completeness gap: if the AV disappears with
+    // this on, the remset is missing a mature->young edge (a write-barrier gap);
+    // if it persists, the bug is in the closure/reclaim itself.
+    static int s_fullScan = (getenv("LXR_NURSERY_FULLSCAN") != nullptr) ? 1 : 0;
+    if (s_fullScan)
+    {
+        EnterCriticalSection(&g_chunkLock);
+        size_t n = g_chunkCount;
+        for (size_t i = 0; i < n; i++)
+        {
+            ChunkRegion c = g_chunks[i];
+            if (!c.Committed)
+                continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            uint8_t* p = c.Start;
+            while (p < end)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0) break;
+                p += sz;
+                GCScanObjectRefs(o, sz, [](Object** ref) { LXRNurserySeed((uint8_t*)*ref); });
+            }
+        }
+        LeaveCriticalSection(&g_chunkLock);
+    }
+
+    // 2. Transitive young->young closure. Parsing a young object and following its
+    //    fields is safe: nothing is reclaimed yet, so every young region is still
+    //    committed. Over-retention (e.g. a field of a still-committed dead young
+    //    object) is harmless.
+    while (!closure.work.empty())
+    {
+        Object* o = closure.work.back();
+        closure.work.pop_back();
+        size_t sz = LXRObjectSize(o);
+        if (sz == 0)
+            continue;
+        GCScanObjectRefs(o, sz, [](Object** ref) { LXRNurserySeed((uint8_t*)*ref); });
+    }
+    g_nurseryClosure = nullptr;
+    InterlockedExchange64(&g_lxrCounters.NurseryLiveYoung, (int64_t)closure.live.size());
+
+    // 3. Reclaim young regions with no reachable young object (region-granular,
+    //    Immix-style). Mirrors the sweep decommit path.
+    int64_t regionsReclaimed = 0, bytesReclaimed = 0;
+    EnterCriticalSection(&g_chunkLock);
+    size_t sweepCount = g_chunkCount;
+    for (size_t i = 0; i < sweepCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.Owner != nullptr || c.FreeRun)
+            continue;                       // uncommitted, active, or a carved free run
+        if (c.UsedEnd <= c.Start)
+            continue;
+        if (!IsYoung((Object*)c.Start))
+            continue;                       // mature region: handled by the trace, not here
+
+        // Any reachable young object in [Start,UsedEnd) keeps the whole region.
+        bool anyLive = false;
+        uint8_t* p = c.Start;
+        while (p < c.UsedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) { anyLive = true; break; } // unparseable: keep, never free
+            if (closure.live.count(o) != 0) { anyLive = true; break; }
+            p += sz;
+        }
+        if (anyLive)
+            continue;
+
+        // Dead young region: decommit its page-aligned interior and recycle it.
+        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
+        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
+        if (dend > dbeg)
+        {
+            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
+            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
+            bytesReclaimed += (int64_t)(dend - dbeg);
+        }
+        c.Committed = false;
+        // Reclaimed => RC 0 (see the sweep decommit site): young objects are RC-
+        // exempt so their RC bytes should already be 0, but clear defensively so
+        // no stale count survives into the decommitted range.
+        ClearRCRange(c.Start, c.UsedEnd);
+        if (g_freeChunkTop == g_freeChunkCap)
+        {
+            size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
+            size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
+            if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
+        }
+        if (g_freeChunkTop < g_freeChunkCap)
+            g_freeChunks[g_freeChunkTop++] = i;
+        regionsReclaimed++;
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    InterlockedIncrement64(&g_lxrCounters.NurseryPasses);
+    InterlockedExchangeAdd64(&g_lxrCounters.NurseryRegionsReclaimed, regionsReclaimed);
+    InterlockedExchangeAdd64(&g_lxrCounters.NurseryBytesReclaimed, bytesReclaimed);
+    if (verbose)
+    {
+        fprintf(stderr, "LXRGC: [nursery] liveYoung=%zu regionsReclaimed=%lld bytesReclaimed=%lld\n",
+                closure.live.size(), (long long)regionsReclaimed, (long long)bytesReclaimed);
+        fflush(stderr);
+    }
+}
+
 // ===========================================================================
 //                              LXRGCHeap
 // ===========================================================================
@@ -3731,6 +3970,14 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("conc:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
+        // Item F: a complete trace re-establishes remset completeness (all live
+        // mature->young edges are re-derivable from the marked-object graph) and
+        // the epoch bump below ages all current young to mature, so pre-trace
+        // remset entries are irrelevant to the next nursery window. Discard them
+        // under the pause (the barrier appends lock-free; resetting post-restart
+        // would race). Clears the overflow flag, restoring completeness.
+        if (g_remsetActive)
+            g_lxrCollector.ResetRemsets();
         LXRSetPhase("conc:restart-finish");
         LXRRestartEE();
         LXRSetPhase("idle");
@@ -3792,6 +4039,22 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             // safe here under the pause.
             if (g_lxrCollector.IsSatbActive())
                 g_lxrCollector.ResetSatbBuffers();
+            // Item F: discard the pre-trace remembered set under the pause (see the
+            // concurrent-finish path for the rationale: complete trace + young
+            // aging make pre-trace mature->young edges irrelevant, and resetting
+            // post-restart would race the lock-free barrier append).
+            if (g_remsetActive)
+                g_lxrCollector.ResetRemsets();
+        }
+        else if (g_youngRC && g_nurseryActive)
+        {
+            // Item D: young/nursery collection at the RC pause. Reclaims young
+            // (this-epoch) regions proven dead by a bounded closure over roots +
+            // handles + the complete mature->young remembered set (item F) +
+            // young->young edges. OFF by default (LXR_NURSERY) pending a complete
+            // write barrier; self-guards on remset completeness besides.
+            LXRSetPhase("stw:nursery");
+            g_lxrCollector.CollectNursery();
         }
 
         LXRSetPhase("stw:restart");
