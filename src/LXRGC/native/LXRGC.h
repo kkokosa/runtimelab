@@ -206,6 +206,13 @@ public:
     uint8_t* RCSlot(Object* obj) const;
     void RCIncrement(Object* obj);
     bool RCDecrement(Object* obj); // returns true if the count reached zero
+    // Item G (§3.5): thread-safe variants for parallel RC apply. Use a CAS loop on
+    // the byte RC slot so concurrent workers touching the same object's count race
+    // safely (preserving the 0xFF stuck-high sentinel and the no-decrement-below-0
+    // rule). The RC page must be pre-committed (RC apply pre-commits serially), so
+    // these never call VirtualAlloc.
+    void RCIncrementAtomic(Object* obj);
+    bool RCDecrementAtomic(Object* obj); // returns true iff THIS worker drove it to zero
 
     // --- Coalescing / field-logging write barrier support ---
     //
@@ -401,6 +408,12 @@ public:
 private:
     void EnqueueZeroCount(Object* obj);
     void DrainZeroCountWorkList();
+    // Item G (§3.5): apply one coalesced RC epoch -- ALL increments then ALL
+    // decrements (paper's ordering) -- across the worker pool when large enough,
+    // else serially. Objects that reach zero are enqueued for the (serial) free
+    // cascade; the caller then calls DrainZeroCountWorkList(). Shared by the STW
+    // ProcessModifiedBuffers and the off-pause ProcessSnapshotDecrements.
+    void ApplyRCEpoch(std::vector<Object*>& incs, std::vector<Object*>& decs);
 
     // Extend the committed+zeroed mark-table prefix to cover [heapBase, addrEnd)
     // without disturbing already-set bits, so marks can be set on freshly claimed

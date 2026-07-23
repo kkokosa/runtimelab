@@ -8,6 +8,7 @@
 //
 #include "LXRGC.h"
 #include <cstdio>
+#include <intrin.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -528,6 +529,29 @@ static class LXRCollector* g_poolCollector = nullptr;
 static void LXRMarkWorkerProc(void* idx);
 static void EnsureMarkWorkerPool();
 
+// Item G (§3.5): the same persistent pool also runs a generic parallel-for so
+// phases beyond marking (parallel reference-count apply) scale across the GC
+// worker threads. g_poolWorkKind selects which body a woken worker runs: 0 = the
+// mark drain (g_poolSlices), 1 = the generic parallel-for (g_poolForFn over lane
+// index). Only one pool activity runs at a time (collection is serialized), so
+// this shared state needs no lock. g_poolActiveLanes is the lane count for the
+// current activity (main thread = lane 0, workers = lanes 1..).
+static volatile LONG g_poolWorkKind = 0;                       // 0=mark, 1=parallel-for
+static void (*g_poolForFn)(int lane, int lanes, void* ctx) = nullptr;
+static void*   g_poolForCtx = nullptr;
+static int     g_poolActiveLanes = 1;
+// Mutual exclusion for the shared worker pool. Item C's background marker drains
+// the mark closure on the pool OFF-PAUSE while, on the driver thread, a spanned
+// RC epoch now also drives the pool for parallel RC apply (item G). Both must not
+// wake the shared workers at once, so every pool-driving site (ParallelDrainMark-
+// Stack and RunOnPool) holds this lock for one complete wake->join cycle. No
+// nesting (pool bodies never re-enter the pool), so no deadlock; a driver STW
+// pause may briefly wait for an in-flight marker drain to finish, which is a
+// latency cost, not a hang.
+static CRITICAL_SECTION g_poolLock;
+static volatile LONG64 g_parRCApplies = 0; // item G diagnostic: epochs applied in parallel
+static volatile LONG64 g_serRCApplies = 0; // item G diagnostic: epochs applied serially
+
 static uint32_t g_pageSize = 4096;
 
 // Heap bytes currently committed and in use (increased on commit, decreased when
@@ -962,6 +986,7 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     InitializeCriticalSection(&g_satbLock);
     InitializeCriticalSection(&g_remsetLock);
     InitializeCriticalSection(&g_evacEdgeLock);
+    InitializeCriticalSection(&g_poolLock);
     InitializeCriticalSection(&g_chunkLock);
 
     // P2 barrier-extension gates. Off by default (zero barrier overhead); SATB is
@@ -1075,6 +1100,47 @@ bool LXRCollector::RCDecrement(Object* obj)
         return false; // already zero, or stuck-high (resolved by backup trace)
     (*slot)--;
     return (*slot == 0);
+}
+
+// Item G (§3.5): thread-safe RC apply. The RC slot is a single byte; a CAS loop
+// (_InterlockedCompareExchange8) makes the saturating increment / floored
+// decrement atomic so multiple parallel-RC workers can touch the same object's
+// count without a lost update. The page is pre-committed by the serial flatten
+// pass, so no VirtualAlloc happens here (that would not be safe to contend and
+// would defeat the parallelism).
+void LXRCollector::RCIncrementAtomic(Object* obj)
+{
+    if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
+        return;
+    char volatile* p = (char volatile*)RCSlot(obj);
+    for (;;)
+    {
+        char cur = *p;
+        if ((uint8_t)cur == 0xFF)               // stuck-high sentinel: never wraps
+            break;
+        char nxt = (char)((uint8_t)cur + 1);
+        if (_InterlockedCompareExchange8(p, nxt, cur) == cur)
+            break;
+    }
+    InterlockedIncrement64(&g_lxrCounters.RCIncrements);
+}
+
+bool LXRCollector::RCDecrementAtomic(Object* obj)
+{
+    if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
+        return false;
+    InterlockedIncrement64(&g_lxrCounters.RCDecrements);
+    char volatile* p = (char volatile*)RCSlot(obj);
+    for (;;)
+    {
+        char cur = *p;
+        uint8_t u = (uint8_t)cur;
+        if (u == 0 || u == 0xFF)                // already zero / stuck-high
+            return false;
+        char nxt = (char)(u - 1);
+        if (_InterlockedCompareExchange8(p, nxt, cur) == cur)
+            return (u - 1) == 0;                // exactly one worker sees the 1->0 edge
+    }
 }
 
 // Provision this thread's write-barrier buffers OFF the barrier, on the
@@ -1824,8 +1890,9 @@ void LXRCollector::VerifyTraceComplete()
         }
     }
     LeaveCriticalSection(&g_chunkLock);
-    fprintf(stderr, "LXRGC: [verify] trace-completeness offenders=%lld markStackDrops=%lld\n",
-            (long long)offenders, (long long)g_lxrCounters.MarkStackDrops);
+    fprintf(stderr, "LXRGC: [verify] trace-completeness offenders=%lld markStackDrops=%lld rcApply[par=%lld ser=%lld]\n",
+            (long long)offenders, (long long)g_lxrCounters.MarkStackDrops,
+            (long long)g_parRCApplies, (long long)g_serRCApplies);
     fflush(stderr);
 }
 
@@ -2164,11 +2231,51 @@ static void LXRMarkWorkerProc(void* idx)
     for (;;)
     {
         WaitForSingleObject(g_poolStart[w], INFINITE);
-        std::vector<std::vector<Object*>>* slices = g_poolSlices;
-        if (slices != nullptr && (size_t)(w + 1) < slices->size() && g_poolCollector != nullptr)
-            g_poolCollector->DrainSliceLocal((*slices)[(size_t)(w + 1)]);
+        if (g_poolWorkKind == 0)
+        {
+            std::vector<std::vector<Object*>>* slices = g_poolSlices;
+            if (slices != nullptr && (size_t)(w + 1) < slices->size() && g_poolCollector != nullptr)
+                g_poolCollector->DrainSliceLocal((*slices)[(size_t)(w + 1)]);
+        }
+        else // g_poolWorkKind == 1: generic parallel-for, this worker is lane w+1
+        {
+            if (g_poolForFn != nullptr)
+                g_poolForFn(w + 1, g_poolActiveLanes, g_poolForCtx);
+        }
         SetEvent(g_poolDone[w]);
     }
+}
+
+// Item G (§3.5): run `fn` across the persistent worker pool as a parallel-for.
+// Lane 0 runs on the calling (collector) thread; lanes 1..(lanes-1) on pooled
+// workers. `fn(lane, lanes, ctx)` computes its own [lane, lanes) index stripe.
+// Falls back to a single serial lane when the pool is unavailable / lanes<2.
+// Must NOT be called during a STW mark (that uses the pool via g_poolWorkKind=0);
+// the RC apply that uses this runs at its own pause / off-pause, never nested.
+static void RunOnPool(int lanes, void (*fn)(int lane, int lanes, void* ctx), void* ctx)
+{
+    if (lanes < 2 || g_poolWorkers < 1)
+    {
+        fn(0, 1, ctx);
+        return;
+    }
+    if (lanes > g_poolWorkers + 1)
+        lanes = g_poolWorkers + 1;
+    EnterCriticalSection(&g_poolLock); // serialize with the marker's mark-drain
+    g_poolForFn = fn;
+    g_poolForCtx = ctx;
+    g_poolActiveLanes = lanes;
+    InterlockedExchange(&g_poolWorkKind, 1);
+    for (int w = 1; w < lanes; w++)   // wake pooled workers 0..lanes-2 -> lanes 1..lanes-1
+        SetEvent(g_poolStart[w - 1]);
+    fn(0, lanes, ctx);                // main thread is lane 0
+    for (int w = 1; w < lanes; w++)
+        WaitForSingleObject(g_poolDone[w - 1], INFINITE);
+    InterlockedExchange(&g_poolWorkKind, 0);
+    g_poolForFn = nullptr;
+    g_poolForCtx = nullptr;
+    g_poolActiveLanes = 1;
+    LeaveCriticalSection(&g_poolLock);
 }
 
 // Create the persistent parallel-mark worker pool once, at Initialize time (never
@@ -2222,6 +2329,8 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
         lanes = g_poolWorkers + 1; // clamp to what the pool can serve
 
     static std::vector<std::vector<Object*>> slices; // reused; single drain at a time
+    EnterCriticalSection(&g_poolLock); // serialize with parallel-RC pool use (item G)
+    InterlockedExchange(&g_poolWorkKind, 0); // 0 = mark-drain body in the worker proc
     slices.assign((size_t)lanes, std::vector<Object*>());
     size_t n = g_markTop;
     for (size_t i = 0; i < n; i++)
@@ -2237,6 +2346,7 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
     for (int w = 1; w < lanes; w++)
         WaitForSingleObject(g_poolDone[w - 1], INFINITE);
     g_poolSlices = nullptr;
+    LeaveCriticalSection(&g_poolLock);
 }
 
 // Drain the current grey set (already in g_markStack) using the parallel closure
@@ -2394,9 +2504,104 @@ bool LXRCollector::ConservativelyKeepAliveInterior(uint8_t* interior)
     return true;
 }
 
-void LXRCollector::ProcessModifiedBuffers()
+// Item G (§3.5): parallel RC apply. Context + parallel-for bodies for RunOnPool.
+// Each lane strides its index range so a huge coalesced epoch (e.g. a large
+// reference array being filled -> one entry per element) distributes across the
+// GC worker threads. RC slot updates use the atomic CAS variants so concurrent
+// lanes touching the same object's count never lose an update.
+struct LXRParRC
 {
-    // Coalescing reference counting (Levanoni-Petrank, paper A/§3.2.1). For the
+    LXRCollector* self;
+    Object** arr;
+    size_t   n;
+    std::vector<Object*>* laneZeros; // [lanes]: decrement victims per lane (dec phase)
+};
+static void LXRParRCIncFn(int lane, int lanes, void* ctx)
+{
+    LXRParRC* c = (LXRParRC*)ctx;
+    for (size_t i = (size_t)lane; i < c->n; i += (size_t)lanes)
+    {
+        Object* o = c->arr[i];
+        if (o != nullptr)
+            c->self->RCIncrementAtomic(o);
+    }
+}
+static void LXRParRCDecFn(int lane, int lanes, void* ctx)
+{
+    LXRParRC* c = (LXRParRC*)ctx;
+    std::vector<Object*>& zeros = c->laneZeros[lane];
+    for (size_t i = (size_t)lane; i < c->n; i += (size_t)lanes)
+    {
+        Object* o = c->arr[i];
+        if (o != nullptr && c->self->RCDecrementAtomic(o))
+            zeros.push_back(o);
+    }
+}
+
+// Apply one coalesced RC epoch: ALL increments before ANY decrement (paper's
+// ordering, so an object gaining a reference this epoch is never transiently
+// freed by an earlier decrement), collecting zero-count victims for the (serial)
+// free cascade the caller drains. Parallelises across the worker pool when the
+// epoch is large enough to amortise the wake cost; otherwise stays serial. The
+// two RunOnPool calls form the required increments->decrements barrier (RunOnPool
+// joins all lanes before returning).
+void LXRCollector::ApplyRCEpoch(std::vector<Object*>& incs, std::vector<Object*>& decs)
+{
+    static int s_parRC = -1;
+    if (s_parRC < 0)
+        s_parRC = (getenv("LXR_PARALLEL_RC") != nullptr && getenv("LXR_PARALLEL_RC")[0] == '0') ? 0 : 1;
+    // Below this many entries the pool wake/join overhead outweighs the win.
+    const size_t kParThreshold = 8192;
+    int lanes = g_gcThreads;
+    bool parallel = s_parRC && lanes > 1 && g_poolWorkers > 0 &&
+                    (incs.size() + decs.size()) >= kParThreshold;
+
+    if (!parallel)
+    {
+        InterlockedIncrement64(&g_serRCApplies);
+        for (Object* o : incs)
+            if (o != nullptr) RCIncrement(o);
+        for (Object* o : decs)
+            if (o != nullptr && RCDecrement(o)) EnqueueZeroCount(o);
+        return;
+    }
+    InterlockedIncrement64(&g_parRCApplies);
+
+    // Pre-commit the RC-table pages for every touched object SERIALLY (deduped by
+    // page) so the atomic apply never calls VirtualAlloc under contention. The RC
+    // table is 1 byte/granule, so a 4 KB page spans many objects -> few unique
+    // pages. m_collectLock is already held by the caller.
+    {
+        std::unordered_set<uintptr_t> pages;
+        pages.reserve((incs.size() + decs.size()) / 8 + 16);
+        uintptr_t pmask = ~((uintptr_t)g_pageSize - 1);
+        auto commit = [&](Object* o) {
+            if (o == nullptr) return;
+            if ((uint8_t*)o < m_heapBase || (uint8_t*)o >= m_heapBase + m_heapBytes) return;
+            uintptr_t pg = (uintptr_t)RCSlot(o) & pmask;
+            if (pages.insert(pg).second)
+                VirtualAlloc((void*)pg, g_pageSize, MEM_COMMIT, PAGE_READWRITE);
+        };
+        for (Object* o : incs) commit(o);
+        for (Object* o : decs) commit(o);
+    }
+
+    if (lanes > g_poolWorkers + 1) lanes = g_poolWorkers + 1;
+    std::vector<std::vector<Object*>> laneZeros((size_t)lanes);
+
+    LXRParRC inc{ this, incs.data(), incs.size(), nullptr };
+    RunOnPool(lanes, &LXRParRCIncFn, &inc);
+
+    LXRParRC dec{ this, decs.data(), decs.size(), laneZeros.data() };
+    RunOnPool(lanes, &LXRParRCDecFn, &dec);
+
+    for (std::vector<Object*>& z : laneZeros)
+        for (Object* o : z)
+            EnqueueZeroCount(o);
+}
+
+void LXRCollector::ProcessModifiedBuffers()
+{    // Coalescing reference counting (Levanoni-Petrank, paper A/§3.2.1). For the
     // period t_n -> t_{n+1} it is sufficient to apply, per MODIFIED FIELD, exactly
     // ONE decrement of the referent at t_n (the FIRST logged old value) and ONE
     // increment of the referent at t_{n+1} (the field's final value), ignoring all
@@ -2433,23 +2638,21 @@ void LXRCollector::ProcessModifiedBuffers()
     // Increments before decrements (paper B/§3.2.1): apply ALL increments of the
     // final referents first, so an object that gains a new reference this epoch is
     // never transiently driven to zero (and freed) by an earlier field's decrement.
+    // Item G (§3.5): build flat increment/decrement lists and apply them across the
+    // worker pool (ApplyRCEpoch), which distributes a large epoch (e.g. a big
+    // reference array's per-element entries) instead of serialising on one thread.
+    std::vector<Object*> incs; incs.reserve(coalesced.size() + rootsNow.size());
+    std::vector<Object*> decs; decs.reserve(coalesced.size() + m_rootDeferredPrev.size());
     for (const auto& kv : coalesced)
     {
-        Object* newValue = *(kv.first);
-        if (newValue != nullptr)
-            RCIncrement(newValue);
+        Object* newValue = *(kv.first); // t_{n+1}, read under STW here
+        if (newValue != nullptr) incs.push_back(newValue);
     }
-    for (Object* r : rootsNow)          // root increments (this epoch's root set)
-        RCIncrement(r);
+    for (Object* r : rootsNow) incs.push_back(r);            // this epoch's root incs
     for (const auto& kv : coalesced)
-    {
-        Object* oldValue = kv.second;
-        if (oldValue != nullptr && RCDecrement(oldValue))
-            EnqueueZeroCount(oldValue);
-    }
-    for (Object* r : m_rootDeferredPrev) // deferred root decrements (prior epoch)
-        if (RCDecrement(r))
-            EnqueueZeroCount(r);
+        if (kv.second != nullptr) decs.push_back(kv.second); // first old value (t_n)
+    for (Object* r : m_rootDeferredPrev) decs.push_back(r);  // deferred root decs
+    ApplyRCEpoch(incs, decs);
     m_rootDeferredPrev.swap(rootsNow);   // this epoch's roots -> next epoch's decs
     DrainZeroCountWorkList();
     // Restore the unlogged-bit invariant for the next epoch: every set logged bit
@@ -2552,24 +2755,19 @@ void LXRCollector::ProcessSnapshotDecrements()
                           std::make_pair(g_rcSnapEntries[i].OldValue, g_rcSnapEntries[i].NewValue));
     // Increments before decrements: apply ALL final-referent increments first so
     // an object that gained a reference this epoch is never transiently freed by
-    // an earlier field's decrement.
+    // an earlier field's decrement. Item G (§3.5): distribute the apply across the
+    // worker pool via ApplyRCEpoch when the epoch is large. This runs OFF-pause;
+    // the atomic RC ops touch only the collector-private RC side table (never
+    // mutator-visible object memory), so parallelising it off-pause is sound.
+    std::vector<Object*> incs; incs.reserve(coalesced.size() + m_rootDeferredSnap.size());
+    std::vector<Object*> decs; decs.reserve(coalesced.size() + m_rootDeferredPrev.size());
     for (const auto& kv : coalesced)
-    {
-        Object* newValue = kv.second.second;
-        if (newValue != nullptr)
-            RCIncrement(newValue);
-    }
-    for (Object* r : m_rootDeferredSnap)  // root increments captured at the pause
-        RCIncrement(r);
+        if (kv.second.second != nullptr) incs.push_back(kv.second.second); // t_{n+1}
+    for (Object* r : m_rootDeferredSnap) incs.push_back(r);  // root incs (this pause)
     for (const auto& kv : coalesced)
-    {
-        Object* oldValue = kv.second.first;
-        if (oldValue != nullptr && RCDecrement(oldValue))
-            EnqueueZeroCount(oldValue);
-    }
-    for (Object* r : m_rootDeferredPrev)  // deferred root decrements (prior pause)
-        if (RCDecrement(r))
-            EnqueueZeroCount(r);
+        if (kv.second.first != nullptr) decs.push_back(kv.second.first);   // t_n
+    for (Object* r : m_rootDeferredPrev) decs.push_back(r);  // deferred root decs
+    ApplyRCEpoch(incs, decs);
     m_rootDeferredPrev.swap(m_rootDeferredSnap); // rotate the deferral chain
     m_rootDeferredSnap.clear();
     g_rcSnapCount = 0;
@@ -2724,9 +2922,10 @@ void LXRCollector::BackupTrace()
 
     if (getenv("LXR_VERIFY_TRACE") != nullptr)
     {
-        fprintf(stderr, "LXRGC: [trace] rootsPushed=%llu heapNextFree=+%lldMB\n",
+        fprintf(stderr, "LXRGC: [trace] rootsPushed=%llu heapNextFree=+%lldMB rcApply[par=%lld ser=%lld]\n",
                 (unsigned long long)rootsPushed,
-                (long long)((g_lxrGCHeap ? (g_lxrGCHeap->HeapHighWater() - g_lxrGCHeap->HeapBase()) : 0) >> 20));
+                (long long)((g_lxrGCHeap ? (g_lxrGCHeap->HeapHighWater() - g_lxrGCHeap->HeapBase()) : 0) >> 20),
+                (long long)g_parRCApplies, (long long)g_serRCApplies);
         VerifyTraceComplete();
     }
 }
@@ -5579,14 +5778,16 @@ HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
     RequestLXRCollection(/*wait*/ true, /*forceTrace*/ true);
     int64_t reclaimed = g_lxrCollector.ReclaimedBytes() - before;
     fprintf(stderr,
-            "LXRGC: GC(gen=%d) -> RC inc=%lld dec=%lld, backupTraces=%lld, collections=%lld, reclaimed this GC=%lld bytes (total=%lld)\n",
+            "LXRGC: GC(gen=%d) -> RC inc=%lld dec=%lld, backupTraces=%lld, collections=%lld, reclaimed this GC=%lld bytes (total=%lld) rcApply[par=%lld ser=%lld]\n",
             generation,
             (long long)g_lxrCounters.RCIncrements,
             (long long)g_lxrCounters.RCDecrements,
             (long long)g_lxrCounters.BackupTraces,
             (long long)g_lxrCounters.Collections,
             (long long)reclaimed,
-            (long long)g_lxrCollector.ReclaimedBytes());
+            (long long)g_lxrCollector.ReclaimedBytes(),
+            (long long)g_parRCApplies,
+            (long long)g_serRCApplies);
     fflush(stderr);
     return S_OK;
 }
