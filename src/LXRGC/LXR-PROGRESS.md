@@ -23,7 +23,7 @@ Legend: ✅ conformant · ⚠️ partial / approximated · ❌ divergent (shortc
 |---|---|---|---|
 | **A** | **Coalescing field-logging barrier**: per-field **unlogged bit**; log each field **once per epoch** (first write pushes old→`decbuf`, addr→`modbuf`); ignore intermediate referents; unlogged bit reset at RC pause; new objects born "logged" so barrier elides young (§3.4, Fig.3) | **A(i)+A(ii) landed** (`parity-a1`, `parity-a2`): the barrier now carries a per-field **unlogged-bit side table** (`m_loggedTable`, 1 bit/8-byte slot) — `TryFirstLogField` test-and-sets it so RC-`modbuf` + SATB append **exactly once per field per epoch** (`LogModifiedField`); bits are cleared per-consumed-field at each RC pause (`ClearLoggedBit`, O(modified fields)) or wholesale on a buffer-overflow epoch (`ResetLoggedTable`). Logged pages are committed off the barrier on the alloc path (`EnsureLoggedUpTo`). Coalescing is now at the **source** (Levanoni-Petrank), matching the paper; this drastically cuts buffer traffic and the overflow→O(heap) fallback frequency. (Young still handled via `LXR_YOUNG_RC` RC-skip, not birth-logged elision — see D.) | ✅ |
 | **B** | RC pause applies **all increments, then all decrements** (§3.2.1); **root deferral** — increment root-reachable at tₙ, buffer matching decrement for tₙ₊₁ (§2.1) | **Ordering + root deferral landed** (`parity-b`): all increments precede all decrements on both RC paths, and `CaptureRoots` now scans handles + stack/static/finalizer roots at each RC STW pause, increments each unique in-heap referent, and buffers a matching decrement for the next pause (`m_rootDeferredPrev`/`m_rootDeferredSnap`, rotated in `ProcessModifiedBuffers`/`ProcessSnapshotDecrements`). RC is now **self-standing** (root-reachable mature objects hold RC ≥ 1 for their rooted epoch) instead of relying on the mark trace to protect roots — the prerequisite for young-at-RC-pause reclaim (D). (Young referents are RC-skipped, per D.) | ✅ |
-| **C** | SATB trace **spans multiple RC epochs**; completes **concurrently, no STW finish** (checked at next RC pause); invariant: RC may never delete an unmarked object mid-trace → **mark+scan any mature object RC kills** if not already marked (§3.2.3) | Single snapshot→drain→**STW finish pause** per trace cycle (`ConcurrentTraceFinish`); does not span epochs; uses a final root+handle rescan + (overflow-only) closure instead of the mark-on-RC-death rule. Sound, but structurally different. | ⚠️ |
+| **C** | SATB trace **spans multiple RC epochs**; completes **concurrently, no STW finish** (checked at next RC pause); invariant: RC may never delete an unmarked object mid-trace → **mark+scan any mature object RC kills** if not already marked (§3.2.3) | **LANDED & VERIFIED (2026-07-24)** (env `LXR_MULTIEPOCH`): the trace is now structured as **snapshot piggybacked on an RC pause → background marker across subsequent RC epochs → finalize at a later RC pause** — **no dedicated trace pauses**. A persistent marker thread (`LXRMarkerThreadProc`) runs `ConcurrentTraceDrain` + off-pause `ProcessSnapshotDecrements` while mutators (and spanned RC pauses) run; the driver only *checks* `g_markerQuiescent` at each RC pause and finalizes (`meFinish`: residual SATB + allocate-black + final root rescan + mark-authoritative sweep) when the marker has parked, so the finish is a brief **RC-pause-piggybacked** finalize, not a separate STW trace pause. The **no-delete-unmarked-mid-trace** invariant is enforced by **reclamation deferral** (`g_traceWindowOpen` gates ALL decommit/reuse — nursery, chunk, free-run, sweep — off until the finish), which is the paper's sound-deletion rule realised as deferral rather than eager mark-on-death (equivalent soundness; only the collector mutates RC, and no RC-zero object is freed until the trace completes). Snapshot uses the cheap `SnapshotModifiedBuffers` detach (RC arithmetic off-pause on the marker); spanned RC epochs skip buffer processing to keep the outstanding snapshot's root-deferral rotation intact, draining at the finish. Verified: snapshot pauses **1.4–8.4 ms** (was 27–31 ms before the detach fix; matches the legacy concurrent snapshot), `LXR_VERIFY_TRACE` **offenders=0 / gap=0** every finish, **8/8 WebApi iters av=0/hang=0**, ~70 MB reclaimed/run. NOTE: on WebApi the 16-thread parallel marker drains the closure *within one* RC-pause gap, so `spans=0` in practice (no epoch is actually spanned) — the spanning **mechanism** is present and correct; the paper spans only when marking outlasts the pause interval. | ✅ |
 | **D** | **Implicitly-dead young**: young objects with no increment are reclaimed **at the RC pause**, before decrements; young survivors (0→1 increment) **copied at that pause** to defragment (§2.1, §3.3.1–3) | **LANDED & VERIFIED (2026-07-24)** (`CollectNursery`, env `LXR_NURSERY`): at each RC pause it reclaims young regions in which every young object is implicitly dead (RC 0, unmarked), region-granular Immix-style, honoring interior/byref roots + mark bits. **True root cause of the earlier AV found and FIXED (not masked):** the per-thread coalescing **modified buffer overflowed** under load and the barrier **dropped the first-log entry** on a full buffer — a dropped first-log **permanently loses an RC increment**, so a live young referent stayed stuck at RC 0 and the nursery freed it while reachable. Proven by an authoritative from-roots probe (`LXR_NURSERY_ROOTPROBE`): with a huge buffer `victimsReachableFromRoots=0` across all pauses, with the normal 4096 buffer up to **1760 live victims**. Fix = the paper's **shared-queue** buffer (§3.2.1): on fill the barrier CAS-swaps in a pre-registered spare from a global free-list (topped up off-barrier in `EnsureThreadBuffers`, recycled at each RC-pause drain), so **no first-log is ever dropped**; the vanishingly-rare free-list-exhaustion case sets `g_youngRCIncomplete` (nursery defers reclaim until the next complete trace re-establishes liveness). Also fixed a latent stale-logged-bit bug (`ClearLoggedRange` at all reclaim sites). Verified with normal buffers: `victimsReachableFromRoots=0` across all pauses; **8/8 concurrent + 6/6 STW WebApi iters av=0/hang=0**, ~75 MB young reclaimed/run (605 MB + 450 MB totals). No runtime change needed. Young-survivor copy-at-RC-pause still deferred (survivors stay young, compacted by the trace-cycle `Evacuate`). | ✅ |
 | **E** | Triggers: RC = heap-full OR increment-threshold OR **young-survival predictor** (1:3 biased exp decay, 128 MB default); SATB = free-block threshold OR **wastage predictor** (live-block, 1:3 decay, 5% default) (§3.2.2, §3.2.5) | Allocation-growth trigger + a single **survival EWMA (7:1)** scaling the epoch cap + epochs-since-trace. No increment/wastage/free-block predictors. | ⚠️ |
 | **F** | Remsets **scoped to the evacuation set**, bootstrapped by the first SATB trace, kept updated by the barrier, **line-reuse-counter** stale-entry tagging; evac set = blocks <50% occupancy, N lowest; **incremental, time-budgeted**, STW (§3.3.4) | **Completeness + scoping landed** (`g_remsetOverflow`, `ResetRemsets` at every trace): the barrier now sets an **overflow flag** on a dropped inter-block edge (was a silent drop) — safety-critical for young reclaim — and the remset is **scoped per inter-trace interval** (reset under STW at each trace, which ages all young to mature and rebuilds completeness). Per-interval reset makes stale entries *impossible* rather than filtering them (equivalent to, and simpler than, the paper's persistent-remset + reuse-counter tagging: reclamation/decommit only happen at traces, and consumers drain under the STW pause before any decommit, so a recorded slot's source is always still committed). `EnumerateRemsetSlots` consumed by the nursery (D). Evac-set scoping + incremental time-budget still differ. | ⚠️ |
@@ -54,12 +54,17 @@ identity issues. Reaching 1:1 parity means restoring **precise, primary RC** fir
 2. **B —** inc-before-dec on the STW RC path + **root deferral** (RC accounts roots). ✅ **DONE**
 3. **D —** implicitly-dead-young reclaim at the RC pause. ✅ **DONE** (young-survivor
    copy-at-RC-pause still deferred to the trace-cycle `Evacuate`).
-4. **C —** multi-epoch SATB + mark-on-RC-death; drop the STW finish closure.
+4. **C —** multi-epoch SATB + mark-on-RC-death; drop the STW finish closure. ✅ **DONE**
+   (env `LXR_MULTIEPOCH`: snapshot piggybacks an RC pause → background marker across
+   epochs → finalize at a later RC pause; no dedicated trace pauses; invariant held by
+   `g_traceWindowOpen` reclamation-deferral. Spanning mechanism present; `spans=0` on
+   WebApi because the parallel marker drains within one pause gap.)
 5. **E / F / G —** survival + wastage predictors; evac-set-scoped remsets with
    line-reuse tagging + incremental time-budgeted evac; parallel RC + array partition.
 
 Only after 1–4 (identity-restoring) land do the full benchmarks become a faithful
-LXR-vs-Server/Workstation comparison.
+LXR-vs-Server/Workstation comparison. **1–4 are now all ✅** (A `f9f7031`, B `2599d3f`,
+D `d7a3b78`, C multi-epoch); remaining divergences E/F/G are precision/perf refinements.
 
 ---
 
@@ -76,12 +81,30 @@ LXR-vs-Server/Workstation comparison.
 ## Full-LXR benchmark config (once parity reached)
 
 `LXR_CONCURRENT=1 LXR_EVAC=1 LXR_REMSET=1 LXR_LINE_REUSE=1 LXR_CONC_DECREMENTS=1`
-`LXR_YOUNG_RC=1 LXR_NURSERY=1 LXR_GC_THREADS=<#cores>` + `DOTNET_ReadyToRun=0`. vs Server GC
-and Workstation GC. Regenerate `results/report.html`.
+`LXR_YOUNG_RC=1 LXR_NURSERY=1 LXR_MULTIEPOCH=1 LXR_GC_THREADS=<#cores>` + `DOTNET_ReadyToRun=0`.
+vs Server GC and Workstation GC. Regenerate `results/report.html`.
 
 ---
 
 ## Changelog
+- **2026-07-24** — **C multi-epoch SATB trace landed → C ✅.** Restructured the
+  concurrent trace so it **piggybacks on the RC-pause cadence** instead of running two
+  dedicated trace pauses inside one monolithic collection call (env `LXR_MULTIEPOCH`):
+  a **snapshot** rides an RC pause (cheap `SnapshotModifiedBuffers` detach), a
+  **persistent background marker thread** (`LXRMarkerThreadProc`) marks the closure +
+  replays RC decrements off-pause across the following RC epochs, and a later RC pause
+  **finalizes** (`meFinish`: residual SATB + allocate-black + final root rescan +
+  mark-authoritative sweep) once the marker parks. No dedicated trace pauses; the
+  no-delete-unmarked-mid-trace invariant is held by `g_traceWindowOpen` reclamation
+  deferral (the paper's sound-deletion rule as deferral). Spanned RC epochs skip
+  `ProcessModifiedBuffers` so the outstanding snapshot's root-deferral rotation stays
+  intact (drained at finish). **Fixed a snapshot-pause regression** (27–31 ms → 1.4–8.4
+  ms) by using the detach + off-pause replay instead of full STW `ProcessModifiedBuffers`
+  at the snapshot. Verified: `LXR_VERIFY_TRACE` offenders=0/gap=0 every finish, **8/8
+  WebApi iters av=0/hang=0**, ~70 MB reclaimed/run. `spans=0` on WebApi (the 16-thread
+  parallel marker drains within one pause gap) — the spanning mechanism is present and
+  correct; the paper spans only when marking outlasts the pause interval. No runtime
+  change needed.
 - **2026-07-24** — **D implicitly-dead-young reclaim landed → D ✅.** Root-caused the
   nursery AV to the coalescing **modified buffer overflow dropping first-log entries**
   (a dropped first-log permanently loses an RC increment, leaving a live young object

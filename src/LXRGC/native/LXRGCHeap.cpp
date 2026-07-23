@@ -320,6 +320,70 @@ static size_t   g_snapChunkCount = 0;
 static uint8_t* g_concWatermark  = nullptr;   // heap high-water at snapshot
 static int g_gcThreads = 1; // P5: parallel mark worker count (env LXR_GC_THREADS)
 
+// --- Multi-epoch concurrent trace (LXR §3.2.3 parity, env LXR_MULTIEPOCH) ---
+// The paper's SATB trace SPANS MULTIPLE RC EPOCHS and has NO dedicated trace
+// pauses: the snapshot piggybacks on an ordinary RC pause, a background marker
+// thread marks the transitive closure concurrently while subsequent RC pauses
+// run normally, and a later RC pause finalizes the trace once the marker is
+// quiescent. This differs from the legacy concurrent path, which confines a
+// trace to a single collection with two dedicated (snapshot+finish) pauses,
+// monopolizing the collection lock so no RC pause can interleave. Moving the
+// drain onto a persistent thread frees the collection lock between the snapshot
+// and finish, so RC pauses (the spanned epochs) interleave with marking.
+//
+// Soundness: during MARKING, g_traceWindowOpen==1 suppresses ALL decommit/reuse
+// (CollectNursery, ReuseChunk, ReuseFreeRun) and the sweep runs only at the
+// finish pause when the marker has already returned (sole owner of the mark
+// stack), so the concurrent marker never races a decommit and two threads never
+// touch the mark stack at once. Reclamation deferral of RC-zero objects until
+// the trace completes is already parity-correct (see g_traceWindowOpen gating).
+enum { TRACE_IDLE = 0, TRACE_MARKING = 1 };
+static volatile LONG g_concDecrements = 0;  // env LXR_CONC_DECREMENTS (declared here so the marker can gate)
+static volatile LONG g_multiEpoch      = 0;  // env LXR_MULTIEPOCH: span trace over RC epochs
+static volatile LONG g_traceState      = TRACE_IDLE;
+static volatile LONG g_markerQuiescent = 0;  // marker finished its drain-to-quiescence
+static volatile LONG g_markerStop      = 0;  // shutdown request for the marker thread
+static HANDLE  g_markerThread    = nullptr;
+static HANDLE  g_markerStartEvent = nullptr; // auto-reset: wakes the marker to drain
+static volatile LONG64 g_multiEpochSpans = 0; // diagnostic: RC epochs spanned across traces
+
+// Persistent background marker: waits for a snapshot to open a trace, marks the
+// transitive closure to quiescence (ConcurrentTraceDrain, which itself yields so
+// mutators + RC pauses make progress), then signals quiescent and parks. It runs
+// exactly ONE drain per trace; the finish pause mops up residual SATB. Because it
+// has returned (parked) before the finish pause runs, the driver is the sole
+// owner of the mark stack at finish - no two-thread mark race.
+static DWORD WINAPI LXRMarkerThreadProc(void*)
+{
+    for (;;)
+    {
+        WaitForSingleObject(g_markerStartEvent, INFINITE);
+        if (g_markerStop)
+            break;
+        g_lxrCollector.ConcurrentTraceDrain();
+        // #1 off-pause decrement replay (mirrors the legacy concurrent branch):
+        // consume the buffers detached at the meStart snapshot (SnapshotModified-
+        // Buffers) - RC arithmetic + recursive free - here, off the pause. Must
+        // run before the next epoch's ProcessModifiedBuffers so g_rcSnap and the
+        // root-deferral rotation are consumed exactly once. Spanned RC epochs skip
+        // ProcessModifiedBuffers while MARKING, so this is the sole snapshot
+        // consumer until the finish pause.
+        if (g_concDecrements)
+            g_lxrCollector.ProcessSnapshotDecrements();
+        InterlockedExchange(&g_markerQuiescent, 1);
+    }
+    return 0;
+}
+
+static void LXREnsureMarkerThread()
+{
+    if (g_markerThread != nullptr)
+        return;
+    if (g_markerStartEvent == nullptr)
+        g_markerStartEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset
+    g_markerThread = CreateThread(nullptr, 0, LXRMarkerThreadProc, nullptr, 0, nullptr);
+}
+
 // --- Phase watchdog: pinpoint an intermittent hang without perturbing the hot
 //     path. Each phase boundary publishes a name + a QPC stamp (two word writes,
 //     no I/O). A monitor thread prints the current phase if it stalls, so the
@@ -364,8 +428,8 @@ static size_t g_zeroCountCap = 0;
 // so even if a rare mutator resurrection races an off-pause decrement and
 // transiently corrupts a reference count, no reachable object can be freed -
 // the sweep frees by mark, not by RC, that cycle. Gated by LXR_CONC_DECREMENTS
-// and only ever taken on the concurrent path.
-static volatile LONG g_concDecrements = 0; // env LXR_CONC_DECREMENTS
+// and only ever taken on the concurrent path. (Declared above near the trace
+// state so the multi-epoch marker thread can gate its off-pause decrement replay.)
 struct RCSnapshotEntry { Object* OldValue; Object* NewValue; };
 static RCSnapshotEntry* g_rcSnapEntries = nullptr;
 static size_t g_rcSnapCount = 0;
@@ -827,6 +891,11 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // pauses + off-pause marking). The SATB window is opened per-trace, so
     // g_satbActive is NOT forced on here.
     if (getenv("LXR_CONCURRENT") != nullptr) g_concurrentEnabled = 1;
+    // Item C (paper §3.2.3): span the SATB trace over multiple RC epochs with no
+    // dedicated trace pauses (snapshot + finish piggyback on RC pauses; a
+    // background thread marks concurrently across the spanned epochs). Requires
+    // LXR_CONCURRENT. See g_multiEpoch.
+    if (getenv("LXR_MULTIEPOCH") != nullptr) g_multiEpoch = 1;
     // #1: replay coalescing-RC decrements + the recursive free OFF the STW
     // pause (concurrent path only). Only the bounded buffer snapshot is paused.
     if (getenv("LXR_CONC_DECREMENTS") != nullptr) g_concDecrements = 1;
@@ -4472,6 +4541,22 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     // both features are enabled we alternate: most cycles trace concurrently
     // (cheap pauses, collects cyclic garbage), and every kEvacEveryN-th cycle is
     // a STW trace+evac that actually defragments. Every feature stays active.
+    // --- Multi-epoch trace: classify this epoch's role BEFORE the evac/legacy-
+    //     concurrent decisions (item C). While a trace is MARKING, every epoch is
+    //     an ordinary RC pause (a "spanned" epoch) except the one that finalizes
+    //     it, so force phase=RCPause here to keep evac/legacy-concurrent from
+    //     starting a second trace mid-flight.
+    bool meStart = false, meFinish = false;
+    if (g_multiEpoch && g_concurrentEnabled && g_theGCToCLR != nullptr && doTrace &&
+        g_traceState == TRACE_MARKING)
+    {
+        if (g_markerQuiescent)
+            meFinish = true;                       // marker parked -> finalize now
+        else
+            InterlockedIncrement64(&g_multiEpochSpans);
+        phase = LXRPhase::RCPause;
+    }
+
     static LONG s_traceCycleCounter = 0;
     bool evacCycle = false;
     if (phase == LXRPhase::TracePause && g_evacActive)
@@ -4480,12 +4565,90 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LONG cyc = InterlockedIncrement(&s_traceCycleCounter);
         evacCycle = (!g_concurrentEnabled) || (cyc % kEvacEveryN == 0);
     }
+    // Begin a multi-epoch trace at this RC pause when idle and a (non-evac) trace
+    // is due. Evac cycles still take the fully-STW trace+evac path below.
+    if (g_multiEpoch && g_concurrentEnabled && g_theGCToCLR != nullptr && doTrace &&
+        g_traceState == TRACE_IDLE && phase == LXRPhase::TracePause && !evacCycle)
+    {
+        meStart = true;
+    }
     bool useConcurrent = (phase == LXRPhase::TracePause) && doTrace &&
-                         g_concurrentEnabled && g_theGCToCLR != nullptr && !evacCycle;
+                         g_concurrentEnabled && g_theGCToCLR != nullptr && !evacCycle &&
+                         !meStart;
 
     int64_t pauseMicros = 0;
 
-    if (useConcurrent)
+    if (meStart)
+    {
+        // Snapshot piggybacked on this RC pause: process this epoch's RC buffers,
+        // take the SATB snapshot (reset marks, arm the deletion barrier, seed
+        // roots, open the trace window), then launch the background marker to
+        // mark the closure across the coming RC epochs. Reclaims nothing here.
+        QueryPerformanceCounter(&t0);
+        LXRSetPhase("me:suspend-snapshot");
+        LXRSuspendEE();
+        LXRSetPhase("me:snapshot-buffers");
+        LARGE_INTEGER tb0, tb1, tb2;
+        QueryPerformanceCounter(&tb0);
+        // Detach this epoch's RC buffers cheaply (bounded copy, no RC arithmetic /
+        // no recursive free) exactly like the legacy concurrent snapshot; the
+        // marker replays them off-pause via ProcessSnapshotDecrements. Falls back
+        // to full STW processing only when concurrent decrements are disabled.
+        if (doBuffers)
+        {
+            if (g_concDecrements)
+                g_lxrCollector.SnapshotModifiedBuffers();
+            else
+                g_lxrCollector.ProcessModifiedBuffers();
+        }
+        QueryPerformanceCounter(&tb1);
+        LXRSetPhase("me:snapshot");
+        g_lxrCollector.ConcurrentTraceSnapshot();
+        QueryPerformanceCounter(&tb2);
+        if (verbose) { fprintf(stderr, "LXRGC: [stage]   snapshot breakdown: bufs=%lldus snap=%lldus\n", (long long)((tb1.QuadPart-tb0.QuadPart)*1000000/freq.QuadPart), (long long)((tb2.QuadPart-tb1.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
+        LXREnsureMarkerThread();
+        InterlockedExchange(&g_traceCompleteThisCycle, 0);
+        InterlockedExchange(&g_markerQuiescent, 0);
+        InterlockedExchange(&g_traceState, TRACE_MARKING);
+        SetEvent(g_markerStartEvent);
+        LXRSetPhase("me:restart-snapshot");
+        LXRRestartEE();
+        LXRSetPhase("idle");
+        QueryPerformanceCounter(&t1);
+        pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+        phase = LXRPhase::RCPause;   // account the snapshot epoch as an RC pause
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace snapshot (pause=%lldus)\n", (long long)pauseMicros); fflush(stderr); }
+    }
+    else if (meFinish)
+    {
+        // The marker has drained to quiescence and parked, so the driver is the
+        // sole owner of the mark stack: finalize the trace at this RC pause
+        // (residual SATB + allocate-black + final root rescan + reconciliation),
+        // then the mark-authoritative sweep. Closes the trace window.
+        QueryPerformanceCounter(&t0);
+        LXRSetPhase("me:suspend-finish");
+        LXRSuspendEE();
+        LXRSetPhase("me:finish");
+        g_lxrCollector.ConcurrentTraceFinish();
+        LXRSetPhase("me:finish-buffers");
+        if (doBuffers)
+            g_lxrCollector.ProcessModifiedBuffers();
+        LXRSetPhase("me:finish-sweep");
+        if (doSweep)
+            g_lxrCollector.SweepAndSelectDefrag();
+        if (g_remsetActive)
+            g_lxrCollector.ResetRemsets();
+        InterlockedExchange(&g_traceState, TRACE_IDLE);
+        LXRSetPhase("me:restart-finish");
+        LXRRestartEE();
+        LXRSetPhase("idle");
+        QueryPerformanceCounter(&t1);
+        pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+        phase = LXRPhase::TracePause; // account the finish epoch as a trace pause
+        if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace finish (pause=%lldus spans=%lld)\n",
+                               (long long)pauseMicros, (long long)g_multiEpochSpans); fflush(stderr); }
+    }
+    else if (useConcurrent)
     {
         LARGE_INTEGER a0, a1;
         // --- Snapshot pause (STW): mod buffers, reset marks, seed roots ---
@@ -4598,7 +4761,17 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                                phase == LXRPhase::TracePause ? "trace" : "rc", (int)suspended); fflush(stderr); }
 
         LXRSetPhase("stw:buffers");
-        if (doBuffers)
+        // While a multi-epoch trace is MARKING, an outstanding meStart snapshot
+        // (g_rcSnap + root-deferral rotation) has not yet been consumed by the
+        // marker's ProcessSnapshotDecrements. Running ProcessModifiedBuffers here
+        // would rotate m_rootDeferredPrev out of turn and corrupt/drop that
+        // snapshot's deferred decrements. Skip it: the buffers accumulate (bounded
+        // by the shared-queue spares) and are drained at the finish pause. This
+        // keeps the spanned RC epoch a pure "is the marker done yet" poll, and
+        // defers this epoch's RC lazily - sound (reclamation stays gated on the
+        // mark-authoritative sweep at finish).
+        bool skipBuffersForSpan = g_multiEpoch && g_traceState == TRACE_MARKING;
+        if (doBuffers && !skipBuffersForSpan)
         {
             g_lxrCollector.ProcessModifiedBuffers();
             if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done\n"); fflush(stderr); }
