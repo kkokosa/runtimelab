@@ -152,6 +152,8 @@ struct LXRCounters
     volatile int64_t SatbOverflowRetraces;  // finish-pause full re-traces due to SATB overflow
     volatile int64_t RemsetEntries;         // inter-block pointer slots logged
     volatile int64_t RemsetFixups;          // remset slots rewritten during evacuation
+    volatile int64_t RemsetRebuilds;        // item F: persistent-remset rebuilds from mark (post-overflow)
+    volatile int64_t RemsetStaleSkipped;    // item F: remset entries skipped as stale (line reuse ver advanced)
 
     // P3 STW evacuation (moving defragmentation).
     volatile int64_t EvacPasses;            // evacuation phases run
@@ -320,6 +322,17 @@ public:
     bool IsRemsetActive() const;
     void EnumerateRemsetSlots(void (*visit)(Object** slot, void* ctx), void* ctx);
     void ResetRemsets();
+    // Item F (§3.3.4): make the remembered set PERSISTENT with reuse-version
+    // pruning instead of clearing it each trace. CompactRemsets (called at trace
+    // finish, after Evacuate has consumed the set) drops entries whose source line
+    // reuse version has advanced (stale) and de-duplicates the survivors, keeping
+    // the set bounded to the live inter-block edge working set. On a prior barrier
+    // overflow it rebuilds completeness from the just-completed mark. RecordRemset-
+    // Edge lets the collector register edges created by GC-internal relocation
+    // (evac copies / young-survivor promotions), whose memcpy stores never fire
+    // the barrier. Both run STW.
+    void CompactRemsets();
+    void RecordRemsetEdge(Object** slot);
 
     // --- STW incremental evacuation / copying (P3) ---
     //
@@ -333,6 +346,15 @@ public:
     void SetEvacActive(bool active);
     bool IsEvacActive() const;
     void Evacuate();
+
+    // Item F (paper §3.3.4): per-line reuse versioning for the persistent evac
+    // remembered set. LineReuseVerOf reads a line's current reuse version;
+    // BumpLineReuseRange increments the version of every line overlapping
+    // [start,end) and is called at every reclaim site (carve, sweep decommit,
+    // evac free). EnsureLineReuseCommitted commits the covering table prefix.
+    uint32_t LineReuseVerOf(void* addr) const;
+    void BumpLineReuseRange(uint8_t* start, uint8_t* end);
+    void EnsureLineReuseCommitted(size_t usedBytes);
 
     // Periodic mark-sweep over the whole heap to reclaim dead cycles that RC
     // leaks. Uses IGCToCLR root/stack enumeration (which the ABI *does*
@@ -490,6 +512,16 @@ private:
     size_t          m_markCommittedBytes = 0; // committed+zeroed mark-table prefix (bytes)
     uint8_t*        m_lineMarkTable = nullptr;   // 1 bit / 256 B line (Immix line reuse)
     size_t          m_lineMarkCommittedBytes = 0; // committed+zeroed line-table prefix (bytes)
+    // Item F (paper §3.3.4): per-line reuse version. Bumped whenever a line is
+    // reclaimed/recycled (carve, sweep decommit, evac free). A persistent evac
+    // remembered-set entry records the source line's version at insert; at evac
+    // fix-up an entry whose line version has advanced is STALE (its source object
+    // was reclaimed and the line possibly reused) and is skipped. This is what
+    // lets the barrier-maintained remset stay persistent without dangling on
+    // reused slots. 16 bits: wrap needs 65536 reclaims of one line between insert
+    // and consume (impossible within a trace interval).
+    uint16_t*       m_lineReuseVer = nullptr;    // 1 uint16 / 256 B line
+    size_t          m_lineReuseVerCommittedBytes = 0; // committed prefix (bytes)
     uint8_t*        m_loggedTable = nullptr;  // 1 bit / 8 heap bytes: per-field "logged this epoch" (coalescing unlogged bit, paper A(ii))
     size_t          m_loggedCommittedBytes = 0; // committed logged-table prefix (bytes)
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block

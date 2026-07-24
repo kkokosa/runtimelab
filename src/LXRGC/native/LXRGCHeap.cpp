@@ -271,11 +271,27 @@ struct RemsetBuffer
 {
     static const size_t kCapacity = 4096;
     Object** Entries[kCapacity];
+    uint32_t Ver[kCapacity];   // item F (§3.3.4): source line reuse version at insert
     size_t Count = 0;
+    LONG InUse = 0;            // 1 = a thread's current append target / collector-owned
     RemsetBuffer* NextRegistered = nullptr;
+    RemsetBuffer* NextFree = nullptr;   // Treiber free-list link (spare when non-null owner)
 };
 static thread_local RemsetBuffer* t_remsetBuffer = nullptr;
 static RemsetBuffer* volatile g_registeredRemsetBuffers = nullptr;
+// Shared free-list of spare remset buffers (paper §3.2.1 shared-queue swap-in),
+// mirroring g_freeModifiedBuffers: when a thread's per-thread remset buffer fills
+// mid-window the barrier swaps in a pre-registered spare instead of DROPPING the
+// inter-block edge (which forced the O(live-heap) full-walk evac-fixup fallback).
+// Topped up OFF the barrier in EnsureThreadBuffers; replenished at CompactRemsets.
+static RemsetBuffer* volatile g_freeRemsetBuffers = nullptr;
+static volatile LONG g_freeRemsetCount = 0;
+// Item F: a collector-owned remset buffer for edges created by GC-internal object
+// relocation (evac copies / young-survivor promotions). Those are memcpy stores
+// that never fire the write barrier, so their inter-block out-edges must be
+// registered explicitly (RecordRemsetEdge). Appended only by the single collector
+// thread under STW; linked into g_registeredRemsetBuffers so all consumers see it.
+static RemsetBuffer* g_collectorRemset = nullptr;
 static CRITICAL_SECTION g_remsetLock;
 static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation is enabled
 // Item F: a mutator's per-thread remset buffer filled, so an inter-block store
@@ -299,6 +315,44 @@ static void RegisterRemsetBuffer(RemsetBuffer* nb)
         if (InterlockedCompareExchangePointer((PVOID volatile*)&g_registeredRemsetBuffers,
                                               nb, head) == head)
             return;
+    }
+}
+
+// Lock-free push/pop of a spare remset buffer (mirrors PushFreeModifiedBuffer /
+// PopFreeModifiedBuffer). A buffer stays permanently linked in the append-only
+// registry (NextRegistered) and, when free, additionally sits on this Treiber
+// stack (NextFree) with Count==0. Pop runs only in the cooperative-mode barrier;
+// push only off-barrier / at STW compaction, so a popped buffer is never
+// concurrently pushed (single logical owner).
+static void PushFreeRemsetBuffer(RemsetBuffer* nb)
+{
+    for (;;)
+    {
+        RemsetBuffer* head = g_freeRemsetBuffers;
+        nb->NextFree = head;
+        if (InterlockedCompareExchangePointer((PVOID volatile*)&g_freeRemsetBuffers,
+                                              nb, head) == head)
+        {
+            InterlockedIncrement(&g_freeRemsetCount);
+            return;
+        }
+    }
+}
+static RemsetBuffer* PopFreeRemsetBuffer()
+{
+    for (;;)
+    {
+        RemsetBuffer* head = g_freeRemsetBuffers;
+        if (head == nullptr)
+            return nullptr;
+        RemsetBuffer* next = head->NextFree;
+        if (InterlockedCompareExchangePointer((PVOID volatile*)&g_freeRemsetBuffers,
+                                              next, head) == head)
+        {
+            InterlockedDecrement(&g_freeRemsetCount);
+            head->NextFree = nullptr;
+            return head;
+        }
     }
 }
 
@@ -996,6 +1050,15 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     if (m_lineMarkTable == nullptr)
         return false;
 
+    // Item F (paper §3.3.4): per-line reuse-version table, 1 uint16 per 256 B
+    // line. Reserved only; committed to the used-heap prefix alongside the mark
+    // table (EnsureLineReuseCommitted). Backs the persistent evac remembered set's
+    // stale-entry filtering.
+    size_t lineVerBytes = (heapReservedBytes / lxr::kLineSize) * sizeof(uint16_t);
+    m_lineReuseVer = (uint16_t*)VirtualAlloc(nullptr, lineVerBytes, MEM_RESERVE, PAGE_READWRITE);
+    if (m_lineReuseVer == nullptr)
+        return false;
+
     InitializeCriticalSection(&m_collectLock);
     InitializeCriticalSection(&g_buffersLock);
     InitializeCriticalSection(&g_satbLock);
@@ -1235,7 +1298,22 @@ static void EnsureThreadBuffers()
     if (t_remsetBuffer == nullptr)
     {
         RemsetBuffer* rb = new (std::nothrow) RemsetBuffer();
-        if (rb != nullptr) { t_remsetBuffer = rb; RegisterRemsetBuffer(rb); }
+        if (rb != nullptr) { rb->InUse = 1; t_remsetBuffer = rb; RegisterRemsetBuffer(rb); }
+    }
+    // Keep the shared free-list of spare remset buffers topped up OFF the barrier
+    // (item F, §3.2.1). The barrier swaps to one of these when a thread's remset
+    // buffer fills mid-window, so an inter-block edge is never dropped (which would
+    // force the O(live-heap) full-walk evac fixup). Each spare holds 4096 edges.
+    if (g_remsetActive)
+    {
+        const LONG kRemsetSpareTarget = 64;
+        while (g_freeRemsetCount < kRemsetSpareTarget)
+        {
+            RemsetBuffer* rb = new (std::nothrow) RemsetBuffer();
+            if (rb == nullptr) break;
+            RegisterRemsetBuffer(rb);   // registered so consumers/compaction walk it
+            PushFreeRemsetBuffer(rb);   // available for the barrier to swap in
+        }
     }
 }
 
@@ -1264,6 +1342,11 @@ void LXRCollector::EnsureLoggedUpTo(uint8_t* addrEnd)
         if (VirtualAlloc(from, delta, MEM_COMMIT, PAGE_READWRITE) != nullptr)
             m_loggedCommittedBytes = neededBytes; // publish AFTER the commit succeeds
     }
+    // Item F: grow the per-line reuse-version table on the same alloc-path cadence
+    // so a young region reclaimed before the next trace already has committed
+    // version slots to bump (else its reclamation would go unversioned and a stale
+    // remset entry into it could escape filtering).
+    EnsureLineReuseCommitted(usedBytes);
 }
 
 // Unlogged-bit test-and-set (paper §3.4). Returns true the FIRST time a field is
@@ -1320,6 +1403,13 @@ void LXRCollector::ClearLoggedBit(Object** slot)
 // STW only (non-atomic byte writes). Bounded to the committed logged prefix.
 void LXRCollector::ClearLoggedRange(uint8_t* start, uint8_t* end)
 {
+    // Item F (§3.3.4): this is the canonical "range reclaimed/reused" hook, so it
+    // is also where the persistent evac remembered set's per-line reuse version is
+    // bumped. Any remset entry recorded against a line in [start,end) becomes
+    // STALE here (its source object is gone / the line may be reused), and evac
+    // fix-up detects that by the advanced version. Bump BEFORE the logged-bit
+    // clamp mutates start/end.
+    BumpLineReuseRange(start, end);
     if (m_loggedTable == nullptr) return;
     if (start < m_heapBase) start = m_heapBase;
     if (end > m_heapBase + m_heapBytes) end = m_heapBase + m_heapBytes;
@@ -1354,6 +1444,59 @@ void LXRCollector::ResetLoggedTable()
 {
     if (m_loggedTable != nullptr && m_loggedCommittedBytes > 0)
         memset(m_loggedTable, 0, m_loggedCommittedBytes);
+}
+
+// --- Item F (§3.3.4): per-line reuse versioning ---------------------------
+// Commit the version-table prefix covering the used heap. Unlike the mark/line
+// tables (re-zeroed each cycle), this table PERSISTS for the whole run: only the
+// committed prefix grows, and freshly-committed pages are zero (version 0). Never
+// memset the existing prefix (it would wipe live versions). STW only.
+void LXRCollector::EnsureLineReuseCommitted(size_t usedBytes)
+{
+    if (m_lineReuseVer == nullptr) return;
+    size_t needLines = usedBytes / lxr::kLineSize + 1;
+    size_t needBytes = needLines * sizeof(uint16_t);
+    needBytes = (needBytes + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
+    size_t cap = (m_heapBytes / lxr::kLineSize) * sizeof(uint16_t);
+    if (needBytes > cap) needBytes = cap;
+    if (needBytes > m_lineReuseVerCommittedBytes)
+    {
+        // MEM_COMMIT is idempotent and does NOT re-zero already-committed pages,
+        // so committing the whole prefix preserves existing versions; only the
+        // new tail pages come in zeroed.
+        VirtualAlloc(m_lineReuseVer, needBytes, MEM_COMMIT, PAGE_READWRITE);
+        m_lineReuseVerCommittedBytes = needBytes;
+    }
+}
+
+// Read a line's current reuse version. Off-prefix / off-heap => 0 (a never-
+// reclaimed line). Safe to call from the barrier (monotonic committed prefix).
+uint32_t LXRCollector::LineReuseVerOf(void* addr) const
+{
+    if (m_lineReuseVer == nullptr) return 0;
+    uint8_t* p = (uint8_t*)addr;
+    if (p < m_heapBase || p >= m_heapBase + m_heapBytes) return 0;
+    size_t line = (size_t)(p - m_heapBase) / lxr::kLineSize;
+    if (line * sizeof(uint16_t) >= m_lineReuseVerCommittedBytes) return 0;
+    return m_lineReuseVer[line];
+}
+
+// Increment the reuse version of every line overlapping [start,end). STW only
+// (non-atomic 16-bit increments): every caller (carve, sweep decommit, evac free)
+// runs inside a collection pause.
+void LXRCollector::BumpLineReuseRange(uint8_t* start, uint8_t* end)
+{
+    if (m_lineReuseVer == nullptr || end <= start) return;
+    if (start < m_heapBase) start = m_heapBase;
+    if (end > m_heapBase + m_heapBytes) end = m_heapBase + m_heapBytes;
+    if (end <= start) return;
+    size_t firstLine = (size_t)(start - m_heapBase) / lxr::kLineSize;
+    size_t lastLine  = (size_t)(end - 1 - m_heapBase) / lxr::kLineSize;
+    size_t maxLine = m_lineReuseVerCommittedBytes / sizeof(uint16_t);
+    if (firstLine >= maxLine) return;
+    if (lastLine >= maxLine) lastLine = maxLine - 1;
+    for (size_t line = firstLine; line <= lastLine; line++)
+        m_lineReuseVer[line]++;
 }
 
 // LXR write-barrier slow path. Reached from the runtime's generic Callback
@@ -1463,15 +1606,39 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
         if (sblk != tblk)
         {
             RemsetBuffer* rb = t_remsetBuffer;
+            if (rb == nullptr || rb->Count >= RemsetBuffer::kCapacity)
+            {
+                // Item F (§3.2.1): current buffer full (or absent) -> swap in a
+                // pre-registered spare from the shared free-list so NO inter-block
+                // edge is dropped (a drop would force the O(live-heap) full-walk
+                // evac fixup). The old buffer stays registered (consumers read the
+                // whole chain) and is recycled at CompactRemsets. Sole-owner writes.
+                RemsetBuffer* fresh = PopFreeRemsetBuffer();
+                if (fresh != nullptr)
+                {
+                    if (rb != nullptr) rb->InUse = 0; // swapped away: recyclable at compact
+                    fresh->Count = 0;
+                    fresh->InUse = 1;
+                    t_remsetBuffer = fresh;
+                    rb = fresh;
+                }
+            }
             if (rb != nullptr && rb->Count < RemsetBuffer::kCapacity)
             {
-                rb->Entries[rb->Count++] = slot;
+                // Item F (§3.3.4): tag with the source line's current reuse
+                // version so evac can drop this entry as stale if the line is
+                // reclaimed before the next evacuation.
+                rb->Entries[rb->Count] = slot;
+                rb->Ver[rb->Count] = LineReuseVerOf(slot);
+                rb->Count++;
                 InterlockedIncrement64(&g_lxrCounters.RemsetEntries);
             }
             else
             {
-                // Dropped an inter-block edge: mark the remset incomplete so the
-                // young collector falls back to the authoritative trace this cycle.
+                // Shared free-list momentarily exhausted (rare: spares topped up on
+                // every allocation) -> dropped an inter-block edge. Mark the remset
+                // incomplete so evac uses the sound full-walk fixup and the nursery
+                // falls back to the authoritative trace this cycle.
                 InterlockedExchange(&g_remsetOverflow, 1);
             }
         }
@@ -1547,6 +1714,122 @@ void LXRCollector::ResetRemsets()
         rb->Count = 0;
     LeaveCriticalSection(&g_remsetLock);
     InterlockedExchange(&g_remsetOverflow, 0);
+}
+
+// Item F (§3.3.4): register an inter-block edge created by GC-internal relocation
+// (evac copy / young-survivor promotion). memcpy stores skip the barrier, so the
+// copy's outgoing inter-block references would otherwise be absent from the
+// persistent remembered set and dangle at a later evacuation. Appends (slot,
+// current line reuse version) to the collector-owned buffer. STW / single-thread.
+void LXRCollector::RecordRemsetEdge(Object** slot)
+{
+    if (!g_remsetActive)
+        return;
+    if (g_collectorRemset == nullptr || g_collectorRemset->Count >= RemsetBuffer::kCapacity)
+    {
+        RemsetBuffer* nb = new (std::nothrow) RemsetBuffer();
+        if (nb == nullptr) { InterlockedExchange(&g_remsetOverflow, 1); return; }
+        nb->InUse = 1;                 // collector-owned: never recycled as a spare
+        RegisterRemsetBuffer(nb);      // link into the shared chain
+        g_collectorRemset = nb;
+    }
+    RemsetBuffer* rb = g_collectorRemset;
+    rb->Entries[rb->Count] = slot;
+    rb->Ver[rb->Count] = LineReuseVerOf(slot);
+    rb->Count++;
+    InterlockedIncrement64(&g_lxrCounters.RemsetEntries);
+}
+
+// Item F (§3.3.4): the persistent alternative to ResetRemsets. Called at trace
+// finish AFTER Evacuate() has consumed the set. Instead of clearing (which would
+// drop still-valid edges that the barrier will never re-log - notably memcpy'd
+// relocation edges), it prunes:
+//   * STALE entries  - the source line's reuse version advanced since insert, so
+//                      the referrer object was reclaimed / the line reused;
+//   * DUPLICATE entries - the same slot logged multiple times.
+// keeping the set bounded to the live inter-block edge working set. If the barrier
+// dropped entries at any point (g_remsetOverflow), completeness is lost and cannot
+// be recovered by pruning, so it REBUILDS the set from the just-completed mark
+// (every live inter-block edge is re-derivable by scanning marked objects) - an
+// O(live) pass that runs only on the rare overflow. STW only.
+void LXRCollector::CompactRemsets()
+{
+    if (g_remsetOverflow)
+    {
+        EnterCriticalSection(&g_remsetLock);
+        // Discard the (incomplete) set: clear every buffer and recycle swapped-away
+        // per-thread buffers (InUse==0) that held data back onto the spare list.
+        // A thread's current buffer (InUse==1) and collector buffers stay put.
+        for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+        {
+            bool hadData = rb->Count > 0;
+            rb->Count = 0;
+            if (hadData && rb->InUse == 0)
+                PushFreeRemsetBuffer(rb);
+        }
+        LeaveCriticalSection(&g_remsetLock);
+        EnterCriticalSection(&g_chunkLock);
+        size_t n = g_chunkCount;
+        for (size_t i = 0; i < n; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed)
+                continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            uint8_t* p = c.Start;
+            while (p < end)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0)
+                    break;
+                p += sz;
+                if (!IsMarked(o))
+                    continue;
+                GCScanObjectRefs(o, sz, [this](Object** f)
+                {
+                    Object* nv = *f;
+                    if (nv == nullptr || !InHeap(nv))
+                        return;
+                    uintptr_t sb = (uintptr_t)f  & ~(lxr::kBlockSize - 1);
+                    uintptr_t tb = (uintptr_t)nv & ~(lxr::kBlockSize - 1);
+                    if (sb != tb)
+                        RecordRemsetEdge(f);
+                });
+            }
+        }
+        LeaveCriticalSection(&g_chunkLock);
+        InterlockedExchange(&g_remsetOverflow, 0);
+        InterlockedIncrement64(&g_lxrCounters.RemsetRebuilds);
+        return;
+    }
+
+    EnterCriticalSection(&g_remsetLock);
+    std::unordered_set<Object**> seen;
+    for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+    {
+        bool hadData = rb->Count > 0;
+        size_t w = 0;
+        for (size_t i = 0; i < rb->Count; i++)
+        {
+            Object** slot = rb->Entries[i];
+            if (LineReuseVerOf(slot) != rb->Ver[i])
+                continue;                       // stale: source line reclaimed
+            if (!seen.insert(slot).second)
+                continue;                       // duplicate
+            rb->Entries[w] = slot;
+            rb->Ver[w] = rb->Ver[i];
+            w++;
+        }
+        rb->Count = w;
+        // A swapped-away per-thread buffer (InUse==0) whose entries all pruned to
+        // empty is returned to the spare free-list for reuse (paper §3.2.1). Guard
+        // on hadData so an already-free spare (Count was 0) is never double-pushed;
+        // current/collector buffers (InUse==1) are never recycled.
+        if (hadData && w == 0 && rb->InUse == 0)
+            PushFreeRemsetBuffer(rb);
+    }
+    LeaveCriticalSection(&g_remsetLock);
 }
 
 void LXRCollector::EnqueueZeroCount(Object* obj)
@@ -2191,6 +2474,9 @@ void LXRCollector::ResetMarks()
                                                   : (m_heapBase + m_heapBytes);
     size_t usedBytes = (size_t)(highWater - m_heapBase);
     size_t neededBytes = (usedBytes / lxr::kObjectGranule + 7) / 8;
+    // Item F: grow the persistent per-line reuse-version table to cover the used
+    // heap (persists across cycles; never re-zeroed).
+    EnsureLineReuseCommitted(usedBytes);
     // Round up to a page so the whole covering range is committed.
     neededBytes = (neededBytes + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
     size_t cap = (m_heapBytes / lxr::kObjectGranule + 7) / 8;
@@ -3849,49 +4135,140 @@ void LXRCollector::Evacuate()
     static int s_scopedFixup = -1;
     if (s_scopedFixup < 0)
         s_scopedFixup = (getenv("LXR_EVAC_SCOPED_FIXUP") != nullptr && getenv("LXR_EVAC_SCOPED_FIXUP")[0] == '0') ? 0 : 1;
-    bool useScoped = s_scopedFixup && g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0;
+    // Item F (§3.3.4): by default the incoming-edge source is the PERSISTENT,
+    // barrier-maintained, line-reuse-tagged remembered set - which is complete
+    // without a dedicated STW mark, so evacuation can run in a concurrent-trace
+    // finish pause. LXR_EVAC_PERSIST=0 selects the legacy per-evac-cycle STW-mark-
+    // derived edge logs (g_evacEdgeLogs) for A/B bisection.
+    static int s_persist = -1;
+    if (s_persist < 0)
+        s_persist = (getenv("LXR_EVAC_PERSIST") != nullptr && getenv("LXR_EVAC_PERSIST")[0] == '0') ? 0 : 1;
+    // Fall back to the sound full-heap walk when the chosen remembered set may be
+    // incomplete: persistent set -> a barrier drop this interval (repaired only at
+    // the *next* CompactRemsets); legacy set -> a lane overflow or a conservative-
+    // keep-alive cycle (objects marked without a field scan, so no out-edges logged).
+    bool useScoped = s_scopedFixup &&
+        (s_persist ? (g_remsetActive && g_remsetOverflow == 0)
+                   : (g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0));
 
     if (useScoped)
     {
         InterlockedIncrement64(&g_lxrCounters.EvacRemsetFixups);
-        // (a) Outgoing edges of moved objects: scan each destination copy. Bounded
-        //     by the evacuated live bytes (small), not the whole heap.
+        // (a) Outgoing edges of moved objects: scan each destination copy, forward
+        //     its fields, AND (persistent mode) register its inter-block out-edges
+        //     into the remembered set. The copy was produced by memcpy, so those
+        //     edges never fired the write barrier; unless remembered here they
+        //     would be absent from the set and dangle at a FUTURE evacuation.
         for (const MovedRange& r : movedRanges)
-            GCScanObjectRefs((Object*)r.newStart, (size_t)(r.oldEnd - r.oldStart), rebaseField);
-        // (b) Incoming edges from non-moved referrers: replay the recorded inter-
-        //     block slots. Skip any slot that lies inside a moved source range --
-        //     that source is retired and its copy's fields were fixed up in (a);
-        //     reading the stale source would just waste work. Binary-search the
-        //     sorted movedRanges to classify each slot.
-        EnterCriticalSection(&g_evacEdgeLock);
-        for (std::vector<Object**>* log : g_evacEdgeLogs)
-        {
-            for (Object** slot : *log)
-            {
-                uint8_t* sa = (uint8_t*)slot;
-                size_t lo = 0, hi = movedRanges.size();
-                while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
-                if (lo != 0)
+            GCScanObjectRefs((Object*)r.newStart, (size_t)(r.oldEnd - r.oldStart),
+                [&](Object** f)
                 {
-                    const MovedRange& mr = movedRanges[lo - 1];
-                    if (sa >= mr.oldStart && sa < mr.oldEnd)
-                        continue; // slot inside a moved source: handled by (a)
-                }
-                rebaseField(slot);
-            }
-        }
-        LeaveCriticalSection(&g_evacEdgeLock);
-        // (c) In-place survivors of the evac regions (pinned objects, or objects
-        //     that could not be evac-allocated) may hold INTRA-region references
-        //     to objects that DID move -- evacuation is per-OBJECT, so a pinned
-        //     object stays put while its same-block neighbour moves, leaving an
-        //     intra-block edge that the (inter-block) remembered set deliberately
-        //     excludes. Scan the evac regions' surviving marked objects directly.
-        //     Bounded by the evac-set size (the copy budget), NOT the whole heap.
-        for (const EvacRegion& er : evac)
+                    rebaseField(f);
+                    if (s_persist)
+                    {
+                        Object* nv = *f;
+                        if (nv != nullptr && InHeap(nv))
+                        {
+                            uintptr_t sb = (uintptr_t)f  & ~(lxr::kBlockSize - 1);
+                            uintptr_t tb = (uintptr_t)nv & ~(lxr::kBlockSize - 1);
+                            if (sb != tb) RecordRemsetEdge(f);
+                        }
+                    }
+                });
+        // (b) Incoming edges from non-moved referrers.
+        if (s_persist)
         {
-            uint8_t* p = er.start;
-            while (p < er.usedEnd)
+            // Persistent remset entries can point into a region freed since insert.
+            // The line-reuse version catches the reclaim; a cached-VirtualQuery
+            // committed guard catches any residual (e.g. a store that raced ahead
+            // of the version-table commit).
+            uint8_t* cqBase = nullptr; size_t cqLen = 0; bool cqComm = false;
+            auto slotCommitted = [&](void* s) -> bool
+            {
+                if ((uint8_t*)s < cqBase || (uint8_t*)s >= cqBase + cqLen)
+                {
+                    MEMORY_BASIC_INFORMATION mbi;
+                    if (VirtualQuery(s, &mbi, sizeof(mbi)) == 0) { cqBase = nullptr; cqLen = 0; cqComm = false; return false; }
+                    cqBase = (uint8_t*)mbi.BaseAddress; cqLen = mbi.RegionSize; cqComm = (mbi.State == MEM_COMMIT);
+                }
+                return cqComm;
+            };
+            EnterCriticalSection(&g_remsetLock);
+            for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+            {
+                for (size_t i = 0; i < rb->Count; i++)
+                {
+                    Object** slot = rb->Entries[i];
+                    if (LineReuseVerOf(slot) != rb->Ver[i])
+                    { InterlockedIncrement64(&g_lxrCounters.RemsetStaleSkipped); continue; } // stale: source line reclaimed
+                    uint8_t* sa = (uint8_t*)slot;
+                    size_t lo = 0, hi = movedRanges.size();
+                    while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                    if (lo != 0)
+                    {
+                        const MovedRange& mr = movedRanges[lo - 1];
+                        if (sa >= mr.oldStart && sa < mr.oldEnd)
+                            continue; // slot inside a moved source: handled by (a)
+                    }
+                    if (!slotCommitted(slot))
+                        continue; // referrer region decommitted since insert
+                    rebaseField(slot);
+                }
+            }
+            LeaveCriticalSection(&g_remsetLock);
+        }
+        else
+        {
+            EnterCriticalSection(&g_evacEdgeLock);
+            for (std::vector<Object**>* log : g_evacEdgeLogs)
+            {
+                for (Object** slot : *log)
+                {
+                    uint8_t* sa = (uint8_t*)slot;
+                    size_t lo = 0, hi = movedRanges.size();
+                    while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                    if (lo != 0)
+                    {
+                        const MovedRange& mr = movedRanges[lo - 1];
+                        if (sa >= mr.oldStart && sa < mr.oldEnd)
+                            continue; // slot inside a moved source: handled by (a)
+                    }
+                    rebaseField(slot);
+                }
+            }
+            LeaveCriticalSection(&g_evacEdgeLock);
+        }
+        // (c) In-place survivors that share a 32 KiB Immix BLOCK with an evacuated
+        //     object may hold INTRA-block references to objects that DID move.
+        //     Evacuation is per-OBJECT and our regions are sub-block (the sweep
+        //     carves a block into several regions), so a referrer can sit in a
+        //     DIFFERENT region of the SAME block as a moved object - including an
+        //     active alloc-context region. Such intra-block edges are deliberately
+        //     excluded from the (inter-block) remembered set, so scan every live
+        //     object in every block touched by the evac set (not just the evac
+        //     regions). Bounded by the evac-set's block span (the copy budget), NOT
+        //     the whole heap.
+        std::unordered_set<uintptr_t> touchedBlocks;
+        for (const EvacRegion& er : evac)
+            for (uint8_t* b = (uint8_t*)((uintptr_t)er.start & ~(lxr::kBlockSize - 1));
+                 b < er.usedEnd; b += lxr::kBlockSize)
+                touchedBlocks.insert((uintptr_t)b);
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed)
+                continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            if (end <= c.Start)
+                continue;
+            bool overlaps = false;
+            for (uint8_t* b = (uint8_t*)((uintptr_t)c.Start & ~(lxr::kBlockSize - 1));
+                 b < end; b += lxr::kBlockSize)
+                if (touchedBlocks.count((uintptr_t)b)) { overlaps = true; break; }
+            if (!overlaps)
+                continue;
+            uint8_t* p = c.Start;
+            while (p < end)
             {
                 Object* o = (Object*)p;
                 size_t sz = LXRObjectSize(o);
@@ -3931,7 +4308,29 @@ void LXRCollector::Evacuate()
             }
         }
     }
-    //     step 4 forwarded EVERY heap reference to a moved object. Any marked,
+    // Item D-copy: an evac copy M' is produced by memcpy, so M's mature->young
+    // edges are duplicated into M' at NEW slot addresses while the D-copy old->
+    // young remembered set (g_dcopyModifiedSlots) still holds the DEAD source M's
+    // slots. If this finish pause does NOT age the nursery (a multi-epoch meFinish
+    // runs with phase==RCPause, so the epoch bump that would mature the targets and
+    // clear the remset is skipped), M'->young stays live-and-untracked and would
+    // dangle when a later nursery-copy relocates the young target. Re-register each
+    // evac copy's young out-edges at the copy's stable (mature) slot. At a
+    // TracePause finish the subsequent epoch bump clears these again, harmlessly.
+    if (g_dcopyCaptureModified && !g_dcopyRemsetOverflow)
+    {
+        for (const MovedRange& r : movedRanges)
+            GCScanObjectRefs((Object*)r.newStart, (size_t)(r.oldEnd - r.oldStart),
+                [&](Object** f)
+                {
+                    Object* t = *f;
+                    if (t == nullptr) return;
+                    if ((uint8_t*)t < m_heapBase || (uint8_t*)t >= m_heapBase + m_heapBytes) return;
+                    if (!IsYoung(t)) return;
+                    if (g_dcopyModifiedSlots.size() >= kDCopyRemsetCap) { g_dcopyRemsetOverflow = 1; return; }
+                    g_dcopyModifiedSlots.push_back(f);
+                });
+    }
     //     non-source object whose field still points at a forwarding source is a
     //     miss that would dangle once the source region is decommitted. Log the
     //     referrer (region/owner/offset/MT) so the structural gap is pinpointed.
@@ -4945,6 +5344,25 @@ void LXRCollector::CopyYoungSurvivors()
                     g_dcopyModifiedSlots.push_back(f);
                 });
             }
+            // Item F (§3.3.4): the promoted copy is a MATURE object produced by
+            // memcpy, so its outgoing inter-block references never fired the write
+            // barrier and are therefore ABSENT from the evacuation remembered set.
+            // If any such mature target is later evacuated, this promoted referrer
+            // would be missed by the scoped fix-up and dangle. Register the copy's
+            // inter-block out-edges into the evac remset now (dest slot address is
+            // stable mature space), exactly as Evacuate step (a) does for evac
+            // copies. Bounded by the promoted survivors' inter-block edge count.
+            if (g_remsetActive)
+            {
+                GCScanObjectRefs((Object*)d, sz, [&](Object** f)
+                {
+                    Object* nv = *f;
+                    if (nv == nullptr || !InHeap(nv)) return;
+                    uintptr_t sb = (uintptr_t)f  & ~(lxr::kBlockSize - 1);
+                    uintptr_t tb = (uintptr_t)nv & ~(lxr::kBlockSize - 1);
+                    if (sb != tb) RecordRemsetEdge(f);
+                });
+            }
             moved++;
             movedObjs++;
             movedBytes += (int64_t)sz;
@@ -5102,8 +5520,9 @@ void LXRCollector::CopyYoungSurvivors()
                     if (forwarding.find(*f) != forwarding.end())
                     {
                         if (misses < 20)
-                            fprintf(stderr, "LXRGC: [verify-nursery-copy] UNFORWARDED ref: referrer=%p mt=%p region=%zu off=%lld -> stale %p\n",
+                            fprintf(stderr, "LXRGC: [verify-nursery-copy] UNFORWARDED ref: referrer=%p mt=%p region=%zu owner=%d young=%d off=%lld -> stale %p\n",
                                     (void*)o, (void*)o->GetGCSafeMethodTable(), i,
+                                    (int)(c.Owner != nullptr), (int)IsYoung(o),
                                     (long long)((uint8_t*)f - op), (void*)*f);
                         misses++;
                     }
@@ -5927,18 +6346,17 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     // to the single-pause STW trace when concurrency is disabled or unavailable.
     //
     // Copying/evacuation, however, must run under a COMPLETE, precise STW trace.
-    // The LXR paper copies ONLY during stop-the-world pauses, and moving an
-    // object requires every live referrer to be marked so Evacuate's fix-up pass
-    // can forward it to the new location. A concurrent SATB trace + allocate-black
-    // is conservative for liveness but is NOT a safe basis for moving objects: a
-    // referrer the SATB deletion barrier failed to re-mark would be left pointing
-    // at the freed source copy -> dangling pointer -> access violation (observed
-    // as an NRE deep in socket IO on the webapi workload under CONCURRENT+EVAC).
-    // So per trace cycle we do EITHER a concurrent, non-moving SATB trace OR a
-    // fully-STW trace+evacuate - never evacuate on concurrent-only marks. When
-    // both features are enabled we alternate: most cycles trace concurrently
-    // (cheap pauses, collects cyclic garbage), and every kEvacEveryN-th cycle is
-    // a STW trace+evac that actually defragments. Every feature stays active.
+    // Item F (§3.3.4): LXR copies ONLY during stop-the-world pauses, and moving an
+    // object requires every live referrer to be forwarded by Evacuate's fix-up
+    // pass. Referrers come from two complete sources at a trace finish: (1) the
+    // just-completed mark (marked objects' out-fields are scanned+forwarded), and
+    // (2) the PERSISTENT, barrier-maintained, line-reuse-tagged remembered set,
+    // which captures inter-block mature->* edges the mark alone would miss (e.g.
+    // stores into already-marked objects). Because that remset is complete at
+    // EVERY trace finish - concurrent, multi-epoch, or STW - evacuation runs in
+    // the finish pause of any trace, with no dedicated every-Nth fully-STW backup
+    // trace. All trace-finish pauses suspend the EE and park the marker, so the
+    // copy is race-free; Evacuate self-limits by fragmentation + a copy budget.
     // --- Multi-epoch trace: classify this epoch's role BEFORE the evac/legacy-
     //     concurrent decisions (item C). While a trace is MARKING, every epoch is
     //     an ordinary RC pause (a "spanned" epoch) except the one that finalizes
@@ -5955,23 +6373,29 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         phase = LXRPhase::RCPause;
     }
 
-    static LONG s_traceCycleCounter = 0;
-    bool evacCycle = false;
-    if (phase == LXRPhase::TracePause && g_evacActive)
-    {
-        const LONG kEvacEveryN = 4;
-        LONG cyc = InterlockedIncrement(&s_traceCycleCounter);
-        evacCycle = (!g_concurrentEnabled) || (cyc % kEvacEveryN == 0);
-    }
-    // Begin a multi-epoch trace at this RC pause when idle and a (non-evac) trace
-    // is due. Evac cycles still take the fully-STW trace+evac path below.
+    // Item F (§3.3.4): with the PERSISTENT, barrier-maintained, line-reuse-tagged
+    // remembered set, evacuation no longer needs a dedicated fully-STW backup
+    // trace to derive its fix-up set - the set is complete at every trace finish.
+    // So evacuate in ANY trace-finish pause (STW, concurrent, or multi-epoch) and
+    // let the trace stay concurrent. Evacuate() self-limits by fragmentation and a
+    // copy budget, so "every finish" costs nothing when there is little to defrag.
+    bool doEvac = ((phase == LXRPhase::TracePause) || meFinish) && g_evacActive && doTrace;
+    // A trace COMPLETES this pause when it is a synchronous TracePause OR the
+    // multi-epoch finalize pause (meFinish). Both must age the nursery, bump the
+    // trace epoch, reset the D-copy old->young remembered set, and reset the trace
+    // predictors -- otherwise a multi-epoch trace (which finalizes with phase forced
+    // to RCPause) would complete without ever promoting the just-traced young
+    // window, leaving mature objects pointing at still-young survivors whose
+    // mature->young edges are absent from the barrier-maintained remset.
+    bool traceCompleted = (phase == LXRPhase::TracePause) || meFinish;
+    // Begin a multi-epoch trace at this RC pause when idle and a trace is due.
     if (g_multiEpoch && g_concurrentEnabled && g_theGCToCLR != nullptr && doTrace &&
-        g_traceState == TRACE_IDLE && phase == LXRPhase::TracePause && !evacCycle)
+        g_traceState == TRACE_IDLE && phase == LXRPhase::TracePause)
     {
         meStart = true;
     }
     bool useConcurrent = (phase == LXRPhase::TracePause) && doTrace &&
-                         g_concurrentEnabled && g_theGCToCLR != nullptr && !evacCycle &&
+                         g_concurrentEnabled && g_theGCToCLR != nullptr &&
                          !meStart;
 
     int64_t pauseMicros = 0;
@@ -6046,13 +6470,27 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (doBuffers)
             g_lxrCollector.SnapshotModifiedBuffers();
         QueryPerformanceCounter(&tf2);
+        // Item F: evacuate in this concurrent-trace finish pause (marks are
+        // complete; EE is suspended and the marker is parked). The persistent
+        // remembered set supplies the incoming-edge fix-up set - no dedicated STW
+        // backup trace needed. Must precede the sweep (which frees dead regions).
+        if (doEvac)
+        {
+            LXRSetPhase("me:evacuate");
+            g_lxrCollector.Evacuate();
+        }
         LXRSetPhase("me:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
         QueryPerformanceCounter(&tf3);
         if (verbose) { fprintf(stderr, "LXRGC: [stage]   finish breakdown: finish=%lldus bufs=%lldus sweep=%lldus\n", (long long)((tf1.QuadPart-tf0.QuadPart)*1000000/freq.QuadPart), (long long)((tf2.QuadPart-tf1.QuadPart)*1000000/freq.QuadPart), (long long)((tf3.QuadPart-tf2.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
+        // Item F: PRUNE the persistent remembered set (drop stale/duplicate
+        // entries; rebuild from marks on prior overflow) instead of clearing it -
+        // clearing would drop the evac copies' just-recorded memcpy out-edges that
+        // the barrier will never re-log. Runs AFTER Evacuate consumed it + AFTER
+        // the sweep bumped reclaimed lines' reuse versions.
         if (g_remsetActive)
-            g_lxrCollector.ResetRemsets();
+            g_lxrCollector.CompactRemsets();
         InterlockedExchange(&g_traceState, TRACE_IDLE);
         LXRSetPhase("me:restart-finish");
         LXRRestartEE();
@@ -6152,17 +6590,23 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("conc:finish-buffers");
         if (doBuffers)
             g_lxrCollector.ProcessModifiedBuffers();
+        // Item F: evacuate in this concurrent-trace finish pause (STW, marks
+        // complete). The persistent remembered set supplies the fix-up set.
+        if (doEvac)
+        {
+            LXRSetPhase("conc:evacuate");
+            g_lxrCollector.Evacuate();
+        }
         LXRSetPhase("conc:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
-        // Item F: a complete trace re-establishes remset completeness (all live
-        // mature->young edges are re-derivable from the marked-object graph) and
-        // the epoch bump below ages all current young to mature, so pre-trace
-        // remset entries are irrelevant to the next nursery window. Discard them
-        // under the pause (the barrier appends lock-free; resetting post-restart
-        // would race). Clears the overflow flag, restoring completeness.
+        // Item F: PRUNE the persistent remembered set (drop stale/duplicate
+        // entries; rebuild from marks on prior overflow) rather than clearing it,
+        // so the evac copies' just-recorded memcpy out-edges survive for the next
+        // evacuation. Runs after Evacuate consumed it and after the sweep bumped
+        // reclaimed lines' reuse versions.
         if (g_remsetActive)
-            g_lxrCollector.ResetRemsets();
+            g_lxrCollector.CompactRemsets();
         LXRSetPhase("conc:restart-finish");
         LXRRestartEE();
         LXRSetPhase("idle");
@@ -6216,15 +6660,16 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             if (doTrace)
             {
                 LXRSetPhase("stw:backuptrace");
-                // Item F (F3): on an evac cycle, bootstrap the evac remembered set
-                // from this mark. Reset the lane logs first (fresh set per cycle),
-                // record inter-block edges during the closure, then stop recording.
-                if (evacCycle) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
+                // Item F (F3): keep the legacy STW-mark-derived evac edge log as an
+                // A/B fallback (consumed by Evacuate only when LXR_EVAC_PERSIST=0).
+                // The default path uses the PERSISTENT barrier-maintained remset and
+                // ignores these logs. Reset+record inter-block edges during closure.
+                if (doEvac) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
                 g_lxrCollector.BackupTrace();
-                if (evacCycle) InterlockedExchange(&g_recordEvacEdges, 0);
+                if (doEvac) InterlockedExchange(&g_recordEvacEdges, 0);
                 if (verbose) { fprintf(stderr, "LXRGC: [stage] BackupTrace done\n"); fflush(stderr); }
             }
-            if (evacCycle)
+            if (doEvac)
             {
                 LXRSetPhase("stw:evacuate");
                 g_lxrCollector.Evacuate();
@@ -6240,12 +6685,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             // safe here under the pause.
             if (g_lxrCollector.IsSatbActive())
                 g_lxrCollector.ResetSatbBuffers();
-            // Item F: discard the pre-trace remembered set under the pause (see the
-            // concurrent-finish path for the rationale: complete trace + young
-            // aging make pre-trace mature->young edges irrelevant, and resetting
-            // post-restart would race the lock-free barrier append).
+            // Item F: PRUNE (not clear) the persistent remembered set - preserve the
+            // evac copies' recorded memcpy out-edges; drop stale/duplicate entries;
+            // rebuild from marks on prior overflow. Runs after Evacuate + sweep.
             if (g_remsetActive)
-                g_lxrCollector.ResetRemsets();
+                g_lxrCollector.CompactRemsets();
         }
         else
         {
@@ -6293,6 +6737,14 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     {
         InterlockedIncrement64(&g_lxrCounters.TracePauses);
         InterlockedExchangeAdd64(&g_lxrCounters.TracePausePauseMicros, pauseMicros);
+    }
+    else
+    {
+        InterlockedIncrement64(&g_lxrCounters.RCPauses);
+        InterlockedExchangeAdd64(&g_lxrCounters.RCPausePauseMicros, pauseMicros);
+    }
+    if (traceCompleted)
+    {
         // Item E predictors, both using the paper's asymmetric ("biased")
         // exponential decay (§3.2.5): react fast to a rising signal (¾ new, ¼ old)
         // and decay slowly on a falling one (¼ new, ¾ old) so the collector never
@@ -6340,13 +6792,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     }
     else
     {
-        InterlockedIncrement64(&g_lxrCounters.RCPauses);
-        InterlockedExchangeAdd64(&g_lxrCounters.RCPausePauseMicros, pauseMicros);
         InterlockedIncrement64(&g_epochsSinceTrace);
     }
     // Legacy "Collections" counter continues to count full reclaiming cycles so
     // existing runtime GC counters / reports keep reporting real collections.
-    if (phase == LXRPhase::TracePause)
+    if (traceCompleted)
         InterlockedIncrement64(&g_lxrCounters.Collections);
 
     if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%% wastageEwma=%lld%% satbEntries=%lld satbMarks=%lld remsetEntries=%lld)\n",
