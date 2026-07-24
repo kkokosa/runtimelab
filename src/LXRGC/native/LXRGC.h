@@ -184,6 +184,18 @@ struct LXRCounters
     volatile int64_t NurseryBytesReclaimed; // young bytes decommitted by the nursery
     volatile int64_t NurseryLiveYoung;      // live young objects retained at the last nursery pass
 
+    // Item D-copy: young-survivor copy-at-RC-pause (paper §3.3.1-3). Live young
+    // (RC>0) survivors are copied out of young regions into fresh MATURE space at
+    // the RC pause to defragment + promote, letting the emptied young regions be
+    // recycled instead of leaving survivors in place for the later trace Evacuate.
+    volatile int64_t NurseryCopyPasses;      // survivor-copy passes run
+    volatile int64_t NurseryCopyObjects;     // young survivors relocated (promoted)
+    volatile int64_t NurseryCopyBytes;       // survivor bytes copied
+    volatile int64_t NurseryCopyPinned;      // live young survivors left in place (root/handle-pinned)
+    volatile int64_t NurseryCopyRegionsFreed;// young regions freed after full survivor evacuation
+    volatile int64_t NurseryCopyFieldsForwarded; // heap refs rewritten to promoted survivors
+    volatile int64_t NurseryCopyFullWalks;   // passes that fell back to the O(heap) fixup walk
+
     // Item ★ (primary-RC mature reclamation): mature memory returned at the RC
     // pause by RC authority (RC==0), NOT by the backup trace's mark-sweep. This
     // is what makes RC the PRIMARY reclaimer (paper §3.3) rather than the trace.
@@ -340,6 +352,19 @@ public:
     // open, so freeing young can never dangle a live mature->young edge.
     void CollectNursery();
 
+    // Item D-copy (paper §3.3.1-3): at the RC pause, copy the live young (RC>0)
+    // SURVIVORS out of young regions into fresh MATURE destination space, then
+    // recycle the emptied young regions. This is the defragmenting/promoting half
+    // of item D (the reclaim-only half is CollectNursery). Liveness is RC (marks
+    // are stale outside a trace window); reference fix-up to moved survivors uses
+    // the inter-block remembered set (item F) for incoming edges + the moved
+    // copies' outgoing edges + in-place pinned survivors, with an O(heap) full-walk
+    // fallback when the remset is unavailable/overflowed. Root/handle referents are
+    // pinned (not moved); interior-root-unresolved cycles are skipped. Runs before
+    // CollectNursery so fully-evacuated regions are freed here and all-dead regions
+    // are mopped up there. Self-guards on g_traceWindowOpen / g_youngRCIncomplete.
+    void CopyYoungSurvivors();
+
     // Item ★ (primary-RC mature reclamation, paper §3.3): at each RC pause,
     // return MATURE memory whose reference count has dropped to zero, WITHOUT
     // waiting for the backup trace. RC is authoritative outside a trace window
@@ -361,6 +386,9 @@ public:
     // allocate-black instead. Sound because reclamation is mark-authoritative on
     // every trace cycle and RC-only pauses never reclaim.
     void StampBornEpoch(uint8_t* start, size_t size);
+    // Stamp blocks as MATURE (aged out of the current window) so IsYoung() is
+    // false there. Used for CopyYoungSurvivors promotion destinations.
+    void StampMatureEpoch(uint8_t* start, size_t size);
     bool IsYoung(Object* obj);
 
     // --- Backup trace (stop-the-world mark) + Immix reclamation ---

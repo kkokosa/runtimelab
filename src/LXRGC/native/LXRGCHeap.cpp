@@ -609,6 +609,21 @@ static volatile LONG g_youngRC = 0;
 // authoritative young reclamation needs a complete mature->young remembered set
 // (a complete write barrier); see the CollectNursery gate and Initialize().
 static volatile LONG g_nurseryActive = 0;
+// Item D-copy: young-survivor copy at RC pauses (env LXR_NURSERY_COPY). When set,
+// ProcessModifiedBuffers accumulates every modified slot whose CURRENT value is a
+// young object into g_dcopyModifiedSlots -- the paper's "remembered set of
+// references to young objects" (§3.3). This is maintained PERSISTENTLY across RC
+// pauses (a young object survives many RC pauses; it only ages to mature at a
+// TRACE), and reset only when a trace bumps g_traceEpoch (ResetDCopyRemset).
+// CopyYoungSurvivors replays it to fix up incoming edges to moved survivors.
+// Persistence is required: the coalescing modified buffer is cleared every RC
+// pause, so an A->B edge created several pauses ago (B pinned/budget-skipped and
+// still young) would otherwise be lost. On overflow the remset is abandoned and
+// D-copy falls back to a full committed-heap walk.
+static volatile LONG        g_dcopyCaptureModified = 0;
+static std::vector<Object**> g_dcopyModifiedSlots;
+static volatile LONG        g_dcopyRemsetOverflow = 0;
+static const size_t         kDCopyRemsetCap = 4u * 1024u * 1024u; // entries
 static volatile int64_t g_traceEpoch = 0;
 
 // Env-gated diagnostic (LXR_NURSERY_GUARD): a ring of recently-decommitted young
@@ -1020,6 +1035,10 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // No remembered set and no O(heap) closure - the RC side table is the oracle.
     // Guards on g_traceWindowOpen so it never frees under an in-flight trace.
     if (getenv("LXR_NURSERY") != nullptr) g_nurseryActive = 1;
+    // Item D-copy: young-survivor copy at the RC pause. When enabled, tell
+    // ProcessModifiedBuffers to snapshot the epoch's modified slots so D-copy can
+    // replay them as its (complete, bounded) remembered set for reference fix-up.
+    if (getenv("LXR_NURSERY_COPY") != nullptr) g_dcopyCaptureModified = 1;
     // P5: parallel mark worker count. Clamped to [1, 64]; 1 keeps the verified
     // single-threaded closure.
     if (const char* t = getenv("LXR_GC_THREADS"))
@@ -1067,6 +1086,29 @@ bool LXRCollector::IsYoung(Object* obj)
     uint8_t* blk = (uint8_t*)((uintptr_t)obj & ~(lxr::kBlockSize - 1));
     lxr::BlockMeta* meta = MetaForBlock(blk);
     return meta != nullptr && meta->bornTraceEpoch == g_traceEpoch;
+}
+
+// Stamp the blocks spanned by [start, start+size) as MATURE (aged out of the
+// current inter-trace window) so IsYoung() reports false for objects placed
+// there. Used by CopyYoungSurvivors for the promotion destinations: survivors
+// copied to fresh chunks must land in mature space, otherwise RegisterChunk's
+// StampBornEpoch would leave them young and they would be re-evacuated at every
+// subsequent RC pause (infinite copying). g_traceEpoch-1 is behind every real
+// (>=0) epoch, so a promoted survivor is never young again until, and unless, a
+// real trace legitimately re-ages the block.
+void LXRCollector::StampMatureEpoch(uint8_t* start, size_t size)
+{
+    if (!g_youngRC || start < m_heapBase)
+        return;
+    int64_t mature = g_traceEpoch - 1;
+    uint8_t* blk = (uint8_t*)((uintptr_t)start & ~(lxr::kBlockSize - 1));
+    uint8_t* end = start + size;
+    for (; blk < end; blk += lxr::kBlockSize)
+    {
+        lxr::BlockMeta* meta = MetaForBlock(blk);
+        if (meta != nullptr)
+            meta->bornTraceEpoch = mature;
+    }
 }
 
 uint8_t* LXRCollector::RCSlot(Object* obj) const
@@ -2720,6 +2762,16 @@ void LXRCollector::ApplyRCEpoch(std::vector<Object*>& incs, std::vector<Object*>
             EnqueueZeroCount(o);
 }
 
+// Item D-copy incoming-edge source: the COMPLETE set of field slots modified this
+// epoch (the coalesced modified-buffer keys), captured by ProcessModifiedBuffers
+// for CopyYoungSurvivors to replay as its remembered set. Storage declared near
+// g_nurseryActive (needed earlier, in Initialize). This is sound and complete
+// precisely when D-copy is allowed to run: a this-epoch young survivor can only
+// be referenced by a field written this epoch, and coalescing RC logs every
+// first-modified field before the pause (a dropped first-log sets
+// g_youngRCIncomplete and makes D-copy self-skip). Bounded by the epoch's
+// modified-field count (= the paper's field-logging barrier cost), NOT the heap.
+
 void LXRCollector::ProcessModifiedBuffers()
 {    // Coalescing reference counting (Levanoni-Petrank, paper A/§3.2.1). For the
     // period t_n -> t_{n+1} it is sufficient to apply, per MODIFIED FIELD, exactly
@@ -2748,6 +2800,31 @@ void LXRCollector::ProcessModifiedBuffers()
             PushFreeModifiedBuffer(buf);
     }
     LeaveCriticalSection(&g_buffersLock);
+    // Item D-copy: maintain the persistent "references to young" remembered set.
+    // For every modified slot whose CURRENT value (read under STW) is a young
+    // object, append the slot to g_dcopyModifiedSlots. This set is NOT cleared per
+    // pause -- a young object lives across many RC pauses (aged only by a trace),
+    // so an A->B edge created in an earlier pause must be retained until B is
+    // promoted or the epoch turns over. Reset happens at the trace epoch bump
+    // (ResetDCopyRemset). On overflow we abandon the set and D-copy full-walks.
+    if (g_dcopyCaptureModified && !g_dcopyRemsetOverflow)
+    {
+        for (const auto& kv : coalesced)
+        {
+            Object* cur = *(kv.first);
+            if (cur == nullptr) continue;
+            if ((uint8_t*)cur < m_heapBase || (uint8_t*)cur >= m_heapBase + m_heapBytes) continue;
+            if (!IsYoung(cur)) continue;
+            if (g_dcopyModifiedSlots.size() >= kDCopyRemsetCap)
+            {
+                g_dcopyRemsetOverflow = 1;
+                g_dcopyModifiedSlots.clear();
+                g_dcopyModifiedSlots.shrink_to_fit();
+                break;
+            }
+            g_dcopyModifiedSlots.push_back(kv.first);
+        }
+    }
     // Deferred-RC root capture (paper §3.2.1): scan the roots at this STW pause so
     // root-reachable mature objects are incremented now and decremented at the
     // next pause (m_rootDeferredPrev). This is what makes RC self-standing rather
@@ -4533,6 +4610,545 @@ void LXRCollector::CollectNursery()
 }
 
 // ===========================================================================
+//  Item D-copy — young-survivor copy at the RC pause (paper §3.3.1-3, RCImmix
+//  "judicious copying of young survivors to defragment blocks").
+//
+//  CollectNursery reclaims the IMPLICITLY-DEAD young (RC 0). This is its
+//  defragmenting/promoting complement: the young SURVIVORS (RC>0) are copied out
+//  of the young regions into fresh MATURE space so the emptied young regions can
+//  be recycled here, at the RC pause, instead of leaving survivors in place to be
+//  compacted only by the far less frequent trace-cycle Evacuate. Copying young
+//  survivors both defragments (a survivor amid dead young no longer pins its
+//  region) and promotes (a survivor that lived through an RC pause graduates out
+//  of the nursery), matching the paper's premise that most reclamation - and here
+//  most compaction - happens at the light RC pause, not the occasional trace.
+//
+//  Liveness authority is RC, NOT marks: outside a trace window marks are stale
+//  (set at the last trace, which predates every current-epoch young object), so
+//  a survivor is any young object with RC>0. This mirrors ReclaimMatureByRC.
+//
+//  Soundness of the reference fix-up (the hard part of any moving collector):
+//   * Roots/handles PIN their referents (a young object any raw root/handle
+//     address falls within is never moved), so no root or handle needs fixing
+//     up - exactly as Evacuate. Raw addresses (not resolved-then-bail like
+//     Evacuate) are used because the RC pause is frequent and one unresolvable
+//     interior byref must not disable copying for the whole pause.
+//   * Incoming heap edges into a moved survivor come only from (i) other young
+//     objects or (ii) mature objects (roots are pinned). A this-epoch young
+//     survivor can only be referenced by a field written THIS epoch, and the
+//     coalescing write barrier logs every first-modified field before the pause,
+//     so ProcessModifiedBuffers' coalesced slot set (captured into
+//     g_dcopyModifiedSlots) is the COMPLETE incoming-edge remembered set. D-copy
+//     replays it (step 4b) - re-reading each slot's current value, skipping slots
+//     inside moved sources (handled by the dest-copy scan 4a), guarding against
+//     slots in a region freed by the zero-count cascade - and additionally scans
+//     the moved copies' own out-edges (4a). This is bounded by the epoch's
+//     modified-field count (the paper's field-logging barrier cost), NOT the heap.
+//     Completeness holds precisely when D-copy runs: a dropped first-log sets
+//     g_youngRCIncomplete, which makes this pass self-skip.
+//   * If the modified-slot capture is unavailable the pass falls back to a sound
+//     O(heap) full walk (like Evacuate). LXR_VERIFY_TRACE cross-checks that no
+//     live field is left pointing at a moved source.
+//
+//  Promotion destinations are stamped MATURE (StampMatureEpoch) so a promoted
+//  survivor is not seen as young again and re-copied every pause (infinite copy).
+//
+//  Deferred entirely while g_traceWindowOpen (marker mutating marks / walking
+//  young) or g_youngRCIncomplete (a dropped first-log => possible RC undercount),
+//  the same guards CollectNursery / ReclaimMatureByRC use. Runs BEFORE
+//  CollectNursery so a region emptied of survivors here is freed here, and a
+//  region of purely dead young is mopped up there. Opt-in via LXR_NURSERY_COPY.
+// ===========================================================================
+struct DCopyMovedRange { uint8_t* oldStart; uint8_t* oldEnd; uint8_t* newStart; };
+struct DCopyFixupCtx
+{
+    std::unordered_map<Object*, Object*>* forwarding = nullptr;
+    std::vector<DCopyMovedRange>*         movedRanges = nullptr; // sorted by oldStart
+    int64_t                               forwarded = 0;
+    // One-page VirtualQuery cache: a remembered-set slot may lie in a region
+    // decommitted by an earlier RC pause (the remset is only reset at traces), so
+    // guard every slot read against a non-committed page instead of faulting.
+    uint8_t* cacheBase = nullptr; size_t cacheLen = 0; bool cacheCommitted = false;
+    bool SlotCommitted(void* slot)
+    {
+        if ((uint8_t*)slot < cacheBase || (uint8_t*)slot >= cacheBase + cacheLen)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(slot, &mbi, sizeof(mbi)) == 0)
+            {
+                cacheBase = nullptr; cacheLen = 0; cacheCommitted = false; return false;
+            }
+            cacheBase = (uint8_t*)mbi.BaseAddress; cacheLen = mbi.RegionSize;
+            cacheCommitted = (mbi.State == MEM_COMMIT);
+        }
+        return cacheCommitted;
+    }
+    void Rebase(Object** f)
+    {
+        uint8_t* v = (uint8_t*)*f;
+        if (v == nullptr)
+            return;
+        auto it = forwarding->find((Object*)v);
+        if (it != forwarding->end())
+        {
+            *f = it->second; forwarded++;
+            InterlockedIncrement64(&g_lxrCounters.NurseryCopyFieldsForwarded);
+            return;
+        }
+        if (movedRanges->empty())
+            return;
+        size_t lo = 0, hi = movedRanges->size();
+        while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*movedRanges)[mid].oldStart <= v) lo = mid + 1; else hi = mid; }
+        if (lo == 0)
+            return;
+        const DCopyMovedRange& r = (*movedRanges)[lo - 1];
+        if (v > r.oldStart && v < r.oldEnd)
+        {
+            *f = (Object*)(r.newStart + (v - r.oldStart)); forwarded++;
+            InterlockedIncrement64(&g_lxrCounters.NurseryCopyFieldsForwarded);
+        }
+    }
+};
+static DCopyFixupCtx* g_dcopyFixup = nullptr;
+// Fix-up replay callback (step 4b), fed the epoch's modified slots. Skips slots
+// inside a moved source range (their copy's out-edges are fixed by 4a) and slots
+// on non-committed pages (a slot's region may have been freed by this pause's
+// zero-count cascade or an earlier RC pause).
+static void LXRDCopyRemsetVisit(Object** slot, void* /*ctx*/)
+{
+    DCopyFixupCtx* fx = g_dcopyFixup;
+    if (fx == nullptr)
+        return;
+    uint8_t* sa = (uint8_t*)slot;
+    if (!fx->movedRanges->empty())
+    {
+        size_t lo = 0, hi = fx->movedRanges->size();
+        while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx->movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+        if (lo != 0)
+        {
+            const DCopyMovedRange& mr = (*fx->movedRanges)[lo - 1];
+            if (sa >= mr.oldStart && sa < mr.oldEnd)
+                return; // slot inside a moved source: handled by 4a
+        }
+    }
+    if (!fx->SlotCommitted(slot))
+        return; // referrer region freed at an earlier RC pause: stale, moot
+    fx->Rebase(slot);
+}
+
+void LXRCollector::CopyYoungSurvivors()
+{
+    static int s_enabled = -1;
+    if (s_enabled < 0)
+        s_enabled = (getenv("LXR_NURSERY_COPY") != nullptr) ? 1 : 0; // opt-in until validated
+    if (!s_enabled)
+        return;
+    if (!g_youngRC || !g_nurseryActive || g_theGCToCLR == nullptr)
+        return;
+    // Same coordination guards CollectNursery / ReclaimMatureByRC use: never
+    // move/free young under an in-flight concurrent trace, and never promote a
+    // young object whose RC may be undercounted by a dropped first-log.
+    if (g_traceWindowOpen || g_youngRCIncomplete)
+        return;
+
+    bool verbose = getenv("LXR_VERBOSE") != nullptr;
+
+    // Policy knobs (bound the STW copy per pass; regions not reached this pass are
+    // re-selected next RC pause).
+    static int64_t s_budgetBytes = -1, s_budgetMs = -1;
+    if (s_budgetBytes < 0)
+    {
+        const char* b = getenv("LXR_NURSERY_COPY_BUDGET_MB");
+        s_budgetBytes = (b ? _atoi64(b) : 32) * (int64_t)1024 * 1024;
+        const char* ms = getenv("LXR_NURSERY_COPY_BUDGET_MS");
+        s_budgetMs = ms ? _atoi64(ms) : 20;
+    }
+
+    // 1. Collect the raw root + handle referent addresses (interior/byref kept
+    //    UNRESOLVED) under the STW pause, exactly as CollectNursery does. A young
+    //    object that any root/handle address falls within is PINNED (never moved),
+    //    so - like Evacuate - a moved survivor is never referenced by a root and
+    //    no root/handle needs fix-up. Using raw addresses (vs. resolving interiors
+    //    and bailing on failure like Evacuate) is essential here: the RC pause is
+    //    frequent, and bailing the whole pass on any single unresolvable interior
+    //    byref would disable copying almost every pause.
+    std::vector<uint8_t*> rootAddrs;
+    g_nurseryRootAddrs = &rootAddrs;
+    LXRGCHandleStore::ForEachLiveHandle(&LXRNurseryCollectHandleAddr, nullptr);
+    {
+        ScanContext sc; sc.promotion = true;
+        g_theGCToCLR->GcScanRoots(&LXRNurseryCollectRootAddr, 2, 2, &sc);
+    }
+    g_nurseryRootAddrs = nullptr;
+    std::sort(rootAddrs.begin(), rootAddrs.end());
+    auto rootInRange = [&](uint8_t* start, uint8_t* end) -> bool {
+        auto it = std::lower_bound(rootAddrs.begin(), rootAddrs.end(), start);
+        return it != rootAddrs.end() && *it < end;
+    };
+
+    // A never-incremented young object's RC-table page may be reserved-but-
+    // uncommitted (definitionally RC 0). Guard the read with a one-page cache.
+    uint8_t* rcCacheBase = nullptr; size_t rcCacheLen = 0; bool rcCacheCommitted = false;
+    auto rcValue = [&](Object* o) -> uint8_t {
+        uint8_t* slot = RCSlot(o);
+        if (slot < rcCacheBase || slot >= rcCacheBase + rcCacheLen)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(slot, &mbi, sizeof(mbi)) == 0) return 0;
+            rcCacheBase = (uint8_t*)mbi.BaseAddress; rcCacheLen = mbi.RegionSize;
+            rcCacheCommitted = (mbi.State == MEM_COMMIT);
+        }
+        return rcCacheCommitted ? *slot : (uint8_t)0;
+    };
+
+    // 2. Snapshot the young source regions (retired, committed, young). Skip the
+    //    active (Owner!=nullptr) alloc chunks - moving out from under a live alloc
+    //    context would dangle its bump watermark; those young objects are handled
+    //    once the context retires. Snapshot before registering any dest chunk so a
+    //    g_chunks realloc cannot invalidate the list (indices stay valid).
+    struct SrcRegion { size_t index; uint8_t* start; uint8_t* usedEnd; };
+    std::vector<SrcRegion> srcs;
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.Owner != nullptr || c.FreeRun || c.UsedEnd <= c.Start)
+            continue;
+        if (!IsYoung((Object*)c.Start))
+            continue;
+        srcs.push_back({ i, c.Start, c.UsedEnd });
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    if (srcs.empty())
+    {
+        if (verbose) { fprintf(stderr, "LXRGC: [nursery-copy] no young source regions\n"); fflush(stderr); }
+        return;
+    }
+
+    // 3. Copy live (RC>0), non-pinned young survivors into fresh MATURE dest
+    //    chunks; record forwarding old->new. Pinned / marked survivors stay put.
+    std::unordered_map<Object*, Object*> forwarding;
+    std::vector<DCopyMovedRange> movedRanges;
+    uint8_t* destPtr = nullptr;
+    uint8_t* destEnd = nullptr;
+    int      curDestIndex = -1;
+    auto destAlloc = [&](size_t sz) -> uint8_t*
+    {
+        if (destPtr == nullptr || destPtr + sz > destEnd)
+        {
+            if (curDestIndex >= 0)
+                g_chunks[curDestIndex].UsedEnd = destPtr;
+            size_t claim = (sz > CONTEXT_ALLOC_QUANTUM) ? sz : CONTEXT_ALLOC_QUANTUM;
+            claim = (claim + g_pageSize - 1) & ~((size_t)g_pageSize - 1);
+            uint8_t* base = g_lxrGCHeap->ClaimBlocks(claim);
+            if (base == nullptr)
+                return nullptr;
+            size_t committed = CommitRange(base, claim);
+            InterlockedExchangeAdd64(&g_committedInUse, (int64_t)committed);
+            curDestIndex = RegisterChunk(base, claim, nullptr);
+            // Promote: the destination hosts MATURE objects, not this window's
+            // nursery. Override RegisterChunk's StampBornEpoch (which would leave
+            // the copies young and re-copy them every pause).
+            StampMatureEpoch(base, claim);
+            EnsureMarkCommitted(base + claim);
+            EnsureLoggedUpTo(base + claim); // future barrier stores into promoted objects must not fault
+            destPtr = base;
+            destEnd = base + claim;
+        }
+        uint8_t* r = destPtr;
+        destPtr += sz;
+        return r;
+    };
+
+    std::vector<size_t> freeableSrcIndices;
+    int64_t movedObjs = 0, movedBytes = 0, pinnedKept = 0;
+    LARGE_INTEGER clkFreq, clk0;
+    QueryPerformanceFrequency(&clkFreq);
+    QueryPerformanceCounter(&clk0);
+    int64_t budgetTicks = (s_budgetMs > 0) ? (s_budgetMs * clkFreq.QuadPart / 1000) : 0;
+    int64_t byteBudget = s_budgetBytes;
+    for (const SrcRegion& sr : srcs)
+    {
+        if (budgetTicks > 0)
+        {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            if (now.QuadPart - clk0.QuadPart >= budgetTicks)
+                break; // out of time this pause; region left for next RC pause
+        }
+        if (byteBudget <= 0)
+            break;
+        size_t skipped = 0, moved = 0;
+        uint8_t* p = sr.start;
+        while (p < sr.usedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) { skipped++; break; }   // unparseable: never free this region
+            p += sz;
+            // Marked (a marker holds/held a ref) or root/handle-referenced (raw
+            // address falls within the object, interior included) survivors must
+            // stay in place; RC 0 young are implicitly dead (CollectNursery frees
+            // them with the region) and are neither moved nor kept.
+            if (IsMarked(o)) { skipped++; continue; }
+            if (rootInRange((uint8_t*)o, (uint8_t*)o + sz)) { skipped++; continue; }
+            if (rcValue(o) == 0)
+                continue; // dead young: leave; region freed only if nothing kept
+            uint8_t* d = destAlloc(sz);
+            if (d == nullptr) { skipped++; continue; } // out of dest space: keep in place
+            memcpy(d, o, sz);
+            forwarding.emplace(o, (Object*)d);
+            movedRanges.push_back({ (uint8_t*)o, (uint8_t*)o + sz, d });
+            CommitPageFor(RCSlot((Object*)d));
+            CommitPageFor(RCSlot(o));
+            *RCSlot((Object*)d) = *RCSlot(o); // preserve the survivor's reference count
+            *RCSlot(o) = 0;                   // source granule retired
+            // The promoted copy is now MATURE but may hold young->young field
+            // edges the JIT never barriered (elided intra-nursery init stores).
+            // Such an edge would become an invisible mature->young reference:
+            // absent from the old->young remembered set (4b) and skipped by the
+            // young-space scan (4a-young, this object is mature) in a FUTURE pass
+            // when its young target relocates. Record the DEST field slots that
+            // currently point to a young object into the persistent remembered set
+            // so 4b covers them thereafter. The dest slot address is stable
+            // (mature space); bounded by the count of surviving young->young edges.
+            if (!g_dcopyRemsetOverflow)
+            {
+                GCScanObjectRefs((Object*)d, sz, [&](Object** f)
+                {
+                    Object* t = *f;
+                    if (t == nullptr) return;
+                    if ((uint8_t*)t < m_heapBase || (uint8_t*)t >= m_heapBase + m_heapBytes) return;
+                    if (!IsYoung(t)) return;
+                    if (g_dcopyModifiedSlots.size() >= kDCopyRemsetCap)
+                    {
+                        g_dcopyRemsetOverflow = 1;
+                        return;
+                    }
+                    g_dcopyModifiedSlots.push_back(f);
+                });
+            }
+            moved++;
+            movedObjs++;
+            movedBytes += (int64_t)sz;
+            byteBudget -= (int64_t)sz;
+        }
+        pinnedKept += (int64_t)skipped;
+        // Free the source region only if every live object was relocated (nothing
+        // pinned/marked/unparseable kept it, and at least one object moved). A
+        // region with kept survivors stays; its moved sources become dead space
+        // reclaimed at the next trace.
+        if (skipped == 0 && moved > 0)
+            freeableSrcIndices.push_back(sr.index);
+    }
+    if (curDestIndex >= 0)
+        g_chunks[curDestIndex].UsedEnd = destPtr;
+
+    if (movedObjs == 0)
+    {
+        if (verbose) { fprintf(stderr, "LXRGC: [nursery-copy] no survivors moved (pinnedKept=%lld)\n", (long long)pinnedKept); fflush(stderr); }
+        InterlockedIncrement64(&g_lxrCounters.NurseryCopyPasses);
+        InterlockedExchangeAdd64(&g_lxrCounters.NurseryCopyPinned, pinnedKept);
+        return;
+    }
+
+    // 4. Fix up every heap reference to a moved survivor. Sort moved ranges by old
+    //    address for interior/byref binary search (a heap byref may point into a
+    //    moved object's interior, not just its start).
+    std::sort(movedRanges.begin(), movedRanges.end(),
+              [](const DCopyMovedRange& a, const DCopyMovedRange& b) { return a.oldStart < b.oldStart; });
+    DCopyFixupCtx fx;
+    fx.forwarding = &forwarding;
+    fx.movedRanges = &movedRanges;
+    auto rebaseField = [&fx](Object** f) { fx.Rebase(f); };
+
+    static int s_scopedFixup = -1;
+    if (s_scopedFixup < 0)
+        s_scopedFixup = (getenv("LXR_NURSERY_COPY_SCOPED_FIXUP") != nullptr && getenv("LXR_NURSERY_COPY_SCOPED_FIXUP")[0] == '0') ? 0 : 1;
+    // Scoped fix-up replays the epoch's modified slots (the complete incoming-edge
+    // set for this-epoch young survivors, captured by ProcessModifiedBuffers) plus
+    // the moved copies' own out-edges. Complete precisely because D-copy self-skips
+    // when a first-log was dropped (g_youngRCIncomplete). Fall back to the sound
+    // O(heap) walk only if capture was somehow unavailable.
+    bool useScoped = s_scopedFixup && g_dcopyCaptureModified && !g_dcopyRemsetOverflow;
+
+    if (useScoped)
+    {
+        // 4a. Outgoing edges of moved survivors: scan each destination copy. This
+        //     is the only source that catches a moved survivor's field pointing at
+        //     ANOTHER moved survivor (its source slot is skipped by 4b as it lies
+        //     inside a moved range). Bounded by the moved live bytes.
+        for (const DCopyMovedRange& r : movedRanges)
+            GCScanObjectRefs((Object*)r.newStart, (size_t)(r.oldEnd - r.oldStart), rebaseField);
+        // 4a-young. Young->young incoming edges are NOT in the remembered set: the
+        //     JIT elides the write barrier on stores that initialize a freshly-
+        //     allocated (nursery) object, since an intra-generational young->young
+        //     store needs no card mark. The paper finds these by scanning the young
+        //     space itself (bounded by the nursery size, NOT the heap). Rebase the
+        //     out-edges of every object still resident in a committed YOUNG region
+        //     -- the retired sources' kept-in-place survivors AND the active alloc
+        //     chunks (up to alloc_ptr) -- skipping relocated sources (their mature
+        //     copies are covered by 4a) and our mature dest chunks (IsYoung false).
+        {
+            EnterCriticalSection(&g_chunkLock);
+            size_t nregions = g_chunkCount;
+            for (size_t i = 0; i < nregions; i++)
+            {
+                ChunkRegion& c = g_chunks[i];
+                if (!c.Committed || c.FreeRun || c.UsedEnd <= c.Start)
+                    continue;
+                if (!IsYoung((Object*)c.Start))
+                    continue; // mature (incl. this pass's promotion dests): via 4a/4b
+                uint8_t* cend = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+                uint8_t* p = c.Start;
+                while (p < cend)
+                {
+                    Object* o = (Object*)p;
+                    size_t sz = LXRObjectSize(o);
+                    if (sz == 0) break;
+                    p += sz;
+                    if (forwarding.find(o) != forwarding.end())
+                        continue; // relocated source granule (dead): copy scanned by 4a
+                    GCScanObjectRefs(o, sz, rebaseField);
+                }
+            }
+            LeaveCriticalSection(&g_chunkLock);
+        }
+        // 4b. Incoming edges from MATURE referrers via the epoch's modified slots
+        //     (the barrier's field log = the paper's old->young remembered set).
+        //     Mature->young stores are barriered (card marking is required for an
+        //     old->young reference), so any current mature reference to a this-
+        //     epoch young survivor is here. Re-read each slot's CURRENT value
+        //     (stable under STW), skip slots inside a moved source (handled by 4a),
+        //     and guard against slots in a region an earlier RC pause / this pass's
+        //     zero-count cascade freed.
+        g_dcopyFixup = &fx;
+        for (Object** slot : g_dcopyModifiedSlots)
+            LXRDCopyRemsetVisit(slot, nullptr);
+        g_dcopyFixup = nullptr;
+    }
+    else
+    {
+        InterlockedIncrement64(&g_lxrCounters.NurseryCopyFullWalks);
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed)
+                continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            uint8_t* p = c.Start;
+            while (p < end)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0)
+                    break;
+                p += sz;
+                if (forwarding.find(o) != forwarding.end())
+                    continue; // dead source
+                GCScanObjectRefs(o, sz, rebaseField);
+            }
+        }
+    }
+
+    // Empirical soundness check: after fix-up NO live field may still point at a
+    // moved source (that would dangle once the source region is decommitted).
+    if (getenv("LXR_VERIFY_TRACE") != nullptr)
+    {
+        int64_t misses = 0;
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed)
+                continue;
+            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            uint8_t* p = c.Start;
+            while (p < end)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0)
+                    break;
+                uint8_t* op = p;
+                p += sz;
+                if (forwarding.find(o) != forwarding.end())
+                    continue; // moved source
+                // Only LIVE referrers matter: a dead (RC==0, unmarked, un-rooted)
+                // object is unreachable, so a dangling field in it is never
+                // followed. Skipping them matches Evacuate's verify and avoids
+                // false positives from dead young garbage left in kept regions.
+                bool live = (rcValue(o) != 0) || IsMarked(o) || rootInRange(op, p);
+                if (!live)
+                    continue;
+                GCScanObjectRefs(o, sz, [&](Object** f)
+                {
+                    if (forwarding.find(*f) != forwarding.end())
+                    {
+                        if (misses < 20)
+                            fprintf(stderr, "LXRGC: [verify-nursery-copy] UNFORWARDED ref: referrer=%p mt=%p region=%zu off=%lld -> stale %p\n",
+                                    (void*)o, (void*)o->GetGCSafeMethodTable(), i,
+                                    (long long)((uint8_t*)f - op), (void*)*f);
+                        misses++;
+                    }
+                });
+            }
+        }
+        if (misses > 0)
+        {
+            fprintf(stderr, "LXRGC: [verify-nursery-copy] TOTAL unforwarded refs = %lld (freeable %zu source regions) fixup=%s\n",
+                    (long long)misses, freeableSrcIndices.size(), useScoped ? "scoped" : "fullwalk");
+            fflush(stderr);
+        }
+    }
+
+    // 5. Free the fully-evacuated young source regions (all survivors relocated).
+    int64_t regionsFreed = 0, bytesFreed = 0;
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t idx : freeableSrcIndices)
+    {
+        ChunkRegion& c = g_chunks[idx];
+        if (!c.Committed)
+            continue;
+        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
+        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
+        if (dend > dbeg)
+        {
+            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
+            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
+            bytesFreed += (int64_t)(dend - dbeg);
+        }
+        c.Committed = false;
+        RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryCopyPasses);
+        ClearRCRange(c.Start, c.UsedEnd);   // reclaimed => RC 0 (mirror the sweep decommit site)
+        ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
+        if (g_freeChunkTop == g_freeChunkCap)
+        {
+            size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
+            size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
+            if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
+        }
+        if (g_freeChunkTop < g_freeChunkCap)
+            g_freeChunks[g_freeChunkTop++] = idx;
+        regionsFreed++;
+    }
+    LeaveCriticalSection(&g_chunkLock);
+
+    InterlockedIncrement64(&g_lxrCounters.NurseryCopyPasses);
+    InterlockedExchangeAdd64(&g_lxrCounters.NurseryCopyObjects, movedObjs);
+    InterlockedExchangeAdd64(&g_lxrCounters.NurseryCopyBytes, movedBytes);
+    InterlockedExchangeAdd64(&g_lxrCounters.NurseryCopyPinned, pinnedKept);
+    InterlockedExchangeAdd64(&g_lxrCounters.NurseryCopyRegionsFreed, regionsFreed);
+    if (verbose)
+    {
+        fprintf(stderr, "LXRGC: [nursery-copy] srcRegions=%zu moved=%lld bytes=%lld pinnedKept=%lld freed=%lld(%lld B) forwarded=%lld fixup=%s\n",
+                srcs.size(), (long long)movedObjs, (long long)movedBytes, (long long)pinnedKept,
+                (long long)regionsFreed, (long long)bytesFreed, (long long)fx.forwarded,
+                useScoped ? "scoped" : "fullwalk");
+        fflush(stderr);
+    }
+}
+
+// ===========================================================================
 //  Item ★ — primary-RC MATURE reclamation at the RC pause (paper §3.3).
 //
 //  Before this, ALL mature memory return happened at the (occasional) backup
@@ -5623,6 +6239,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             // never frees under an in-flight concurrent trace.
             if (g_youngRC && g_nurseryActive)
             {
+                // Item D-copy: promote/defragment the young SURVIVORS first, so a
+                // region emptied of survivors is freed here; then CollectNursery
+                // mops up the regions of purely implicitly-dead young.
+                LXRSetPhase("stw:nursery-copy");
+                g_lxrCollector.CopyYoungSurvivors();
                 LXRSetPhase("stw:nursery");
                 g_lxrCollector.CollectNursery();
             }
@@ -5683,6 +6304,16 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // stamped with the pre-bump g_traceEpoch) are no longer young after this
         // trace has had the chance to mark/reclaim them, so RC resumes for them.
         InterlockedIncrement64(&g_traceEpoch);
+        // Item D-copy: the trace has aged the just-ended window's young to mature,
+        // so every slot in the "references to young" remembered set now points to a
+        // mature object (or dead memory). Drop it: the next inter-trace window
+        // rebuilds it from scratch, and clearing any overflow re-enables scoped
+        // fix-up.
+        if (g_dcopyCaptureModified)
+        {
+            g_dcopyModifiedSlots.clear();
+            InterlockedExchange(&g_dcopyRemsetOverflow, 0);
+        }
         // A complete trace has re-established liveness mark-authoritatively and
         // aged the just-ended window's young to mature, so any RC increment lost to
         // a rare free-list exhaustion is now moot: clear the incompleteness flag so
