@@ -143,6 +143,7 @@ struct LXRCounters
     volatile int64_t TracePauses;           // full epochs (trace + sweep) == BackupTraces
     volatile int64_t SurvivalPctEwma;       // EWMA of survivor % across traces (0..100)
     volatile int64_t WastagePctEwma;        // biased-decay EWMA of floating-garbage % recovered per trace (item E wastage predictor)
+    volatile int64_t YoungSurvivalPctEwma;  // biased-decay EWMA of YOUNG-object survival % per RC pause (item E survival-rate RC trigger, paper §3.2.2)
     volatile int64_t RCPausePauseMicros;    // cumulative light-pause time (us)
     volatile int64_t TracePausePauseMicros; // cumulative full-pause time (us)
 

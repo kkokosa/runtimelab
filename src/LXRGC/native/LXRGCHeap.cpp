@@ -469,6 +469,7 @@ static volatile LONG g_reportedEvacFullWalk   = 0;
 static volatile LONG g_reportedDCopyFullWalk  = 0;
 static volatile LONG g_reportedNurseryDefer   = 0;
 static volatile LONG g_reportedBigArrayShape  = 0;
+static volatile LONG g_reportedStraddle       = 0;
 
 // --- Concurrent SATB trace (P4) --------------------------------------------
 // While a concurrent trace window is open, block reuse is suppressed so region
@@ -707,6 +708,18 @@ static volatile int64_t g_traceEveryEpochs = -1;  // force a trace at least ever
 static volatile int64_t g_incrementBaseline = 0;  // ModifiedBufferEntries snapshot at last RC pause
 static volatile int64_t g_incrementTrigger  = -1; // env LXR_INCREMENT_TRIGGER: RC pause after N increments (0=off)
 static volatile int64_t g_wastageTriggerPct = -1; // env LXR_WASTAGE_PCT: trace when projected floating garbage >= % of heap (0=off)
+// Item E survival-rate RC-pause trigger (paper §3.2.2 "Heuristic: RC Triggers").
+// The paper's third RC-pause trigger (besides heap-full and the increment
+// threshold): a young-survival predictor that modulates WHEN the pause fires so
+// as to bound the EXPECTED per-pause cost (recursive increments + young-survivor
+// copying), favouring throughput over worst-case allocation triggering. We
+// realise it by scaling the allocation-growth budget by the young-survival EWMA:
+// high predicted survival (expensive pause) -> smaller budget (pause sooner);
+// low survival (cheap pause, most young die) -> larger budget (pause later, more
+// young reclaimed per pass). g_survivalTrigger != 0 enables it (default ON).
+static volatile int64_t g_survivalTrigger   = -1; // env LXR_SURVIVAL_TRIGGER (0=off, default on)
+static volatile int64_t g_youngSurvCopiedBaseline    = 0; // NurseryCopyBytes snapshot at last RC pause
+static volatile int64_t g_youngSurvReclaimedBaseline = 0; // NurseryBytesReclaimed snapshot at last RC pause
 
 // Young-object nursery (LXR difference #6). g_traceEpoch is a monotonic counter
 // bumped once per completed trace cycle; every allocation region is stamped with
@@ -2219,6 +2232,35 @@ int64_t LXRCollector::CarveDeadRunsByRC(size_t i, const std::vector<uint8_t*>& r
         segs[nseg++] = { runStart, End };
     if (nseg == 0)
         return 0;
+
+    // Item b.5 (paper §3.1 straddling-object soundness): the paper marks the RC
+    // table for a large object's TRAILING LINES so its per-line RC free-scan never
+    // reuses a line a straddling live object still occupies. Our carve is instead
+    // object-boundary precise (each dead run spans only whole DEAD objects), which
+    // subsumes that guarantee. LXR_VERIFY_STRADDLE turns "sound by construction"
+    // into a checked invariant: no carved dead run may overlap any LIVE object's
+    // extent (which would mean a straddling live tail was about to be reused).
+    if (getenv("LXR_VERIFY_STRADDLE") != nullptr)
+    {
+        for (uint8_t* q = Start; q < End; )
+        {
+            Object* o = (Object*)q;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            bool live = (rcValue(o) != 0) || IsYoung(o) || rootInRange(q, q + sz);
+            if (live)
+            {
+                for (int s = 0; s < nseg; s++)
+                    if (q < segs[s].b && (q + sz) > segs[s].a) // live object overlaps a carved dead run
+                    {
+                        LXRReportFallback(&g_reportedStraddle, "carve-straddle-overlap",
+                            "LIVE object overlaps an RC-carved dead run (straddling-tail reuse)");
+                        break;
+                    }
+            }
+            q += sz;
+        }
+    }
 
     // Re-tile [Start, End) into ordered sub-regions: live segments interleaved with
     // the carved dead segments (mirrors CarveFreeRuns exactly). Plug each dead run
@@ -6248,6 +6290,17 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
         int64_t budget = g_gcTriggerBytes;
         int64_t adaptive = (live * g_gcGrowthPct) / 100;
         if (adaptive > budget) budget = adaptive;
+        // Item E survival-rate RC-pause trigger (paper §3.2.2): scale the budget by
+        // the young-survival EWMA so the pause fires sooner when survivors (hence
+        // recursive-increment + young-copy work) are predicted high, and later when
+        // survival is low (cheap pause, most young die). Bounded band 0.5x..1.5x
+        // (survival 100% -> 0.5x budget, 0% -> 1.5x), mirroring DecidePhase's
+        // epoch-cap survival pacing. This targets the EXPECTED per-pause cost.
+        if (g_survivalTrigger > 0 && g_lxrCounters.YoungSurvivalPctEwma >= 0)
+        {
+            budget = (budget * (150 - g_lxrCounters.YoungSurvivalPctEwma)) / 100;
+            if (budget < g_gcTriggerBytes / 2) budget = g_gcTriggerBytes / 2; // never below floor/2
+        }
         int64_t grown = g_committedInUse - live;
         // Item E increment-count RC trigger (paper §3.2.2): also fire a pause once
         // enough reference-count increments have been logged since the last pause,
@@ -6492,6 +6545,16 @@ static void EnsureTracePolicy()
         // committed heap. 0 disables (pace traces purely by epoch cap + growth).
         const char* e = getenv("LXR_WASTAGE_PCT");
         g_wastageTriggerPct = e ? _atoi64(e) : 5;
+    }
+    if (g_survivalTrigger < 0)
+    {
+        // Item E survival-rate RC-pause trigger (paper §3.2.2). Default ON: the
+        // allocation budget is modulated by the young-survival EWMA so pauses
+        // fire sooner when survival (hence per-pause copy/increment work) is
+        // predicted high, bounding the EXPECTED pause cost. =0 opts out (budget
+        // paced purely by growth + increment count).
+        const char* e = getenv("LXR_SURVIVAL_TRIGGER");
+        g_survivalTrigger = (e && _atoi64(e) == 0) ? 0 : 1;
     }
 }
 
@@ -6984,6 +7047,31 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     // increments logged from here on.
     g_incrementBaseline = g_lxrCounters.ModifiedBufferEntries;
 
+    // Item E survival-rate predictor (paper §3.2.2): update the YOUNG-object
+    // survival EWMA from this pause's nursery outcome. Young survival % =
+    // (survivor bytes copied) / (survivor bytes copied + dead young bytes
+    // reclaimed) over the deltas since the last pause. Uses the paper's
+    // asymmetric biased decay (¾ new on a rise, ¼ new on a fall) so the survival
+    // trigger reacts fast to a survival spike (expensive pauses ahead) and decays
+    // slowly, never under-provisioning. Drives the budget modulation in Alloc.
+    {
+        int64_t copied    = g_lxrCounters.NurseryCopyBytes    - g_youngSurvCopiedBaseline;
+        int64_t reclaimed = g_lxrCounters.NurseryBytesReclaimed - g_youngSurvReclaimedBaseline;
+        g_youngSurvCopiedBaseline    = g_lxrCounters.NurseryCopyBytes;
+        g_youngSurvReclaimedBaseline = g_lxrCounters.NurseryBytesReclaimed;
+        int64_t examined = copied + reclaimed;
+        if (examined > 0)
+        {
+            int64_t youngSurvPct = (copied * 100) / examined;
+            if (youngSurvPct > 100) youngSurvPct = 100;
+            if (youngSurvPct < 0)   youngSurvPct = 0;
+            int64_t prevY = g_lxrCounters.YoungSurvivalPctEwma;
+            if (prevY <= 0)                     g_lxrCounters.YoungSurvivalPctEwma = youngSurvPct;
+            else if (youngSurvPct > prevY)      g_lxrCounters.YoungSurvivalPctEwma = (3 * youngSurvPct + prevY) / 4;
+            else                                g_lxrCounters.YoungSurvivalPctEwma = (youngSurvPct + 3 * prevY) / 4;
+        }
+    }
+
     if (phase == LXRPhase::TracePause)
     {
         InterlockedIncrement64(&g_lxrCounters.TracePauses);
@@ -7050,9 +7138,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     if (traceCompleted)
         InterlockedIncrement64(&g_lxrCounters.Collections);
 
-    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%% wastageEwma=%lld%% satbEntries=%lld satbMarks=%lld remsetEntries=%lld)\n",
+    if (verbose) { fprintf(stderr, "LXRGC: [stage] restarted (phase=%s pause=%lldus survivalEwma=%lld%% youngSurvEwma=%lld%% wastageEwma=%lld%% satbEntries=%lld satbMarks=%lld remsetEntries=%lld)\n",
                            phase == LXRPhase::TracePause ? "trace" : "rc",
                            (long long)pauseMicros, (long long)g_lxrCounters.SurvivalPctEwma,
+                           (long long)g_lxrCounters.YoungSurvivalPctEwma,
                            (long long)g_lxrCounters.WastagePctEwma,
                            (long long)g_lxrCounters.SatbEntries, (long long)g_lxrCounters.SatbMarks,
                            (long long)g_lxrCounters.RemsetEntries); fflush(stderr); }
