@@ -52,29 +52,38 @@ Reaching full 1:1 parity is now **complete**: D-copy copies young survivors at t
 RC pause and the primary-RC mature reclaimer (★) is done.
 
 **Audit caveats (re-verified 2026-07-26, code-level, for airtight honesty).** All of
-A–G + ★ + D-copy are present *and* driver-wired; the only fallbacks in the tree are
-bounded overflow safety nets (evac lane-log cap, SATB snapshot overflow, D-copy remset
-cap, conservative keep-alive), never the primary path. Three residual points are sound
-*variants/refinements*, not unsound shortcuts:
-- **Env-gating:** full-parity behaviour manifests only under the documented full env
-  set (`LXR_YOUNG_RC LXR_NURSERY LXR_NURSERY_COPY LXR_CONCURRENT LXR_EVAC LXR_REMSET
-  LXR_MULTIEPOCH`); by default only ★ (`LXR_RC_RECLAIM`), parallel RC and the increment
-  trigger are on. Parity is achieved under the full config (see benchmark section), not
-  out-of-the-box.
-- **F remset is fresh-rebuilt per evac cycle** from the trace mark (`ResetEvacEdges` →
-  record during `BackupTrace` → stop), giving a complete, stale-free inter-block edge
-  set by construction. This *replaces* the paper's persistent barrier-maintained remset
-  with **line-reuse-counter stale-entry tagging** (§3.3.4) — same outcome (bounded,
-  no stale entries), different mechanism. The per-interval barrier remset
-  (`EnumerateRemsetSlots`, `LXR_REMSET`) is still maintained and consumed by the nursery.
+A–G + ★ + D-copy are present, *driver-wired*, and **default-ON (2026-07-26): full-LXR
+parity is now the out-of-the-box behaviour** — `DOTNET_GCName=LXRGC.dll` alone gives
+the full collector; every `LXR_*` knob became opt-*out* (`=0`), and the GC worker count
+defaults to the machine's logical processors. Verified with **no parity env** (WebApi
+40 s exit 0, Errors=0; nursery + nursery-copy + evacuate + multi-epoch concurrent trace
++ rc-reclaim all engage; `LXR_VERIFY_TRACE` misses=0/offenders=0). The only fallbacks
+in the tree are bounded overflow safety nets (evac lane-log cap, SATB snapshot overflow,
+D-copy remset cap, conservative keep-alive) — **empirically dormant (fire count = 0)**
+under all validated runs, retained only to degrade gracefully instead of crashing on a
+pathological resource-exhaustion burst (the paper likewise handles buffer overflow
+gracefully rather than aborting). Residual mechanism differences, all sound (none are
+unsound shortcuts):
+- **F evacuation is a periodic (every 4th trace) fully-STW trace+evac cycle**, and its
+  remset is rebuilt fresh from that cycle's complete STW mark (`ResetEvacEdges` → record
+  during `BackupTrace` → stop) — complete + stale-free by construction. The paper
+  instead **evacuates during the concurrent trace's flip phases using a persistent
+  barrier-maintained remset with line-reuse-counter stale-entry tagging** (§3.3.4), so
+  it never needs a dedicated STW full mark. Ours is behaviourally sound (bounded,
+  `[verify-evac] misses=0`) but the *mechanism* differs, and the every-4th STW mark is
+  an O(live) pause the paper avoids. **This is the one genuine remaining mechanism-level
+  divergence.** The per-interval barrier remset (`EnumerateRemsetSlots`, `LXR_REMSET`)
+  is maintained and consumed by the nursery.
 - **G single-huge-array MARK-side** work-stealing partitioning is not implemented (the
   pool uses static seed-partitioning); the paper's §3.5 large-array *increment*
   scalability IS delivered at RC-entry granularity (`ApplyRCEpoch`). A bounded perf
   refinement, not a soundness gap.
-- **A young elision** is via `LXR_YOUNG_RC` RC-skip, not the paper's birth-logged bit;
-  and **C's epoch-spanning** mechanism is present but not exercised on WebApi (the
-  16-thread marker drains within one RC-pause gap, `spans=0`). Both are behaviour-
-  equivalent under test.
+- **A young elision** is via `LXR_YOUNG_RC` RC-skip, not the paper's birth-logged bit
+  (behaviour-equivalent: young referents are RC-skipped and the JIT elides young→young
+  stores anyway, as D-copy's fix-up confirmed); and **C's epoch-spanning** mechanism is
+  present but not exercised on WebApi (the parallel marker drains within one RC-pause
+  gap, `spans=0`) — it spans only when marking outlasts the pause interval, as the paper
+  intends.
 
 ---
 
