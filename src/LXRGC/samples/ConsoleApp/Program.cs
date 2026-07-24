@@ -34,6 +34,21 @@ Console.WriteLine($"# GC.Name={gcName}");
 
 var survivors = new List<byte[]>();
 var rng = new Random(12345);
+
+// Item G probe: when LXR_BIGARRAY_PROBE is set, allocate a single very large
+// reference array (> the collector's 64K-slot partition threshold) full of live
+// objects and keep mutating/reachable across the whole run, so the parallel
+// mark path (DrainDeferredBigArrays) is exercised on every trace.
+object[]? bigRefArray = null;
+if (Environment.GetEnvironmentVariable("LXR_BIGARRAY_PROBE") != null)
+{
+    int n = 2_000_000; // 2M slots >> 64K threshold (~16MB of pointers)
+    bigRefArray = new object[n];
+    for (int i = 0; i < n; i++)
+        bigRefArray[i] = new object();
+    Console.WriteLine($"# LXR_BIGARRAY_PROBE: allocated object[{n}] live ref array");
+}
+
 long ops = 0;
 var sw = Stopwatch.StartNew();
 var deadline = TimeSpan.FromSeconds(durationSeconds);
@@ -80,7 +95,13 @@ while (sw.Elapsed < deadline)
     // an unthrottled rate, which is unrepresentative of real workloads and
     // risks exhausting machine memory during a multi-minute comparison run.
     Thread.Sleep(1);
+
+    // Keep the big-array probe live and mutating (new element stores keep it
+    // referenced and dirty so every trace re-scans it).
+    if (bigRefArray != null && (ops % 1000 == 0))
+        bigRefArray[(int)((ops / 1000) % bigRefArray.Length)] = new object();
 }
+GC.KeepAlive(bigRefArray);
 
 sw.Stop();
 proc.Refresh();

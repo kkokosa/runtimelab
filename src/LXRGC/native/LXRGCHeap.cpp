@@ -383,6 +383,23 @@ static std::vector<std::vector<Object**>*> g_evacEdgeLogs;          // registry 
 static CRITICAL_SECTION g_evacEdgeLock;           // guards the registry (not the hot append)
 static const size_t kEvacEdgeLaneCap = 16u * 1024u * 1024u; // 16M slots/lane (~128MB) -> overflow
 
+// --- Item G (§3.5): globals for parallel scan of a single very large ref array --
+// (Definitions/rationale at the implementation block near ParallelDrainMarkStack.)
+static std::vector<Object*> g_bigRefArrays;              // deferred huge ref arrays
+static CRITICAL_SECTION     g_bigArrayLock;              // guards g_bigRefArrays
+static volatile LONG        g_bigArrayParallel = 1;      // env LXR_PARALLEL_BIGARRAY (opt-out)
+static const size_t         kBigRefArraySlots  = 64u * 1024u;  // >=512KB ref array => partition
+static const size_t         kBigArrayChunkSlots = 16u * 1024u; // 128KB element chunk / lane task
+static volatile LONG64      g_bigArrayScans        = 0;  // stats: arrays partitioned
+static volatile LONG64      g_bigArraySlotsScanned = 0;  // stats: element slots scanned in parallel
+
+static void DeferBigRefArray(Object* o)
+{
+    EnterCriticalSection(&g_bigArrayLock);
+    g_bigRefArrays.push_back(o);
+    LeaveCriticalSection(&g_bigArrayLock);
+}
+
 // Append an inter-block slot to this lane's log. Lazily allocates + registers the
 // lane's vector on first use. Lock-free on the hot path (each thread owns its
 // vector); the one-time registration is under g_evacEdgeLock.
@@ -1104,6 +1121,7 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     InitializeCriticalSection(&g_evacEdgeLock);
     InitializeCriticalSection(&g_poolLock);
     InitializeCriticalSection(&g_chunkLock);
+    InitializeCriticalSection(&g_bigArrayLock);
 
     // Full-LXR parity is the DEFAULT (1:1 with the paper). Each knob below is now
     // default-ON and only an explicit "=0" opts OUT (for A/B testing) - mirroring
@@ -1164,6 +1182,10 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
         if (n > 64) n = 64;
         g_gcThreads = n;
     }
+    // Item G (§3.5): partition a single very large reference array's mark scan
+    // across the worker pool. Default-ON (parity); LXR_PARALLEL_BIGARRAY=0 opts out
+    // (each lane then scans a claimed array end-to-end, as before).
+    g_bigArrayParallel = envOn("LXR_PARALLEL_BIGARRAY");
     return true;
 }
 
@@ -2388,9 +2410,10 @@ void LXRCollector::VerifyTraceComplete()
         }
     }
     LeaveCriticalSection(&g_chunkLock);
-    fprintf(stderr, "LXRGC: [verify] trace-completeness offenders=%lld markStackDrops=%lld rcApply[par=%lld ser=%lld]\n",
+    fprintf(stderr, "LXRGC: [verify] trace-completeness offenders=%lld markStackDrops=%lld rcApply[par=%lld ser=%lld] bigArrays[scans=%lld slots=%lld par=%d]\n",
             (long long)offenders, (long long)g_lxrCounters.MarkStackDrops,
-            (long long)g_parRCApplies, (long long)g_serRCApplies);
+            (long long)g_parRCApplies, (long long)g_serRCApplies,
+            (long long)g_bigArrayScans, (long long)g_bigArraySlotsScanned, (int)g_bigArrayParallel);
     fflush(stderr);
 }
 
@@ -2693,6 +2716,15 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
         }
         if (g_lineMarksValid)
             MarkLines(o, osz);
+        size_t bigSlots = 0;
+        if (g_bigArrayParallel && IsBigRefArray(o, osz, &bigSlots))
+        {
+            // Item G: this lane has already claimed (marked) the array; defer its
+            // element scan so DrainDeferredBigArrays can partition it across the
+            // pool instead of one lane walking all bigSlots serially.
+            DeferBigRefArray(o);
+            continue;
+        }
         GCScanObjectRefs(o, osz, [this, &local, o](Object** ref)
         {
             Object* c = *ref;
@@ -2805,6 +2837,149 @@ static void EnsureMarkWorkerPool()
     }
 }
 
+// --- Item G (§3.5): parallel scan of a single very large reference array -------
+// The base parallel closure claims each object atomically for exactly one lane and
+// that lane scans the whole object. A single huge object[] (or covariant ref array)
+// is therefore scanned end-to-end by one lane -- the scalability cliff the paper
+// calls out (§3.5). To distribute it, a lane that meets such an array during the
+// closure DEFERS it: it has already atomically claimed (marked) the array, so it
+// pushes the array here instead of scanning the elements inline. After the per-lane
+// mark closure joins (and releases g_poolLock), DrainDeferredBigArrays partitions
+// every deferred array's element range into fixed-size chunks and scans the chunks
+// across the pool; each lane drains the greys it discovers to full local closure
+// (which may defer further nested big arrays), and the whole thing iterates to a
+// fixpoint. Sound by construction: the array is atomically claimed once, its
+// elements are visited exactly once, discovered greys are transitively closed
+// before return, and marking is monotone (a re-seen object is a no-op).
+
+// Is `o` a single-series reference array big enough to be worth partitioning?
+// Only the object[]/covariant-ref-array shape (one positive GC series covering a
+// contiguous run of pointer-sized element slots) qualifies; value-type arrays use
+// the repeating (negative GetNumSeries) encoding and are excluded. outSlots gets
+// the element-slot count.
+bool LXRCollector::IsBigRefArray(Object* o, size_t osz, size_t* outSlots) const
+{
+    MethodTable* mt = o->GetGCSafeMethodTable();
+    if (mt == nullptr || !mt->HasComponentSize())
+        return false;
+    if (mt->RawGetComponentSize() != sizeof(void*)) // ref arrays store pointer-sized slots
+        return false;
+    if (!mt->ContainsGCPointers())
+        return false;
+    CGCDesc* map = CGCDesc::GetCGCDescFromMT(mt);
+    if (map->GetNumSeries() != 1) // exclude the repeating value-type-array encoding
+        return false;
+    CGCDescSeries* series = map->GetHighestSeries();
+    // Mirror gcobjscan.h's single-series element region: [op + off, op + off + (SeriesSize + size)).
+    uint8_t** parm  = (uint8_t**)((uint8_t*)o + series->GetSeriesOffset());
+    uint8_t** ppstop = (uint8_t**)((uint8_t*)parm + series->GetSeriesSize() + osz);
+    if (ppstop <= parm)
+        return false;
+    size_t slots = (size_t)(ppstop - parm);
+    if (slots < kBigRefArraySlots)
+        return false;
+    if (outSlots != nullptr)
+        *outSlots = slots;
+    return true;
+}
+
+// Scan element slots [slotStart, slotEnd) of a single-series ref array, claiming
+// live children into `local`. Replicates the F3 evac-edge logging + nursery guard
+// of the DrainSliceLocal scan callback so item-F soundness/diagnostics still hold
+// when a big array's elements are the inter-block source slots.
+void LXRCollector::ScanBigRefArrayChunk(Object* o, size_t slotStart, size_t slotEnd, std::vector<Object*>& local)
+{
+    MethodTable* mt = o->GetGCSafeMethodTable();
+    CGCDesc* map = CGCDesc::GetCGCDescFromMT(mt);
+    CGCDescSeries* series = map->GetHighestSeries();
+    uint8_t** parm = (uint8_t**)((uint8_t*)o + series->GetSeriesOffset());
+    for (size_t i = slotStart; i < slotEnd; i++)
+    {
+        Object** ref = (Object**)(parm + i);
+        Object* c = *ref;
+        if (c == nullptr)
+            continue;
+        if (g_recordEvacEdges && InHeap(c))
+        {
+            uintptr_t sblk = (uintptr_t)ref & ~(lxr::kBlockSize - 1);
+            uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
+            if (sblk != tblk) RecordEvacEdge(ref);
+        }
+        if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
+        {
+            fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p from bigarray=%p slot=%llu\n",
+                    (void*)c, (void*)o, (unsigned long long)i);
+            fflush(stderr);
+            continue;
+        }
+        if (MarkObject(c)) // atomic claim
+            local.push_back(c);
+    }
+}
+
+// Chunk descriptor + parallel-for context for the deferred big-array scan.
+namespace {
+struct BigArrayChunk { Object* array; size_t start; size_t end; };
+struct BigArrayForCtx { std::vector<BigArrayChunk>* chunks; LXRCollector* self; };
+}
+
+// RunOnPool body: each lane scans its stripe of chunks, then drains the greys it
+// discovered to full local closure (which may defer further nested big arrays into
+// g_bigRefArrays for the next fixpoint round).
+static void LXRBigArrayScanFn(int lane, int lanes, void* ctxp)
+{
+    BigArrayForCtx* ctx = (BigArrayForCtx*)ctxp;
+    const std::vector<BigArrayChunk>& chunks = *ctx->chunks;
+    std::vector<Object*> local;
+    for (size_t i = (size_t)lane; i < chunks.size(); i += (size_t)lanes)
+    {
+        const BigArrayChunk& ch = chunks[i];
+        ctx->self->ScanBigRefArrayChunk(ch.array, ch.start, ch.end, local);
+    }
+    ctx->self->DrainSliceLocal(local);
+}
+
+// Phase B of item G. Called after the per-lane mark closure has joined and released
+// g_poolLock. Repeatedly drains the deferred-big-array list: snapshot+clear it,
+// slice each array's element range into kBigArrayChunkSlots chunks, and RunOnPool a
+// parallel-for over the chunks. A round may itself defer newly discovered nested
+// big arrays, so it loops until the list stays empty.
+void LXRCollector::DrainDeferredBigArrays(int workers)
+{
+    if (!g_bigArrayParallel)
+        return;
+    for (;;)
+    {
+        std::vector<Object*> arrays;
+        EnterCriticalSection(&g_bigArrayLock);
+        arrays.swap(g_bigRefArrays);
+        LeaveCriticalSection(&g_bigArrayLock);
+        if (arrays.empty())
+            return;
+
+        std::vector<BigArrayChunk> chunks;
+        for (Object* a : arrays)
+        {
+            size_t slots = 0;
+            if (!IsBigRefArray(a, LXRObjectSize(a), &slots))
+                continue; // shouldn't happen (only big arrays are deferred)
+            for (size_t s = 0; s < slots; s += kBigArrayChunkSlots)
+            {
+                size_t e = s + kBigArrayChunkSlots;
+                if (e > slots) e = slots;
+                chunks.push_back({ a, s, e });
+            }
+            InterlockedIncrement64(&g_bigArrayScans);
+            InterlockedExchangeAdd64(&g_bigArraySlotsScanned, (LONG64)slots);
+        }
+        if (chunks.empty())
+            continue;
+
+        BigArrayForCtx ctx{ &chunks, this };
+        RunOnPool(workers, &LXRBigArrayScanFn, &ctx);
+    }
+}
+
 // Parallel transitive closure (P5). The seed set already sits in g_markStack.
 // Partition it round-robin across the available lanes (main thread = lane 0, each
 // pooled worker = lane w+1); each lane drains its own local stack to completion.
@@ -2848,6 +3023,11 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
         WaitForSingleObject(g_poolDone[w - 1], INFINITE);
     g_poolSlices = nullptr;
     LeaveCriticalSection(&g_poolLock);
+
+    // Item G: scan any huge reference arrays the lanes deferred during the closure,
+    // partitioned across the pool. Runs OUTSIDE g_poolLock (RunOnPool re-takes it)
+    // and iterates to a fixpoint over nested big arrays.
+    DrainDeferredBigArrays(lanes);
 }
 
 // Drain the current grey set (already in g_markStack) using the parallel closure
@@ -3458,10 +3638,11 @@ void LXRCollector::BackupTrace()
 
     if (getenv("LXR_VERIFY_TRACE") != nullptr)
     {
-        fprintf(stderr, "LXRGC: [trace] rootsPushed=%llu heapNextFree=+%lldMB rcApply[par=%lld ser=%lld]\n",
+        fprintf(stderr, "LXRGC: [trace] rootsPushed=%llu heapNextFree=+%lldMB rcApply[par=%lld ser=%lld] bigArrays[scans=%lld slots=%lld par=%d]\n",
                 (unsigned long long)rootsPushed,
                 (long long)((g_lxrGCHeap ? (g_lxrGCHeap->HeapHighWater() - g_lxrGCHeap->HeapBase()) : 0) >> 20),
-                (long long)g_parRCApplies, (long long)g_serRCApplies);
+                (long long)g_parRCApplies, (long long)g_serRCApplies,
+                (long long)g_bigArrayScans, (long long)g_bigArraySlotsScanned, (int)g_bigArrayParallel);
         VerifyTraceComplete();
     }
 }

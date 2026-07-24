@@ -22,6 +22,13 @@ builder.Logging.ClearProviders(); // keep stdout free for the ##RESULT## line
 builder.WebHost.UseUrls("http://127.0.0.1:0"); // let Kestrel pick a free port
 var app = builder.Build();
 
+// Item G probe: when LXR_BIGARRAY_PROBE is set, allocate a single very large
+// live reference array (> the collector's 64K-slot partition threshold) and keep
+// mutating/reachable for the whole run, so the parallel big-array mark path
+// (DrainDeferredBigArrays) is exercised on every trace. Held in a static field so
+// it stays a GC root for the process lifetime.
+BigArrayProbe.Start();
+
 // Per-request handler: simulates a small JSON API endpoint that builds a
 // response object, serializes it, and does a bit of string/list work -
 // representative gen0-heavy allocation churn for a typical web API.
@@ -153,6 +160,41 @@ static async Task RunBenchmarkAndExitAsync(WebApplication app, Counter<long> ops
 
 internal record WorkItem(int Id, string Name, double Value);
 internal record WorkResponse(int Count, double Sum, WorkItem[] Sample);
+
+// Item G probe (see Program top). Keeps a huge live object[] rooted in a static
+// field and a background thread that periodically stores new elements so the
+// array stays referenced and dirty across every trace.
+internal static class BigArrayProbe
+{
+    private static object[]? s_big;
+    public static void Start()
+    {
+        if (Environment.GetEnvironmentVariable("LXR_BIGARRAY_PROBE") == null)
+            return;
+        int n = 100_000; // >> 64K partition threshold, but a modest 800KB array
+        var big = new object[n];
+        // Populate sparsely with live objects so the parallel chunk scan has real
+        // non-null out-edges to follow, without a huge tiny-object burst.
+        for (int i = 0; i < n; i += 16)
+            big[i] = new object();
+        s_big = big;
+        Console.WriteLine($"# LXR_BIGARRAY_PROBE: allocated object[{n}] live ref array");
+        var t = new Thread(() =>
+        {
+            long k = 0;
+            while (true)
+            {
+                var a = s_big;
+                if (a != null)
+                    a[(int)(k % a.Length)] = new object();
+                k += 997;
+                Thread.Sleep(5);
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+}
 
 internal class BenchResult
 {

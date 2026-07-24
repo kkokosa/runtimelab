@@ -476,6 +476,14 @@ public:
     void ParallelDrainMarkStack(int workers); // P5: parallel transitive closure
     void DrainSliceLocal(std::vector<Object*>& local); // drain one worker's grey set
     void DrainClosure();                // parallel or serial closure per LXR_GC_THREADS
+    // Item G (§3.5): partition the scan of a single very large reference array
+    // across the mark pool. A lane that meets such an array defers it (marks it,
+    // records it) instead of scanning its elements serially; after the per-lane
+    // closure joins, DrainDeferredBigArrays chunks every deferred array's element
+    // range and scans the chunks in parallel, iterating to a fixpoint.
+    bool IsBigRefArray(Object* o, size_t osz, size_t* outSlots) const;
+    void ScanBigRefArrayChunk(Object* o, size_t slotStart, size_t slotEnd, std::vector<Object*>& local);
+    void DrainDeferredBigArrays(int workers);
     Object* ResolveInterior(uint8_t* interior); // interior pointer -> containing object
     // Conservative fallback when an in-heap interior/byref root cannot be
     // resolved to its base object: keep the containing region alive this cycle so
