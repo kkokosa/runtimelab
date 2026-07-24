@@ -1004,22 +1004,27 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     InitializeCriticalSection(&g_poolLock);
     InitializeCriticalSection(&g_chunkLock);
 
-    // P2 barrier-extension gates. Off by default (zero barrier overhead); SATB is
-    // driven by the concurrent trace (P4) and remsets by evacuation (P3). Env
-    // knobs let the STW path exercise them now: LXR_SATB=1, LXR_REMSET=1.
+    // Full-LXR parity is the DEFAULT (1:1 with the paper). Each knob below is now
+    // default-ON and only an explicit "=0" opts OUT (for A/B testing) - mirroring
+    // LXR_RC_RECLAIM / LXR_PARALLEL_RC. LXR_SATB stays a pure STW-exercise
+    // diagnostic (SATB is driven by the concurrent trace), so it is opt-IN.
+    auto envOn = [](const char* name) -> int {
+        const char* e = getenv(name);
+        return (e != nullptr && e[0] == '0') ? 0 : 1; // default ON unless "=0"
+    };
     if (getenv("LXR_SATB") != nullptr)   g_satbActive = 1;
-    if (getenv("LXR_REMSET") != nullptr) g_remsetActive = 1;
-    if (getenv("LXR_EVAC") != nullptr)   g_evacActive = 1;
+    g_remsetActive     = envOn("LXR_REMSET");
+    g_evacActive       = envOn("LXR_EVAC");
     if (getenv("LXR_FAULT_DIAG") != nullptr) AddVectoredExceptionHandler(1, &LXRFaultDiag);
     // P4: run the backup trace concurrently with the mutators (two brief STW
     // pauses + off-pause marking). The SATB window is opened per-trace, so
     // g_satbActive is NOT forced on here.
-    if (getenv("LXR_CONCURRENT") != nullptr) g_concurrentEnabled = 1;
+    g_concurrentEnabled = envOn("LXR_CONCURRENT");
     // Item C (paper §3.2.3): span the SATB trace over multiple RC epochs with no
     // dedicated trace pauses (snapshot + finish piggyback on RC pauses; a
     // background thread marks concurrently across the spanned epochs). Requires
     // LXR_CONCURRENT. See g_multiEpoch.
-    if (getenv("LXR_MULTIEPOCH") != nullptr) g_multiEpoch = 1;
+    g_multiEpoch = envOn("LXR_MULTIEPOCH");
     // #1: replay coalescing-RC decrements + the recursive free OFF the STW
     // pause (concurrent path only). Only the bounded buffer snapshot is paused.
     if (getenv("LXR_CONC_DECREMENTS") != nullptr) g_concDecrements = 1;
@@ -1027,20 +1032,30 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // object is born RC 0; references to it accrue RC via the coalescing barrier /
     // deferred root capture exactly like a mature object, and a young object still
     // at RC 0 at an RC pause is implicitly dead (reclaimed by CollectNursery).
-    if (getenv("LXR_YOUNG_RC") != nullptr) g_youngRC = 1;
+    g_youngRC = envOn("LXR_YOUNG_RC");
     // Item D: implicitly-dead-young reclamation at RC pauses (CollectNursery).
     // Young liveness is decided by the precise coalescing RC itself: after a pause
     // applies all increments (modbuf new-values + deferred root captures) and
     // decrements, young regions in which every young object is RC 0 are reclaimed.
     // No remembered set and no O(heap) closure - the RC side table is the oracle.
     // Guards on g_traceWindowOpen so it never frees under an in-flight trace.
-    if (getenv("LXR_NURSERY") != nullptr) g_nurseryActive = 1;
+    g_nurseryActive = envOn("LXR_NURSERY");
     // Item D-copy: young-survivor copy at the RC pause. When enabled, tell
     // ProcessModifiedBuffers to snapshot the epoch's modified slots so D-copy can
     // replay them as its (complete, bounded) remembered set for reference fix-up.
-    if (getenv("LXR_NURSERY_COPY") != nullptr) g_dcopyCaptureModified = 1;
+    g_dcopyCaptureModified = envOn("LXR_NURSERY_COPY");
     // P5: parallel mark worker count. Clamped to [1, 64]; 1 keeps the verified
     // single-threaded closure.
+    // Parallelism in every phase is part of paper parity (§3.5): default the GC
+    // worker count to the machine's logical processors (clamped) rather than 1.
+    // LXR_GC_THREADS overrides (and =1 forces the serial closure for A/B testing).
+    {
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        int cores = (int)si.dwNumberOfProcessors;
+        if (cores < 1) cores = 1;
+        if (cores > 64) cores = 64;
+        g_gcThreads = cores;
+    }
     if (const char* t = getenv("LXR_GC_THREADS"))
     {
         int n = atoi(t);
@@ -4740,7 +4755,10 @@ void LXRCollector::CopyYoungSurvivors()
 {
     static int s_enabled = -1;
     if (s_enabled < 0)
-        s_enabled = (getenv("LXR_NURSERY_COPY") != nullptr) ? 1 : 0; // opt-in until validated
+    {
+        const char* e = getenv("LXR_NURSERY_COPY");
+        s_enabled = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON (full parity)
+    }
     if (!s_enabled)
         return;
     if (!g_youngRC || !g_nurseryActive || g_theGCToCLR == nullptr)
