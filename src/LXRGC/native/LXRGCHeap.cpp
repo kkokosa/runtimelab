@@ -796,6 +796,15 @@ static HANDLE g_collectDoneEvent = nullptr;    // auto-reset: pulsed after each 
 static HANDLE g_gcCompleteEvent = nullptr;
 static volatile LONG g_gcInProgress = 0;
 static volatile LONG g_collectPending = 0;     // coalesces repeated alloc triggers
+static volatile LONG g_collectorReady = 0;     // SET by the collector thread once it
+                                               // is alive and parked on its request
+                                               // event. Until then NO collection may
+                                               // be triggered: the only alternative
+                                               // is to drive SuspendEE from a random
+                                               // cooperative mutator (the documented
+                                               // early-startup deadlock, seen as an
+                                               // intermittent hang when EventPipe/
+                                               // dotnet-counters attaches mid-init).
 static volatile int64_t g_collectCompletedSeq = 0; // ++ after each completed cycle
 static volatile LONG g_collectorShutdown = 0;
 
@@ -6221,7 +6230,11 @@ HRESULT LXRGCHeap::Initialize()
             CloseHandle(g_collectRequestEvent); g_collectRequestEvent = nullptr;
             CloseHandle(g_collectDoneEvent);    g_collectDoneEvent = nullptr;
         }
-        if (getenv("LXR_WATCHDOG") != nullptr)
+        // Watchdog: on by default (LXR_WATCHDOG=0 opts out). Cheap 2s-poll thread
+        // that, if a stop-the-world phase stalls >20s, prints the stuck phase and
+        // dumps every thread's native stack -- so the rare early-startup EventPipe
+        // suspension hang self-diagnoses instead of hanging silently.
+        if (getenv("LXR_WATCHDOG") == nullptr || _atoi64(getenv("LXR_WATCHDOG")) != 0)
         {
             QueryPerformanceFrequency(&g_lxrQpcFreq);
             InterlockedExchange(&g_lxrWatchdog, 1);
@@ -7040,6 +7053,26 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
     }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
+    // Pause-time telemetry (feeds GetTotalPauseDuration / GetLastGCPercentTimeInGC,
+    // consumed by the dotnet.gc.pause.time meter + "% Time in GC" EventCounter).
+    // % time in GC = this pause / wall-clock interval since the previous pause end.
+    {
+        static LARGE_INTEGER s_prevPauseEndQpc = { 0 };
+        LARGE_INTEGER nowQpc; QueryPerformanceCounter(&nowQpc);
+        g_lxrCounters.LastPauseMicros = pauseMicros;
+        if (s_prevPauseEndQpc.QuadPart != 0)
+        {
+            int64_t intervalMicros =
+                (int64_t)((nowQpc.QuadPart - s_prevPauseEndQpc.QuadPart) * 1000000 / freq.QuadPart);
+            if (intervalMicros > 0)
+            {
+                int64_t pct = pauseMicros * 100 / intervalMicros;
+                if (pct > 100) pct = 100;
+                g_lxrCounters.LastGCPercentTimeInGC = pct;
+            }
+        }
+        s_prevPauseEndQpc = nowQpc;
+    }
     InterlockedIncrement64(&g_lxrCounters.Epochs);
     g_lxrCounters.LastCollectCommitted = g_committedInUse;
     // Item E: reset the increment-count trigger accumulator at every pause (both
@@ -7452,10 +7485,12 @@ static void LXRWatchdogThreadProc(void*)
                     ph, (long long)(stampAge / 1000000), (long long)seq);
             fflush(stderr);
             lastReportedSeq = seq;
-            // If we're stuck inside a SuspendEE, dump every thread's native stack
-            // so we can see which mutator is failing to reach a safepoint.
-            if (strstr(ph, "suspend") != nullptr)
-                LXRDumpAllThreadStacks();
+            // Dump every thread's native stack so we can see which thread is
+            // failing to make progress (a mutator not reaching a safepoint, or a
+            // lock cycle). Previously gated to "suspend" phases only; broadened so
+            // the rare early-startup EventPipe hang is captured whatever phase the
+            // collector is parked in.
+            LXRDumpAllThreadStacks();
         }
     }
 }
@@ -7465,6 +7500,10 @@ static void LXRWatchdogThreadProc(void*)
 // can observe it.
 static void LXRCollectorThreadProc(void*)
 {
+    // Announce readiness: we are alive and about to park on the request event, so
+    // SuspendEE will now run on THIS non-suspendable thread (never a random
+    // cooperative mutator). Triggers gate on this flag (see RequestLXRCollection).
+    InterlockedExchange(&g_collectorReady, 1);
     for (;;)
     {
         WaitForSingleObject(g_collectRequestEvent, INFINITE);
@@ -7484,18 +7523,28 @@ static void LXRCollectorThreadProc(void*)
 // requests so the allocator never blocks or drives SuspendEE itself.
 static void RequestLXRCollection(bool wait, bool forceTrace)
 {
+    // Startup-safety gate: until the dedicated collector thread has announced it is
+    // parked on the request event, NO collection may run. The only alternative is
+    // to drive SuspendEE synchronously from the calling thread -- which, when that
+    // caller is a cooperative-mode mutator (e.g. the EventPipe/dotnet-counters
+    // poll thread allocating during NativeRuntimeEventSource init), is itself a
+    // suspension target and deadlocks (the intermittent early-startup hang). It is
+    // always safe to DROP an early trigger: the heap is freshly reserved and the
+    // budget/increment trigger will simply fire again once the collector is up.
+    if (!g_collectorReady || g_collectRequestEvent == nullptr)
+    {
+        if (!wait)
+            return;                              // fire-and-forget: just skip this one
+        // wait==true (explicit GC.Collect): give the collector a bounded moment to
+        // come up rather than hanging forever; if it never does, drop the request.
+        for (int spins = 0; spins < 200 && (!g_collectorReady || g_collectRequestEvent == nullptr); ++spins)
+            Sleep(5);
+        if (!g_collectorReady || g_collectRequestEvent == nullptr)
+            return;
+    }
+
     if (forceTrace)
         InterlockedExchange(&g_requestTrace, 1);
-
-    if (g_collectRequestEvent == nullptr)
-    {
-        // Collector thread not up yet (very early startup): fall back to a direct
-        // synchronous collection on the calling thread (single-threaded at this
-        // point, so the concurrency hazard does not apply).
-        InterlockedExchange(&g_requestTrace, 0);
-        RunLXRCollection(-1, forceTrace);
-        return;
-    }
 
     if (wait)
     {
@@ -7535,7 +7584,7 @@ HRESULT LXRGCHeap::GarbageCollect(int generation, bool low_memory_p, int mode)
 unsigned LXRGCHeap::GetMaxGeneration() { return 2; }
 void LXRGCHeap::SetFinalizationRun(Object* obj) { }
 bool LXRGCHeap::RegisterForFinalization(int gen, Object* obj) { return true; }
-int LXRGCHeap::GetLastGCPercentTimeInGC() { return 0; }
+int LXRGCHeap::GetLastGCPercentTimeInGC() { return (int)g_lxrCounters.LastGCPercentTimeInGC; }
 size_t LXRGCHeap::GetLastGCGenerationSize(int gen) { return 0; }
 
 bool LXRGCHeap::IsPromoted(Object* object) { return true; }
@@ -7670,7 +7719,8 @@ unsigned int LXRGCHeap::GetGenerationWithRange(Object* object, uint8_t** ppStart
     return 0;
 }
 
-int64_t LXRGCHeap::GetTotalPauseDuration() { return 0; }
+// TimeSpan ticks are 100ns; TotalPauseMicros is in microseconds -> x10.
+int64_t LXRGCHeap::GetTotalPauseDuration() { return g_lxrCounters.TotalPauseMicros * 10; }
 
 void LXRGCHeap::EnumerateConfigurationValues(void* context, ConfigurationValueFunc configurationValueFunc)
 {

@@ -184,6 +184,49 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-24** — **GC pause-time counters wired + startup-hang defensive fix.**
+  (1) **Pause counters:** LXR now feeds the pause-time telemetry that its IGCHeap
+  previously stubbed to 0. `GetTotalPauseDuration()` returns cumulative STW pause
+  time (`TotalPauseMicros`×10, TimeSpan ticks) → drives the modern
+  `dotnet.gc.pause.time` meter *and* the `total-pause-time-by-gc` EventCounter (both
+  managed via `GC.GetTotalPauseDuration()`), and `GetLastGCPercentTimeInGC()` now
+  returns the last pause as a % of the wall interval since the prior pause (feeds the
+  legacy `% Time in GC` counter). Verified: 30 s WebApi/LXRGC canary now reports
+  **PauseTimeMs avg 1.35 / max 32.99 ms** (was uniformly 0). This closes the
+  "harness measurement gap" noted in the prior canary entry — LXR's pauses are now
+  observable, so the throughput/footprint numbers can be attributed. **NOTE:** the
+  prior entry's "expected for an unoptimised research collector" gloss is *rejected* —
+  LXR's design goal is to *beat* the built-in GCs; the regression is an implementation
+  cost to be profiled and removed, not an inherent property. (2) **Startup hang:**
+  root-caused to driving `SuspendEE` synchronously from a cooperative-mode mutator
+  (the EventPipe/`dotnet-counters` poll thread allocating during
+  `NativeRuntimeEventSource` init) — itself a suspension target → deadlock. Fix:
+  added a `g_collectorReady` gate; `RequestLXRCollection` now **drops** early
+  fire-and-forget triggers (always safe on a freshly-reserved heap) and bounds
+  `wait==true` (GC.Collect) readiness spin to ~1 s instead of the removed
+  deadlock-prone synchronous fallback. Watchdog made **default-on** (`LXR_WATCHDOG=0`
+  to disable) and now dumps all thread stacks on ANY >20 s stall for self-diagnosis.
+- **2026-07-24** — **Canary benchmark run (short, non-exhaustive).** Ran
+  `run-benchmarks.ps1 -DurationSeconds 60 -Scenarios console,webapi -GcModes
+  workstation,server,lxrgc` (report at `results/report.html`, data `results/results-full.json`;
+  the harness runs each (scenario,mode) **sequentially**, never concurrently, and
+  regenerates the HTML after every run). Results: **WebApi runs clean on all three GC
+  modes incl. LXRGC** (exit 0). Throughput/footprint gap vs built-in GC on WebApi (60s):
+  LXRGC ~70 ops/s vs ~256 (WS/Server) ≈ 3.6× slower; WS 371 MB / peak 586 / commit 408
+  vs 72–93 MB ≈ 4–8× higher — expected for an unoptimised research collector. LXRGC GC
+  **pause-time EventCounters read 0** (its IGCHeap does not feed `% Time in GC` / pause
+  duration) — a harness measurement gap, not zero pauses. **Finding — intermittent
+  LXRGC × EventPipe startup hang:** `console_lxrgc` HUNG at early startup (~50%: 1 hang /
+  2 harness attempts) with CPU frozen at ~0.9 s; the dump showed the CLR not fully
+  initialised, stalled in the `NativeRuntimeEventSource..cctor` / `CounterGroup.PollForValues`
+  EventPipe path (same path the earlier stale-coreclr AVs traversed). Run **directly
+  without a diagnostics attach, ConsoleApp/LXRGC is 4/4 clean** — so the hang is a race
+  between LXRGC and the EventPipe/`dotnet-counters` attach during fast-process startup,
+  **not** a workload GC-correctness bug (WebApi, slower to start, tolerates the attach
+  3/3). Dump kept at `results/console_lxrgc_hang.dmp`. Also re-confirmed the deployment
+  hazard: `ConsoleApp/publish` carried the stale 4928512-byte 7/20 `coreclr.dll` (crashes
+  **all** GC modes) — refreshed from `artifacts/bin/coreclr/windows.x64.Release`
+  (4935680, 7/22) + `clrjit.dll` before the passing runs.
 - **2026-07-26** — **b.4 young-survival RC-pause trigger + b.5 straddle verification landed
   (post-audit parity closures).** From the bidirectional paper↔impl audit, two items
   closed: **(b.4, throughput)** the paper's §3.2.2 *survival-threshold* RC-pause trigger

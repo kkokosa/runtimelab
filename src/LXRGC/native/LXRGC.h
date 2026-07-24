@@ -146,6 +146,8 @@ struct LXRCounters
     volatile int64_t YoungSurvivalPctEwma;  // biased-decay EWMA of YOUNG-object survival % per RC pause (item E survival-rate RC trigger, paper §3.2.2)
     volatile int64_t RCPausePauseMicros;    // cumulative light-pause time (us)
     volatile int64_t TracePausePauseMicros; // cumulative full-pause time (us)
+    volatile int64_t LastPauseMicros;       // last STW pause duration (us)
+    volatile int64_t LastGCPercentTimeInGC; // last pause as % of the interval since the prior pause (0..100)
 
     // P2 barrier extensions: SATB deletion barrier + remembered sets.
     volatile int64_t SatbEntries;           // old referents logged to SATB buffers
