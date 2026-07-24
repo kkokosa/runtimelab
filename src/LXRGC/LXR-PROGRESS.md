@@ -184,6 +184,36 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-24** — **Pause profiling + sound D-copy fixup micro-opt; throughput
+  claim corrected.** Profiled the WebApi/LXRGC full-config canary with per-phase STW
+  timers (`[rc-breakdown]`, `[copy-breakdown]`, ProcessModifiedBuffers timing — all
+  verbose-gated). **Findings:** (1) **Throughput is NOT ~3.6× slower** — the prior
+  canary's claim was a measurement artifact. Direct + harness runs both give WebApi
+  LXRGC **≈ 250 ops/s vs ≈ 256 WS/Server** (parity). (2) **The real problem is pause
+  latency, not throughput.** Two dominant STW pauses: **(a)** RC-pause
+  `CopyYoungSurvivors` grows to **~68–97 ms**, and the cost is entirely the **4a-young
+  fixup** (full young-space object rescan), NOT the budgeted copy loop (~2–3 ms) nor
+  RC-reclaim (~0.1–0.2 ms) nor the 4b modslot replay (~8 k slots, cheap). **(b)** the
+  trace-finish **STW sweep/line-carve is O(heap) at ~5–170 ms** (one spike to 301 ms
+  under a smaller trigger). During these spikes per-second ops collapse from ~256 to
+  ~16 — that is what makes LXR "feel slow." (3) **Root cause of 4a-young** — the JIT
+  elides the write barrier on *init stores to freshly-allocated (young) objects*, so
+  young→young edges never reach the modified buffer; we compensate with an O(young-
+  space) rescan every RC pause. Young space per pause ≈ the RC-pause trigger's worth
+  of allocation (~32 MB ≈ 450 regions), so 4a-young ∝ trigger size. (4) **Trigger
+  tuning is a tradeoff, not a fix:** `LXR_GC_TRIGGER_MB=8` cut RC pauses (97→20 ms)
+  but made traces more frequent and one sweep hit 301 ms; total young-scan work is
+  ~constant (≈ total allocation) because each pause rescans the whole young space.
+  **Landed (sound, kept):** removed the redundant per-ref `unordered_map::find` from
+  the D-copy fixup hot path (`DCopyFixupCtx::Rebase`/`IsMovedSource` now use one
+  binary search over the small sorted moved-range table; the `>=` lower bound catches
+  exact-start refs the strict `>` previously deferred to the hash) — ~14 % off the
+  worst RC pause (79→68 ms), `LXR_VERIFY_TRACE` misses=0. **Remaining deep fix is a
+  runtime-change boundary** (see Audit-caveats): making young→young init stores
+  barriered (JIT init-store barrier elision) — or maintaining young RC so survivors
+  can age-in-place — is what eliminates the O(young-space) rescan and yields the
+  paper's sub-ms RC pauses. Flagged to the user per the standing "stop and inform on
+  runtime change" mandate.
 - **2026-07-24** — **GC pause-time counters wired + startup-hang defensive fix.**
   (1) **Pause counters:** LXR now feeds the pause-time telemetry that its IGCHeap
   previously stubbed to 0. `GetTotalPauseDuration()` returns cumulative STW pause

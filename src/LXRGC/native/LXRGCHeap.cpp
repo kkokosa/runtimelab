@@ -5397,13 +5397,11 @@ struct DCopyFixupCtx
         uint8_t* v = (uint8_t*)*f;
         if (v == nullptr)
             return;
-        auto it = forwarding->find((Object*)v);
-        if (it != forwarding->end())
-        {
-            *f = it->second; forwarded++;
-            InterlockedIncrement64(&g_lxrCounters.NurseryCopyFieldsForwarded);
-            return;
-        }
+        // Hot path: a single binary search over the (small, sorted) moved ranges
+        // resolves both exact-start and interior refs. This is called for every
+        // field of every young object in 4a-young (~millions/pass), so the former
+        // per-ref unordered_map::find is elided -- movedRanges' oldStart keys are
+        // exactly forwarding's keys, and the >= lower bound catches exact starts.
         if (movedRanges->empty())
             return;
         size_t lo = 0, hi = movedRanges->size();
@@ -5411,11 +5409,22 @@ struct DCopyFixupCtx
         if (lo == 0)
             return;
         const DCopyMovedRange& r = (*movedRanges)[lo - 1];
-        if (v > r.oldStart && v < r.oldEnd)
+        if (v >= r.oldStart && v < r.oldEnd)
         {
             *f = (Object*)(r.newStart + (v - r.oldStart)); forwarded++;
             InterlockedIncrement64(&g_lxrCounters.NurseryCopyFieldsForwarded);
         }
+    }
+    // O(log n) "is this object a moved source?" (replaces forwarding->find in the
+    // 4a-young per-object skip check; equivalent since moved starts == forwarding keys).
+    bool IsMovedSource(Object* o) const
+    {
+        uint8_t* v = (uint8_t*)o;
+        if (movedRanges->empty())
+            return false;
+        size_t lo = 0, hi = movedRanges->size();
+        while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*movedRanges)[mid].oldStart <= v) lo = mid + 1; else hi = mid; }
+        return lo != 0 && (*movedRanges)[lo - 1].oldStart == v;
     }
 };
 static DCopyFixupCtx* g_dcopyFixup = nullptr;
@@ -5673,6 +5682,7 @@ void LXRCollector::CopyYoungSurvivors()
     }
     if (curDestIndex >= 0)
         g_chunks[curDestIndex].UsedEnd = destPtr;
+    LARGE_INTEGER clkAfterCopy; QueryPerformanceCounter(&clkAfterCopy);
 
     if (movedObjs == 0)
     {
@@ -5744,7 +5754,7 @@ void LXRCollector::CopyYoungSurvivors()
                     size_t sz = LXRObjectSize(o);
                     if (sz == 0) break;
                     p += sz;
-                    if (forwarding.find(o) != forwarding.end())
+                    if (fx.IsMovedSource(o))
                         continue; // relocated source granule (dead): copy scanned by 4a
                     GCScanObjectRefs(o, sz, rebaseField);
                 }
@@ -5781,11 +5791,20 @@ void LXRCollector::CopyYoungSurvivors()
                 if (sz == 0)
                     break;
                 p += sz;
-                if (forwarding.find(o) != forwarding.end())
+                if (fx.IsMovedSource(o))
                     continue; // dead source
                 GCScanObjectRefs(o, sz, rebaseField);
             }
         }
+    }
+    LARGE_INTEGER clkAfterFixup; QueryPerformanceCounter(&clkAfterFixup);
+    if (verbose)
+    {
+        fprintf(stderr, "LXRGC: [copy-breakdown] copyloop=%lldus fixup=%lldus scoped=%d modslots=%zu srcRegions=%zu\n",
+                (long long)((clkAfterCopy.QuadPart - clk0.QuadPart) * 1000000 / clkFreq.QuadPart),
+                (long long)((clkAfterFixup.QuadPart - clkAfterCopy.QuadPart) * 1000000 / clkFreq.QuadPart),
+                (int)useScoped, g_dcopyModifiedSlots.size(), srcs.size());
+        fflush(stderr);
     }
 
     // Empirical soundness check: after fix-up NO live field may still point at a
@@ -6974,8 +6993,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         bool skipBuffersForSpan = g_multiEpoch && g_traceState == TRACE_MARKING && !g_snapshotConsumed;
         if (doBuffers && !skipBuffersForSpan)
         {
+            LARGE_INTEGER tpb0; QueryPerformanceCounter(&tpb0);
             g_lxrCollector.ProcessModifiedBuffers();
-            if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done\n"); fflush(stderr); }
+            LARGE_INTEGER tpb1; QueryPerformanceCounter(&tpb1);
+            if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done (%lldus)\n",
+                                   (long long)((tpb1.QuadPart - tpb0.QuadPart) * 1000000 / freq.QuadPart)); fflush(stderr); }
         }
         if (phase == LXRPhase::TracePause)
         {
@@ -7032,9 +7054,19 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 // region emptied of survivors is freed here; then CollectNursery
                 // mops up the regions of purely implicitly-dead young.
                 LXRSetPhase("stw:nursery-copy");
+                LARGE_INTEGER tnc0; QueryPerformanceCounter(&tnc0);
                 g_lxrCollector.CopyYoungSurvivors();
                 LXRSetPhase("stw:nursery");
+                LARGE_INTEGER tnc1; QueryPerformanceCounter(&tnc1);
                 g_lxrCollector.CollectNursery();
+                LARGE_INTEGER tnc2; QueryPerformanceCounter(&tnc2);
+                if (verbose)
+                {
+                    fprintf(stderr, "LXRGC: [rc-breakdown] copy=%lldus nursery=%lldus\n",
+                            (long long)((tnc1.QuadPart - tnc0.QuadPart) * 1000000 / freq.QuadPart),
+                            (long long)((tnc2.QuadPart - tnc1.QuadPart) * 1000000 / freq.QuadPart));
+                    fflush(stderr);
+                }
             }
             // Item ★: primary-RC MATURE reclamation at the RC pause (paper §3.3).
             // ProcessModifiedBuffers above has fully reconciled RC + drained the
@@ -7042,7 +7074,16 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             // dead and is returned NOW by RC authority -- not deferred to the
             // occasional backup trace. This makes RC the primary reclaimer.
             LXRSetPhase("stw:rc-reclaim");
+            LARGE_INTEGER trr0; QueryPerformanceCounter(&trr0);
             g_lxrCollector.ReclaimMatureByRC();
+            LARGE_INTEGER trr1; QueryPerformanceCounter(&trr1);
+            if (verbose)
+            {
+                fprintf(stderr, "LXRGC: [rc-breakdown] rc-reclaim=%lldus (chunks=%zu)\n",
+                        (long long)((trr1.QuadPart - trr0.QuadPart) * 1000000 / freq.QuadPart),
+                        g_chunkCount);
+                fflush(stderr);
+            }
         }
 
         LXRSetPhase("stw:restart");
