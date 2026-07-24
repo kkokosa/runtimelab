@@ -414,6 +414,44 @@ static void ResetEvacEdges()
     InterlockedExchange(&g_evacEdgeOverflow, 0);
 }
 
+// --- Dormant parity-fallback reporter --------------------------------------
+// The LXR parity paths carry a few SOUND graceful-degrade fallbacks that fire
+// only on pathological resource exhaustion (a bounded buffer overflowing under a
+// burst). On a normal run their fire count is 0 in every validated config, and
+// the paper itself degrades gracefully on overflow rather than aborting -- so we
+// keep them. But a fallback must never fire SILENTLY, or a real regression that
+// merely pushes the collector onto the slow-but-sound path would masquerade as
+// "still correct". Each therefore reports LOUDLY the first time it fires and,
+// under LXR_STRICT=1, aborts so it screams in CI/tests.
+static volatile LONG64 g_parityFallbacksFired = 0;
+static bool LXRStrictFallbacks()
+{
+    static int s = -1;
+    if (s < 0) s = (getenv("LXR_STRICT") != nullptr && getenv("LXR_STRICT")[0] != '0') ? 1 : 0;
+    return s != 0;
+}
+static void LXRReportFallback(volatile LONG* oneShot, const char* which, const char* detail)
+{
+    InterlockedIncrement64(&g_parityFallbacksFired);
+    if (InterlockedCompareExchange(oneShot, 1, 0) != 0)
+        return; // this kind already announced (one-shot to avoid log spam)
+    fprintf(stderr,
+            "LXRGC: [PARITY-FALLBACK] *** '%s' graceful-degrade path FIRED *** (%s). "
+            "Sound but OFF the paper's fast path; it must not fire on a normal run -- "
+            "investigate the resource pressure. (set LXR_STRICT=1 to abort here)\n",
+            which, detail ? detail : "resource exhaustion");
+    fflush(stderr);
+    if (LXRStrictFallbacks())
+    {
+        fprintf(stderr, "LXRGC: [PARITY-FALLBACK] LXR_STRICT=1 -> aborting.\n");
+        fflush(stderr);
+        abort();
+    }
+}
+static volatile LONG g_reportedEvacFullWalk   = 0;
+static volatile LONG g_reportedDCopyFullWalk  = 0;
+static volatile LONG g_reportedNurseryDefer   = 0;
+
 // --- Concurrent SATB trace (P4) --------------------------------------------
 // While a concurrent trace window is open, block reuse is suppressed so region
 // indices/starts stay stable for the allocate-black snapshot, and any region
@@ -4151,6 +4189,19 @@ void LXRCollector::Evacuate()
         (s_persist ? (g_remsetActive && g_remsetOverflow == 0)
                    : (g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0));
 
+    // A dormant parity fallback firing: the scoped (remembered-set) fix-up was
+    // requested but a real remset incompleteness forced the sound full-heap walk.
+    // (Distinguish from the intentional A/B disable, LXR_EVAC_SCOPED_FIXUP=0.)
+    if (s_scopedFixup && !useScoped)
+    {
+        const char* why = s_persist
+            ? (g_remsetActive ? "persistent remset barrier-dropped an inter-block edge this interval"
+                              : "persistent remset inactive (g_remsetActive=0)")
+            : (g_evacEdgeOverflow ? "legacy evac-edge lane overflowed its cap"
+                                  : "conservative-keep-alive cycle (object marked without a field scan)");
+        LXRReportFallback(&g_reportedEvacFullWalk, "evac remembered-set -> full-heap walk", why);
+    }
+
     if (useScoped)
     {
         InterlockedIncrement64(&g_lxrCounters.EvacRemsetFixups);
@@ -4740,6 +4791,9 @@ void LXRCollector::CollectNursery()
     if (g_youngRCIncomplete)
     {
         InterlockedIncrement64(&g_lxrCounters.NurserySkipped);
+        LXRReportFallback(&g_reportedNurseryDefer, "nursery reclaim deferred (young RC incomplete)",
+                          "a modified-buffer first-log was dropped -> young RC may be undercounted; "
+                          "deferring reclaim to the next complete trace");
         return;
     }
 
@@ -5406,6 +5460,13 @@ void LXRCollector::CopyYoungSurvivors()
     // when a first-log was dropped (g_youngRCIncomplete). Fall back to the sound
     // O(heap) walk only if capture was somehow unavailable.
     bool useScoped = s_scopedFixup && g_dcopyCaptureModified && !g_dcopyRemsetOverflow;
+
+    // Dormant parity fallback: scoped nursery-copy fix-up was requested but the
+    // old->young remembered set overflowed its cap, forcing the sound O(heap) walk.
+    if (s_scopedFixup && !useScoped)
+        LXRReportFallback(&g_reportedDCopyFullWalk, "nursery-copy remembered-set -> full-heap walk",
+                          g_dcopyRemsetOverflow ? "D-copy old->young remset exceeded its cap"
+                                                : "D-copy modified-slot capture unavailable");
 
     if (useScoped)
     {
