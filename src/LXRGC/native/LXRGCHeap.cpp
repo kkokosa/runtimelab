@@ -468,6 +468,7 @@ static void LXRReportFallback(volatile LONG* oneShot, const char* which, const c
 static volatile LONG g_reportedEvacFullWalk   = 0;
 static volatile LONG g_reportedDCopyFullWalk  = 0;
 static volatile LONG g_reportedNurseryDefer   = 0;
+static volatile LONG g_reportedBigArrayShape  = 0;
 
 // --- Concurrent SATB trace (P4) --------------------------------------------
 // While a concurrent trace window is open, block reuse is suppressed so region
@@ -2962,7 +2963,15 @@ void LXRCollector::DrainDeferredBigArrays(int workers)
         {
             size_t slots = 0;
             if (!IsBigRefArray(a, LXRObjectSize(a), &slots))
-                continue; // shouldn't happen (only big arrays are deferred)
+            {
+                // Invariant: only big ref arrays are ever deferred, and an object's
+                // shape/size is immutable across the trace window, so this cannot
+                // happen. If it ever did, skipping would leave the array's elements
+                // unscanned (unsound: its children stay unmarked) -- report loudly.
+                LXRReportFallback(&g_reportedBigArrayShape,
+                    "deferred big-array no longer a big ref array", "shape/size changed mid-trace");
+                continue;
+            }
             for (size_t s = 0; s < slots; s += kBigArrayChunkSlots)
             {
                 size_t e = s + kBigArrayChunkSlots;
