@@ -184,6 +184,39 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-27** — **D-copy pause bottleneck root-caused & fixed (37× on worst
+  pass); prior 4a-young attribution + the JIT-runtime-change plan REFUTED — no runtime
+  change needed.** The 2026-07-24 entry blamed the ~68–97 ms RC pause on the 4a-young
+  O(young-space) rescan and concluded the deep fix required a JIT init-store-barrier
+  change (approved by the user as "option A"). **Both conclusions were wrong.**
+  **(1) The JIT does NOT elide heap young→young stores.** A dedicated GC-side
+  diagnostic (`LXR_DCOPY_ELISION_DIAG`, since removed) tallied, at every D-copy fixup,
+  the young→young edges 4a-young forwards whose slot is ABSENT from the barrier-
+  maintained remembered set (`g_dcopyModifiedSlots`): **`elided(not-in-remset)=0`
+  across every pass** — every heap young→young edge IS captured by the barrier. A
+  parallel RyuJIT elision audit confirmed the only relevant elision (`GTF_IND_TGT_NOT_HEAP`,
+  gcinfo.cpp:250, set by the ObjectAllocator, objectalloc.cpp:2556) fires on stores
+  into **stack-allocated** (non-escaping) container objects — whose refs are GC
+  **roots**, handled by D-copy's existing root **pinning** (a young object any root
+  address falls within is never moved). So neither a JIT change nor 4a-young is needed
+  for those. **(2) The real bottleneck was a GC-side `VirtualQuery` syscall thrash.**
+  The D-copy fixup 4b step replays the (unsorted) old→young remembered set through
+  `LXRDCopyRemsetVisit → DCopyFixupCtx::SlotCommitted`, which VirtualQuery's each
+  slot's page (freed-region guard) behind a **single-region** cache. Unsorted slots
+  scatter across every mature referrer in the heap → the cache thrashes to **one
+  VirtualQuery per slot** (~8 k syscalls) = the entire 50–75 ms cost; 4a-young itself
+  is ~negligible (A/B with `LXR_DCOPY_NO_4AYOUNG=1`: fixup timing unchanged). **Fix
+  (GC-side, 3 lines):** `std::sort`+`std::unique` the modified-slot vector before the
+  4b replay so same-region slots are visited consecutively → the committed-page cache
+  hits, collapsing VirtualQuery to ~one per distinct region (+ dedup drops repeat
+  logs, + better Rebase locality). **Result:** worst-pass D-copy fixup **75.6 ms →
+  2.1 ms** (~37×); max **RC pause ~97 ms → ~15 ms**; `LXR_VERIFY_TRACE`
+  `[verify-nursery-copy] misses=0` across all passes; 10/10 WebApi iters complete the
+  workload (av=0 in-workload; the ~1/10 teardown AV is the pre-existing flaky shutdown
+  fault, present in baseline). **No runtime change** — the approved option-A JIT change
+  is moot. 4a-young kept as a cheap correctness belt-and-suspenders (dormant A/B knob
+  `LXR_DCOPY_NO_4AYOUNG`). **Next dominant pause = the trace-finish O(heap) STW sweep
+  (~341 ms max observed)** — separate follow-up.
 - **2026-07-24** — **Pause profiling + sound D-copy fixup micro-opt; throughput
   claim corrected.** Profiled the WebApi/LXRGC full-config canary with per-phase STW
   timers (`[rc-breakdown]`, `[copy-breakdown]`, ProcessModifiedBuffers timing — all
@@ -191,13 +224,14 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
   canary's claim was a measurement artifact. Direct + harness runs both give WebApi
   LXRGC **≈ 250 ops/s vs ≈ 256 WS/Server** (parity). (2) **The real problem is pause
   latency, not throughput.** Two dominant STW pauses: **(a)** RC-pause
-  `CopyYoungSurvivors` grows to **~68–97 ms**, and the cost is entirely the **4a-young
-  fixup** (full young-space object rescan), NOT the budgeted copy loop (~2–3 ms) nor
-  RC-reclaim (~0.1–0.2 ms) nor the 4b modslot replay (~8 k slots, cheap). **(b)** the
-  trace-finish **STW sweep/line-carve is O(heap) at ~5–170 ms** (one spike to 301 ms
-  under a smaller trigger). During these spikes per-second ops collapse from ~256 to
-  ~16 — that is what makes LXR "feel slow." (3) **Root cause of 4a-young** — the JIT
-  elides the write barrier on *init stores to freshly-allocated (young) objects*, so
+  `CopyYoungSurvivors` grows to **~68–97 ms** (**correction: 2026-07-27 shows this was
+  the 4b VirtualQuery thrash, NOT the 4a-young rescan as claimed below**), and **(b)**
+  the trace-finish **STW sweep/line-carve is O(heap) at ~5–170 ms** (one spike to
+  301 ms under a smaller trigger). During these spikes per-second ops collapse from
+  ~256 to ~16 — that is what makes LXR "feel slow." (3) **[SUPERSEDED 2026-07-27 —
+  the JIT does not elide heap young→young stores; see above]** ~~Root cause of 4a-young
+  — the JIT elides the write barrier on init stores to freshly-allocated (young)
+  objects~~, so
   young→young edges never reach the modified buffer; we compensate with an O(young-
   space) rescan every RC pause. Young space per pause ≈ the RC-pause trigger's worth
   of allocation (~32 MB ≈ 450 regions), so 4a-young ∝ trigger size. (4) **Trigger

@@ -5738,7 +5738,8 @@ void LXRCollector::CopyYoungSurvivors()
         //     copies are covered by 4a) and our mature dest chunks (IsYoung false).
         {
             EnterCriticalSection(&g_chunkLock);
-            size_t nregions = g_chunkCount;
+            static int s_no4aYoung = (getenv("LXR_DCOPY_NO_4AYOUNG") != nullptr) ? 1 : 0;
+            size_t nregions = s_no4aYoung ? 0 : g_chunkCount;
             for (size_t i = 0; i < nregions; i++)
             {
                 ChunkRegion& c = g_chunks[i];
@@ -5769,6 +5770,17 @@ void LXRCollector::CopyYoungSurvivors()
         //     (stable under STW), skip slots inside a moved source (handled by 4a),
         //     and guard against slots in a region an earlier RC pause / this pass's
         //     zero-count cascade freed.
+        // Sort + dedup the remembered set FIRST so slots that live in the same
+        // region are visited consecutively: LXRDCopyRemsetVisit -> SlotCommitted
+        // keeps a single-region committed cache, so an UNSORTED set (slots
+        // scattered across every mature referrer in the heap) thrashes that cache
+        // to one VirtualQuery syscall PER SLOT -- the dominant D-copy pause cost
+        // (tens of ms at ~8K slots). Sorted, it collapses to ~one VirtualQuery per
+        // distinct region, and improves Rebase locality. Dedup also drops repeat
+        // logs of the same slot (the barrier appends without checking membership).
+        std::sort(g_dcopyModifiedSlots.begin(), g_dcopyModifiedSlots.end());
+        g_dcopyModifiedSlots.erase(std::unique(g_dcopyModifiedSlots.begin(), g_dcopyModifiedSlots.end()),
+                                   g_dcopyModifiedSlots.end());
         g_dcopyFixup = &fx;
         for (Object** slot : g_dcopyModifiedSlots)
             LXRDCopyRemsetVisit(slot, nullptr);
