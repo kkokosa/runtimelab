@@ -184,6 +184,41 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28g** — **GC metric/pause-telemetry fidelity fixes (3 concerns raised
+  from the smoke run).** (a) **`GC.GetTotalAllocatedBytes` was under-reporting ~80x**
+  (ASP.NET Core showed ~690 KB where Workstation/Server GC saw ~55 MB). Root cause:
+  `TotalAllocatedBytes` was bumped by only the *first* object's size per 128 KiB
+  context chunk on the slow path — the mutator bump-allocates every subsequent object
+  inline without re-entering the GC, so ~all allocation went uncounted. Fixed by
+  tallying the true used extent `[Start, usedEnd)` of each chunk in `FinalizeChunk`
+  (the exact point a filled chunk is retired) and dropping the coarse per-slow-path
+  increment. Verified WebApi now reports **42.8 MB** (≈ Server's volume), ConsoleApp
+  **142 MB**. (b) **Committed memory was ~453–487 MB (~17x Server's 26 MB).** Two
+  drivers found via a new `[committed]` verbose breakdown (`total / liveChunks /
+  runOverhang / freeChunks`): (1) a **per-thread commit-ahead "overhang" of ~72–200 MB**
+  — every allocating thread eagerly committed `COMMIT_CHUNK`=16 MiB past its bump
+  pointer, so ~12 WebApi threads wasted ~190 MB; **reduced COMMIT_CHUNK 16 MiB → 2 MiB**
+  (~8x less overhang, one extra VirtualAlloc per ~2 MiB, no throughput cost). (2) a
+  **pathological evac abort**: a single unresolvable interior/byref root skipped **all**
+  evacuation for that cycle (`[evac] skipped: unresolved interior root`), and this
+  workload carried one nearly **every** trace cycle, so fragmented regions were never
+  compacted and committed ratcheted up. **Fixed** by pinning **only** the region each
+  unresolvable interior points into (excluded from the evac candidate set) and
+  compacting the rest — evac-skip **~every-cycle → 0**, `[verify-evac] misses=0`.
+  Net: WebApi committed **487 → 307 MB**, private **602 → 422 MB**, ConsoleApp committed
+  **83 MB**; throughput unchanged (250 ops/s), 4/4 iters exit 0 / verify 0. (c)
+  **`GC.GetGCMemoryInfo().PauseTimePercentage` was hard-wired to 0** (and the
+  `PauseDurations` array empty) in `GetMemoryInfo` — the STW pauses were **not tracked
+  there at all** (an earlier "tracked separately" claim was wrong). Wired the real
+  telemetry we already accumulate into `GetMemoryInfo` (`pauseTimePct` = basis points,
+  `pauseInfoRaw` = TimeSpan ticks), and **changed "% time in GC" from a noisy
+  per-pause instantaneous ratio to an honest CUMULATIVE `TotalPauseMicros / elapsed`**
+  (the instantaneous form spiked to ~80% under clustered concurrent pauses on a
+  workload actually <1%). Verified WebApi **8%**, ConsoleApp **0%** (8 collections /
+  60 s) — believable and stable. No runtime change. New A/B/diag: `LXR_VERBOSE`
+  `[committed]` line. The dominant per-pause cost itself (D-copy young-survivor fixup
+  ~26 ms, an O(young) rescan forced by JIT young→young barrier elision) is now honestly
+  surfaced but not yet reduced — tracked as the next perf item.
 - **2026-07-28f** — **Trace-cycle evacuation remembered set is now CANDIDATE-SCOPED
   (literal paper §3.3 "remsets scoped to the evacuation set"), replacing heap-wide
   inter-block edge recording.** Closes the last true F mechanism-level divergence: the

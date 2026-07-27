@@ -88,9 +88,16 @@ static LONG CALLBACK LXRFaultDiag(EXCEPTION_POINTERS* ep)
 // One large reservation; blocks are carved out of it. Smaller than ZeroGC's
 // 64 GiB because LXR also reserves an RC side table proportional to heap size.
 static const size_t HEAP_RESERVE_SIZE = (size_t)16 << 30;   // 16 GiB
-static const size_t COMMIT_CHUNK = 16 * 1024 * 1024;        // 16 MiB
+// Per-thread ahead-of-use commit granularity. Kept small (2 MiB, not 16 MiB) so
+// the committed footprint tracks live+in-flight allocation instead of a large
+// per-thread over-commit "overhang": every allocating thread eagerly commits up
+// to COMMIT_CHUNK past its bump pointer, so with N allocating threads the wasted
+// committed tail is ~N*COMMIT_CHUNK. At 16 MiB * ~12 webapi threads that was
+// ~190 MiB of committed-but-never-carved memory; 2 MiB cuts it ~8x for one extra
+// VirtualAlloc per ~2 MiB allocated (negligible on the slow path).
+static const size_t COMMIT_CHUNK = 2 * 1024 * 1024;         // 2 MiB
 static const size_t CONTEXT_ALLOC_QUANTUM = 128 * 1024;
-static const size_t THREAD_BLOCK_RUN = 64 * 1024 * 1024;    // 64 MiB claimed per thread at a time
+static const size_t THREAD_BLOCK_RUN = 64 * 1024 * 1024;    // 64 MiB reserved (not committed) per thread at a time
 
 struct ThreadHeapState
 {
@@ -1031,6 +1038,16 @@ static void FinalizeChunk(int index, uint8_t* usedEnd)
     EnterCriticalSection(&g_chunkLock);
     if ((size_t)index < g_chunkCount)
     {
+        // Account the bytes actually consumed from this chunk. The runtime
+        // bump-allocates inline within [Start, alloc_limit] without re-entering
+        // the GC, so the only faithful place to tally allocation volume is here,
+        // when a filled chunk is retired: its true used extent is [Start, usedEnd)
+        // (usedEnd == the exhausted context's alloc_ptr). Counting alignedSize on
+        // the slow path instead would only ever see the first object per chunk and
+        // undercount ~by the object-count-per-chunk factor.
+        uint8_t* start = g_chunks[index].Start;
+        if (usedEnd > start)
+            InterlockedExchangeAdd64(&g_lxrCounters.TotalAllocatedBytes, (int64_t)(usedEnd - start));
         g_chunks[index].UsedEnd = usedEnd;
         g_chunks[index].Owner = nullptr;
     }
@@ -4449,10 +4466,14 @@ void LXRCollector::EnsureMarkCommitted(uint8_t* addrEnd)
 // Pre-pass callbacks: pin every root/handle referent (never move it) so
 // evacuation only ever has to forward heap references, not roots or handles.
 static std::unordered_set<Object*>* g_evacPinned = nullptr;
-// Set if an interior root could not be resolved during the evac pin pass: its
-// target cannot be pinned and roots are not fixed up, so evacuation is skipped
-// this cycle (sweep still runs). Rare (0 under all validated runs).
+// Count of interior roots that could not be resolved to an object base during the
+// evac pin pass. Instead of aborting ALL evacuation (which starves defrag on
+// workloads that always carry an unresolvable interior root), each such interior
+// address is recorded in g_evacUnresolvedInteriorList so that ONLY the region it
+// points into is excluded from the evacuation set; the rest of the fragmented
+// heap is still compacted. (Region kept in place => a live byref never dangles.)
 static volatile LONG g_evacUnresolvedInterior = 0;
+static std::vector<uint8_t*>* g_evacUnresolvedInteriorList = nullptr;
 static void LXRPinRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags)
 {
     Object* o = *ppObj;
@@ -4460,10 +4481,13 @@ static void LXRPinRoot(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint32_t flags
         return;
     if (flags & GC_CALL_INTERIOR)
     {
-        o = g_lxrCollector.ResolveInterior((uint8_t*)o);
+        uint8_t* interior = (uint8_t*)o;
+        o = g_lxrCollector.ResolveInterior(interior);
         if (o == nullptr)
         {
-            InterlockedExchange(&g_evacUnresolvedInterior, 1);
+            InterlockedIncrement(&g_evacUnresolvedInterior);
+            if (g_evacUnresolvedInteriorList != nullptr)
+                g_evacUnresolvedInteriorList->push_back(interior);
             return;
         }
     }
@@ -4503,25 +4527,34 @@ void LXRCollector::Evacuate()
     // 1. Pin all root/handle referents (interior roots resolve to their base).
     LARGE_INTEGER evPinFreq, evPin0, evPin1; QueryPerformanceFrequency(&evPinFreq); QueryPerformanceCounter(&evPin0);
     std::unordered_set<Object*> pinned;
+    std::vector<uint8_t*> unresolvedInteriors;
     InterlockedExchange(&g_evacUnresolvedInterior, 0);
     g_evacPinned = &pinned;
+    g_evacUnresolvedInteriorList = &unresolvedInteriors;
     ScanContext sc; sc.promotion = true;
     g_theGCToCLR->GcScanRoots(&LXRPinRoot, 2, 2, &sc);
     g_evacPinned = nullptr;
+    g_evacUnresolvedInteriorList = nullptr;
     LXRGCHandleStore::ForEachLiveHandle(&LXRPinHandle, &pinned);
     QueryPerformanceCounter(&evPin1);
     if (verbose) { fprintf(stderr, "LXRGC: [evac-pin] roots+handles=%lldus pinned=%zu unresolvedInterior=%ld\n", (long long)((evPin1.QuadPart-evPin0.QuadPart)*1000000/evPinFreq.QuadPart), pinned.size(), (long)g_evacUnresolvedInterior); fflush(stderr); }
 
-    // If any interior root could not be resolved, its target is unpinned and
-    // roots are not fixed up; moving anything risks dangling that root byref.
-    // Skip evacuation this cycle (the sweep still reclaims dead regions).
-    if (g_evacUnresolvedInterior != 0)
-    {
-        if (verbose) { fprintf(stderr, "LXRGC: [evac] skipped: unresolved interior root this cycle\n"); fflush(stderr); }
-        return;
-    }
+    // An unresolvable interior/byref root no longer aborts the whole pass: below,
+    // candidate selection excludes ONLY the region each such interior points into
+    // (that region is kept in place so the live byref never dangles), while the
+    // rest of the fragmented heap is still compacted. Previously a single
+    // unresolvable interior root skipped all evacuation, which -- on workloads
+    // that carry one nearly every cycle -- starved defrag and let committed memory
+    // ratchet up unboundedly (fragmented regions were never reclaimed).
 
     // 2. Select fragmented regions. Paper §3.3.4: the evacuation set is the N
+    //    LOWEST-occupancy blocks (most fragmented first) up to the copy budget,
+    //    NOT simply the first regions over the threshold - evacuating the least-
+    //    occupied blocks first maximises compaction (freed blocks) per live byte
+    //    copied. Gather every region >= s_fragPct dead, sort by occupancy ratio
+    //    (live/total) ascending, then take under the byte budget. Snapshot first
+    //    so registering destination chunks (which may realloc g_chunks) cannot
+    //    invalidate the source list; indices stay valid across realloc.
     //    LOWEST-occupancy blocks (most fragmented first) up to the copy budget,
     //    NOT simply the first regions over the threshold - evacuating the least-
     //    occupied blocks first maximises compaction (freed blocks) per live byte
@@ -4575,6 +4608,18 @@ void LXRCollector::Evacuate()
                 if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
             if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
             if (!allCand)
+                continue;
+        }
+        // Exclude a region that a live but unresolvable interior/byref root points
+        // into: moving it could dangle that byref. Keep it in place (still swept /
+        // RC-reclaimed when it becomes wholly dead). Interiors are typically 0-1
+        // per cycle, so this scan is negligible.
+        if (!unresolvedInteriors.empty())
+        {
+            bool pinnedByInterior = false;
+            for (uint8_t* it : unresolvedInteriors)
+                if (it >= c.Start && it <= c.UsedEnd) { pinnedByInterior = true; break; }
+            if (pinnedByInterior)
                 continue;
         }
         cands.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
@@ -6835,7 +6880,10 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
     acontext->alloc_bytes += (int64_t)alignedSize;
     acontext->alloc_count++;
 
-    InterlockedExchangeAdd64(&g_lxrCounters.TotalAllocatedBytes, (int64_t)alignedSize);
+    // NOTE: total allocation volume is tallied in FinalizeChunk (whole [Start,
+    // usedEnd) used extent per retired chunk), NOT here -- the mutator bump-
+    // allocates most objects inline without re-entering AllocateSlow, so a per-
+    // slow-path increment would only ever see the first object of each chunk.
 
     // In a working LXR the new object is born with RC=0 and stuck-if-young;
     // it gains references only through the write barrier / root scan. Because
@@ -6901,13 +6949,22 @@ void LXRGCHeap::GetMemoryInfo(uint64_t* highMemLoadThresholdBytes,
     if (promotedBytes) *promotedBytes = 0;
     if (pinnedObjectCount) *pinnedObjectCount = 0;
     if (finalizationPendingCount) *finalizationPendingCount = 0;
-    if (index) *index = 0;
+    if (index) *index = (uint64_t)g_lxrCounters.Collections;
     if (generation) *generation = 0;
-    if (pauseTimePct) *pauseTimePct = 0;
-    if (isCompaction) *isCompaction = false;
-    if (isConcurrent) *isConcurrent = false;
+    // Surface the real pause telemetry we already accumulate (previously hard-
+    // wired to 0, which is why GC.GetGCMemoryInfo().PauseTimePercentage always
+    // read 0 despite real multi-ms STW pauses). The managed GCMemoryInfo scales
+    // pauseTimePct by /100 (so it is percent*100 basis points) and treats the
+    // pause-duration array as TimeSpan ticks (100 ns), hence micros*10.
+    if (pauseTimePct) *pauseTimePct = (uint32_t)(g_lxrCounters.LastGCPercentTimeInGC * 100);
+    if (isCompaction) *isCompaction = (g_lxrCounters.EvacPasses > 0);
+    if (isConcurrent) *isConcurrent = (g_concurrentEnabled != 0);
     if (genInfoRaw) memset(genInfoRaw, 0, sizeof(uint64_t) * 8);
-    if (pauseInfoRaw) memset(pauseInfoRaw, 0, sizeof(uint64_t) * 2);
+    if (pauseInfoRaw)
+    {
+        pauseInfoRaw[0] = (uint64_t)(g_lxrCounters.LastPauseMicros * 10);
+        pauseInfoRaw[1] = 0;
+    }
 }
 
 uint32_t LXRGCHeap::GetMemoryLoad()
@@ -7516,24 +7573,28 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     // Pause-time telemetry (feeds GetTotalPauseDuration / GetLastGCPercentTimeInGC,
-    // consumed by the dotnet.gc.pause.time meter + "% Time in GC" EventCounter).
-    // % time in GC = this pause / wall-clock interval since the previous pause end.
+    // consumed by the dotnet.gc.pause.time meter + "% Time in GC" EventCounter, and
+    // now GetGCMemoryInfo().PauseTimePercentage). Report the CUMULATIVE fraction of
+    // wall-clock spent in STW pauses (TotalPauseMicros / elapsed-since-first-pause),
+    // NOT the instantaneous "this pause / interval since the previous pause end"
+    // ratio: under concurrent tracing the snapshot/finish/RC pauses cluster within
+    // a few ms of each other, so the instantaneous ratio spikes to ~100% and wildly
+    // over-reported time-in-GC (e.g. 80% on a workload actually spending <1%). The
+    // cumulative figure is the honest, stable "% time in GC".
     {
-        static LARGE_INTEGER s_prevPauseEndQpc = { 0 };
+        static LARGE_INTEGER s_firstPauseQpc = { 0 };
         LARGE_INTEGER nowQpc; QueryPerformanceCounter(&nowQpc);
         g_lxrCounters.LastPauseMicros = pauseMicros;
-        if (s_prevPauseEndQpc.QuadPart != 0)
+        if (s_firstPauseQpc.QuadPart == 0)
+            s_firstPauseQpc = nowQpc;
+        int64_t elapsedMicros =
+            (int64_t)((nowQpc.QuadPart - s_firstPauseQpc.QuadPart) * 1000000 / freq.QuadPart);
+        if (elapsedMicros > 0)
         {
-            int64_t intervalMicros =
-                (int64_t)((nowQpc.QuadPart - s_prevPauseEndQpc.QuadPart) * 1000000 / freq.QuadPart);
-            if (intervalMicros > 0)
-            {
-                int64_t pct = pauseMicros * 100 / intervalMicros;
-                if (pct > 100) pct = 100;
-                g_lxrCounters.LastGCPercentTimeInGC = pct;
-            }
+            int64_t pct = g_lxrCounters.TotalPauseMicros * 100 / elapsedMicros;
+            if (pct > 100) pct = 100;
+            g_lxrCounters.LastGCPercentTimeInGC = pct;
         }
-        s_prevPauseEndQpc = nowQpc;
     }
     InterlockedIncrement64(&g_lxrCounters.Epochs);
     g_lxrCounters.LastCollectCommitted = g_committedInUse;
@@ -7640,6 +7701,23 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                            (long long)g_lxrCounters.WastagePctEwma,
                            (long long)g_lxrCounters.SatbEntries, (long long)g_lxrCounters.SatbMarks,
                            (long long)g_lxrCounters.RemsetEntries); fflush(stderr); }
+
+    if (verbose) {
+        size_t liveChunkBytes = 0, liveChunks = 0, freeChunks = 0;
+        EnterCriticalSection(&g_chunkLock);
+        for (size_t i = 0; i < g_chunkCount; i++) {
+            if (g_chunks[i].Committed) { liveChunks++; liveChunkBytes += g_chunks[i].Size; }
+            else freeChunks++;
+        }
+        LeaveCriticalSection(&g_chunkLock);
+        int64_t committed = g_committedInUse;
+        fprintf(stderr, "LXRGC: [committed] total=%lldMB liveChunks=%llu(%lldMB) runOverhang=%lldMB freeDecommittedChunks=%llu freeChunkStack=%llu\n",
+                (long long)(committed >> 20), (unsigned long long)liveChunks,
+                (long long)((int64_t)liveChunkBytes >> 20),
+                (long long)((committed - (int64_t)liveChunkBytes) >> 20),
+                (unsigned long long)freeChunks, (unsigned long long)g_freeChunkTop);
+        fflush(stderr);
+    }
 
     int64_t reclaimedNow = g_lxrCollector.ReclaimedBytes();
     InterlockedExchange(&g_inCollection, 0);
