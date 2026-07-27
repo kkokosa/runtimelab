@@ -184,6 +184,38 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28e** — **D-copy young-survivor remembered set is now PER-EVACUATION-REGION
+  (literal paper §3.3 per-block remset), replacing the flat global log.** Closes the
+  "residual vs paper" item flagged in 2026-07-28d. The paper keeps a **per-evacuation-
+  block** remembered set and, at evacuation, **processes only the remsets of the blocks
+  in the evacuation set**. D-copy is byte/time budgeted, so each RC pause evacuates only
+  a **subset** of the young regions; the old flat set forced a replay+prune of *every*
+  mature→young edge in the heap every pause regardless of which regions actually moved.
+  **Change (GC-side, `LXRGCHeap.cpp`):** the flat `g_dcopyModifiedSlots` vector is
+  replaced by `g_dcopyRemsetBuckets` — a vector of per-region buckets keyed by the
+  **target young object's 128 KiB region-slot** (`(target − heapBase) /
+  CONTEXT_ALLOC_QUANTUM`). All four capture sites (`ProcessModifiedBuffers`, evac-copy
+  and D-copy promotion-edge re-registration) append via `DCopyRemsetAppend(slot, target)`
+  (still gated on `!g_traceWindowOpen`); the trace epoch bump and overflow clear all
+  buckets (`DCopyRemsetClearAll`). **4b now replays ONLY the buckets of the regions
+  actually evacuated this pass** (`evacuatedSrcs`, the srcs entered before the budget
+  cut): for each such region it visits the buckets covering `[start, usedEnd)`'s slot
+  range, applying the same per-bucket sort+dedup (SlotCommitted VirtualQuery-cache
+  locality) + Rebase + prune as before. Edges into young regions **deferred** to a later
+  pass stay in their buckets untouched, so 4b work is bounded to *O(incoming edges of the
+  evacuated regions)* rather than *O(all mature→young edges)*. **Soundness:** a young
+  object is stationary until the pass that moves it, so every incoming edge to an object
+  that lived in a region is captured into that region's slot-range buckets — replaying
+  that range covers all of the region's incoming edges; deferred regions did not move, so
+  their unfixed edges remain correct until their bucket is replayed on the pass that
+  evacuates them. Verified full parity config (`LXR_VERIFY_TRACE`, 25 s WebApi):
+  `[copy-breakdown]` shows `remset` bounded (~530–570) with `evacRegions=srcRegions`
+  when the budget covers all young regions, and a **budget-forced partial run**
+  (`LXR_NURSERY_COPY_BUDGET_MB=1`) shows `evacRegions < srcRegions` (e.g. 43/132,
+  138/516, 69/722) with **0 `[verify-nursery-copy]`/`[verify-evac]` miss lines** —
+  proving deferred regions' edges are correctly retained and fixed on the later pass.
+  13 iters Errors=0 / 0 verify misses; teardown-AV rate ~15% (unchanged from the
+  pre-existing 10–30 % baseline, not a regression). No runtime change.
 - **2026-07-28d** — **D-copy remembered-set balloon fixed (a ~330 ms RC pause on
   1.09M slots eliminated); compared against the paper's remembered-set design.**
   Canary profiling caught a single ~330 ms RC pause whose `[copy-breakdown]` showed
@@ -214,8 +246,8 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
   offenders=0, 0 misses); D-copy still moves 635–807 survivors / frees 244–311 regions
   per pass. **Residual vs paper:** a genuinely burst-heavy inter-trace window could
   still make the (now-pruned) set large; the fully paper-faithful bound is a per-
-  evacuation-block remembered set (only edges into the evac set), a larger structural
-  change tracked for future work.
+  evacuation-block remembered set (only edges into the evac set) — **now implemented,
+  see 2026-07-28e.**
 - **2026-07-28c** — **All RC-pause / trace-finish region reclamation decommit moved
   OFF-PAUSE via a single shared `ReclaimRegionMemory` helper — closes the last
   non-paper-faithful cost inside the D-copy young-survivor copy.** Profiling the

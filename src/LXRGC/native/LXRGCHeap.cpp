@@ -744,9 +744,57 @@ static volatile LONG g_nurseryActive = 0;
 // still young) would otherwise be lost. On overflow the remset is abandoned and
 // D-copy falls back to a full committed-heap walk.
 static volatile LONG        g_dcopyCaptureModified = 0;
-static std::vector<Object**> g_dcopyModifiedSlots;
 static volatile LONG        g_dcopyRemsetOverflow = 0;
 static const size_t         kDCopyRemsetCap = 4u * 1024u * 1024u; // entries
+
+// Per-evacuation-region D-copy remembered set (paper §3.3: a per-evacuation-BLOCK
+// remembered set, initialized at the trace and kept up to date by the barrier;
+// at evacuation only the evac candidates' remsets are processed). D-copy is
+// budget-limited to a SUBSET of young regions per RC pause, so a single flat log
+// of every mature->young edge would replay edges into regions not touched this
+// pass. Instead we key the remset by the TARGET young object's 128KB region-slot
+// (index = (target - heapBase) / CONTEXT_ALLOC_QUANTUM): each RC pass replays ONLY
+// the buckets of the young regions it actually evacuated, leaving edges into
+// regions deferred to a later pass in their buckets untouched. This bounds 4b work
+// to O(incoming edges of the evacuated regions), matching the paper's scoped
+// per-block remset rather than an O(all-young-edges) flat replay. g_dcopyRemsetCount
+// tracks the live total for the overflow cap; buckets are reset at a trace epoch
+// bump (the window's young ages to mature) or on overflow.
+static std::vector<std::vector<Object**>> g_dcopyRemsetBuckets; // [regionSlot] -> incoming field slots
+static size_t                             g_dcopyRemsetCount = 0;
+
+// Drop every entry (trace epoch bump / overflow). Keeps the outer vector sized so
+// the next window does not re-grow it.
+static inline void DCopyRemsetClearAll()
+{
+    for (auto& b : g_dcopyRemsetBuckets)
+    {
+        b.clear();
+        b.shrink_to_fit();
+    }
+    g_dcopyRemsetCount = 0;
+}
+
+// Append field `slot` (whose current value `target` is a young object) to the
+// per-region remembered set, keyed by target's 128KB region. Returns false and
+// sets/clears-on overflow when the live total exceeds the cap.
+static inline bool DCopyRemsetAppend(Object** slot, Object* target, uint8_t* heapBase, size_t heapBytes)
+{
+    if (g_dcopyRemsetBuckets.empty())
+        g_dcopyRemsetBuckets.resize(heapBytes / CONTEXT_ALLOC_QUANTUM + 1);
+    if (g_dcopyRemsetCount >= kDCopyRemsetCap)
+    {
+        g_dcopyRemsetOverflow = 1;
+        DCopyRemsetClearAll();
+        return false;
+    }
+    size_t rs = (size_t)((uint8_t*)target - heapBase) / CONTEXT_ALLOC_QUANTUM;
+    if (rs >= g_dcopyRemsetBuckets.size())
+        return false;
+    g_dcopyRemsetBuckets[rs].push_back(slot);
+    g_dcopyRemsetCount++;
+    return true;
+}
 static volatile int64_t g_traceEpoch = 0;
 
 // Env-gated diagnostic (LXR_NURSERY_GUARD): a ring of recently-decommitted young
@@ -3420,14 +3468,8 @@ void LXRCollector::ProcessModifiedBuffers()
             if (cur == nullptr) continue;
             if ((uint8_t*)cur < m_heapBase || (uint8_t*)cur >= m_heapBase + m_heapBytes) continue;
             if (!IsYoung(cur)) continue;
-            if (g_dcopyModifiedSlots.size() >= kDCopyRemsetCap)
-            {
-                g_dcopyRemsetOverflow = 1;
-                g_dcopyModifiedSlots.clear();
-                g_dcopyModifiedSlots.shrink_to_fit();
-                break;
-            }
-            g_dcopyModifiedSlots.push_back(kv.first);
+            if (!DCopyRemsetAppend(kv.first, cur, m_heapBase, m_heapBytes))
+                break; // overflow: set abandoned, D-copy full-walks until next trace
         }
     }
     // Deferred-RC root capture (paper §3.2.1): scan the roots at this STW pause so
@@ -4769,8 +4811,7 @@ void LXRCollector::Evacuate()
                     if (t == nullptr) return;
                     if ((uint8_t*)t < m_heapBase || (uint8_t*)t >= m_heapBase + m_heapBytes) return;
                     if (!IsYoung(t)) return;
-                    if (g_dcopyModifiedSlots.size() >= kDCopyRemsetCap) { g_dcopyRemsetOverflow = 1; return; }
-                    g_dcopyModifiedSlots.push_back(f);
+                    DCopyRemsetAppend(f, t, m_heapBase, m_heapBytes);
                 });
     }
     //     non-source object whose field still points at a forwarding source is a
@@ -5550,31 +5591,6 @@ struct DCopyFixupCtx
     }
 };
 static DCopyFixupCtx* g_dcopyFixup = nullptr;
-// Fix-up replay callback (step 4b), fed the epoch's modified slots. Skips slots
-// inside a moved source range (their copy's out-edges are fixed by 4a) and slots
-// on non-committed pages (a slot's region may have been freed by this pause's
-// zero-count cascade or an earlier RC pause).
-static void LXRDCopyRemsetVisit(Object** slot, void* /*ctx*/)
-{
-    DCopyFixupCtx* fx = g_dcopyFixup;
-    if (fx == nullptr)
-        return;
-    uint8_t* sa = (uint8_t*)slot;
-    if (!fx->movedRanges->empty())
-    {
-        size_t lo = 0, hi = fx->movedRanges->size();
-        while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx->movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
-        if (lo != 0)
-        {
-            const DCopyMovedRange& mr = (*fx->movedRanges)[lo - 1];
-            if (sa >= mr.oldStart && sa < mr.oldEnd)
-                return; // slot inside a moved source: handled by 4a
-        }
-    }
-    if (!fx->SlotCommitted(slot))
-        return; // referrer region freed at an earlier RC pause: stale, moot
-    fx->Rebase(slot);
-}
 
 void LXRCollector::CopyYoungSurvivors()
 {
@@ -5704,6 +5720,10 @@ void LXRCollector::CopyYoungSurvivors()
     };
 
     std::vector<size_t> freeableSrcIndices;
+    // Regions we actually entered the evacuation loop for this pass (bounded by the
+    // per-pass byte/time budget). Only these regions' remembered-set buckets are
+    // replayed in 4b -- the paper's scoped per-evac-block remset processing.
+    std::vector<SrcRegion> evacuatedSrcs;
     int64_t movedObjs = 0, movedBytes = 0, pinnedKept = 0;
     LARGE_INTEGER clkFreq, clk0;
     QueryPerformanceFrequency(&clkFreq);
@@ -5720,6 +5740,7 @@ void LXRCollector::CopyYoungSurvivors()
         }
         if (byteBudget <= 0)
             break;
+        evacuatedSrcs.push_back(sr);
         size_t skipped = 0, moved = 0;
         uint8_t* p = sr.start;
         while (p < sr.usedEnd)
@@ -5762,12 +5783,7 @@ void LXRCollector::CopyYoungSurvivors()
                     if (t == nullptr) return;
                     if ((uint8_t*)t < m_heapBase || (uint8_t*)t >= m_heapBase + m_heapBytes) return;
                     if (!IsYoung(t)) return;
-                    if (g_dcopyModifiedSlots.size() >= kDCopyRemsetCap)
-                    {
-                        g_dcopyRemsetOverflow = 1;
-                        return;
-                    }
-                    g_dcopyModifiedSlots.push_back(f);
+                    DCopyRemsetAppend(f, t, m_heapBase, m_heapBytes);
                 });
             }
             // Item F (§3.3.4): the promoted copy is a MATURE object produced by
@@ -5884,76 +5900,83 @@ void LXRCollector::CopyYoungSurvivors()
             }
             LeaveCriticalSection(&g_chunkLock);
         }
-        // 4b. Incoming edges from MATURE referrers via the epoch's modified slots
-        //     (the barrier's field log = the paper's old->young remembered set).
-        //     Mature->young stores are barriered (card marking is required for an
-        //     old->young reference), so any current mature reference to a this-
-        //     epoch young survivor is here. Re-read each slot's CURRENT value
-        //     (stable under STW), skip slots inside a moved source (handled by 4a),
-        //     and guard against slots in a region an earlier RC pause / this pass's
-        //     zero-count cascade freed.
-        // Sort + dedup the remembered set FIRST so slots that live in the same
-        // region are visited consecutively: LXRDCopyRemsetVisit -> SlotCommitted
-        // keeps a single-region committed cache, so an UNSORTED set (slots
-        // scattered across every mature referrer in the heap) thrashes that cache
-        // to one VirtualQuery syscall PER SLOT -- the dominant D-copy pause cost
-        // (tens of ms at ~8K slots). Sorted, it collapses to ~one VirtualQuery per
-        // distinct region, and improves Rebase locality. Dedup also drops repeat
-        // logs of the same slot (the barrier appends without checking membership).
-        std::sort(g_dcopyModifiedSlots.begin(), g_dcopyModifiedSlots.end());
-        g_dcopyModifiedSlots.erase(std::unique(g_dcopyModifiedSlots.begin(), g_dcopyModifiedSlots.end()),
-                                   g_dcopyModifiedSlots.end());
+        // 4b. Incoming edges from MATURE referrers, replayed PER EVACUATED REGION.
+        //     The paper (§3.3) keeps a per-evacuation-BLOCK remembered set and, at
+        //     evacuation time, processes only the remsets of the blocks in the
+        //     evacuation set. We mirror that: g_dcopyRemsetBuckets is keyed by the
+        //     TARGET young object's 128KB region, and D-copy evacuates only a
+        //     budget-limited SUBSET of young regions per pause (evacuatedSrcs). So
+        //     replay ONLY those regions' buckets; incoming edges to young regions
+        //     deferred to a later pass stay in their buckets untouched. This bounds
+        //     4b work to O(incoming edges of the evacuated regions) instead of the
+        //     old O(all mature->young edges) flat replay.
+        //
+        //     A young object is stationary until the pass that moves it, so every
+        //     edge to an object that lived in region [sr.start, sr.usedEnd) was
+        //     captured into a bucket in that region's slot range -- replaying that
+        //     range covers all of the region's incoming edges (soundness gate:
+        //     LXR_VERIFY_TRACE below asserts no field still points at a moved
+        //     source). Within each bucket we keep the same sort+dedup (SlotCommitted
+        //     single-region VirtualQuery cache locality) and replay+prune as the
+        //     former flat set, so stale entries (target promoted/died) are dropped
+        //     and steady-state buckets stay small.
         g_dcopyFixup = &fx;
-        // Replay AND prune in one pass. The remembered set is otherwise reset only
-        // at a trace epoch bump, so between traces it monotonically accumulates
-        // every mature->young slot ever logged -- including entries whose target
-        // has since been promoted (copied => now mature), died, or had its region
-        // freed. Those stale entries are pure dead weight: they cannot name a
-        // movable young object, yet each still costs a load + moved-range search +
-        // committed check every RC pause, and the O(n log n) re-sort above. Left
-        // unbounded this ballooned to ~1M slots on a burst (a single ~330 ms RC
-        // pause; ~94 ms of it just the re-sort). The LXR paper instead keeps
-        // remembered sets "up to date" via the barrier and scopes them to the
-        // evacuation set, so it never replays stale/irrelevant edges. We approximate
-        // that here: retain an entry only while it still names a movable young
-        // target (it may be copied in a LATER budget-limited pass); drop everything
-        // else. This keeps the set bounded to live young incoming edges, so steady-
-        // state passes stay small and the re-sort cheap. Soundness: we only drop a
-        // slot after Rebase whose CURRENT value is not a young object, and any store
-        // that later makes such a field point at a young object re-logs it (the
-        // coalescing bit was cleared when its buffer was processed), so it is
-        // re-captured -- no live mature->young edge into a survivor is lost.
-        size_t keepW = 0;
-        for (Object** slot : g_dcopyModifiedSlots)
+        auto replayBucket = [&](std::vector<Object**>& bucket)
         {
-            uint8_t* sa = (uint8_t*)slot;
-            // (i) Slot inside a moved source region: its container object is being
-            //     relocated (its copy's out-edges are fixed by 4a) and the source
-            //     region is freed after this pass -- the slot address itself dies.
-            //     Drop it.
-            if (!fx.movedRanges->empty())
+            if (bucket.empty())
+                return;
+            size_t before = bucket.size();
+            std::sort(bucket.begin(), bucket.end());
+            bucket.erase(std::unique(bucket.begin(), bucket.end()), bucket.end());
+            size_t keepW = 0;
+            for (Object** slot : bucket)
             {
-                size_t lo = 0, hi = fx.movedRanges->size();
-                while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx.movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
-                if (lo != 0)
+                uint8_t* sa = (uint8_t*)slot;
+                // (i) Slot inside a moved source region: its container is relocated
+                //     (its copy's out-edges are fixed by 4a) and the source region
+                //     is freed after this pass -- the slot address itself dies. Drop.
+                if (!fx.movedRanges->empty())
                 {
-                    const DCopyMovedRange& mr = (*fx.movedRanges)[lo - 1];
-                    if (sa >= mr.oldStart && sa < mr.oldEnd)
-                        continue; // drop: handled by 4a, source region reclaimed
+                    size_t lo = 0, hi = fx.movedRanges->size();
+                    while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx.movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                    if (lo != 0)
+                    {
+                        const DCopyMovedRange& mr = (*fx.movedRanges)[lo - 1];
+                        if (sa >= mr.oldStart && sa < mr.oldEnd)
+                            continue; // drop: handled by 4a, source region reclaimed
+                    }
                 }
+                // (ii) Referrer region freed by an earlier RC pause / this pass's
+                //      zero-count cascade: the slot's own page is gone. Drop it.
+                if (!fx.SlotCommitted(slot))
+                    continue;
+                // (iii) Redirect any reference into a moved source to its new home.
+                fx.Rebase(slot);
+                // (iv) PRUNE: keep only entries that still name a movable young
+                //      target (it may be copied in a LATER budget-limited pass).
+                //      Soundness: a field dropped here has a non-young current value;
+                //      any later store making it point at a young object re-logs it
+                //      (coalescing bit cleared when its buffer was processed), so it
+                //      is re-captured -- no live mature->young edge is lost.
+                Object* cur = *slot;
+                if (cur != nullptr && (uint8_t*)cur >= m_heapBase && (uint8_t*)cur < m_heapBase + m_heapBytes && IsYoung(cur))
+                    bucket[keepW++] = slot;
             }
-            // (ii) Referrer region freed by an earlier RC pause / this pass's
-            //      zero-count cascade: the slot's own page is gone. Drop it.
-            if (!fx.SlotCommitted(slot))
-                continue;
-            // (iii) Redirect any reference into a moved source to its new location.
-            fx.Rebase(slot);
-            // (iv) PRUNE: keep only entries that still name a movable young target.
-            Object* cur = *slot;
-            if (cur != nullptr && (uint8_t*)cur >= m_heapBase && (uint8_t*)cur < m_heapBase + m_heapBytes && IsYoung(cur))
-                g_dcopyModifiedSlots[keepW++] = slot;
+            bucket.resize(keepW);
+            g_dcopyRemsetCount -= (before - keepW);
+        };
+        if (!g_dcopyRemsetBuckets.empty())
+        {
+            size_t nbuckets = g_dcopyRemsetBuckets.size();
+            for (const SrcRegion& sr : evacuatedSrcs)
+            {
+                size_t rs0 = (size_t)(sr.start - m_heapBase) / CONTEXT_ALLOC_QUANTUM;
+                size_t rs1 = (size_t)((sr.usedEnd - 1) - m_heapBase) / CONTEXT_ALLOC_QUANTUM;
+                if (rs1 >= nbuckets) rs1 = nbuckets - 1;
+                for (size_t rs = rs0; rs <= rs1; rs++)
+                    replayBucket(g_dcopyRemsetBuckets[rs]);
+            }
         }
-        g_dcopyModifiedSlots.resize(keepW);
         g_dcopyFixup = nullptr;
     }
     else
@@ -5982,10 +6005,10 @@ void LXRCollector::CopyYoungSurvivors()
     LARGE_INTEGER clkAfterFixup; QueryPerformanceCounter(&clkAfterFixup);
     if (verbose)
     {
-        fprintf(stderr, "LXRGC: [copy-breakdown] copyloop=%lldus fixup=%lldus scoped=%d modslots=%zu srcRegions=%zu\n",
+        fprintf(stderr, "LXRGC: [copy-breakdown] copyloop=%lldus fixup=%lldus scoped=%d remset=%zu evacRegions=%zu srcRegions=%zu\n",
                 (long long)((clkAfterCopy.QuadPart - clk0.QuadPart) * 1000000 / clkFreq.QuadPart),
                 (long long)((clkAfterFixup.QuadPart - clkAfterCopy.QuadPart) * 1000000 / clkFreq.QuadPart),
-                (int)useScoped, g_dcopyModifiedSlots.size(), srcs.size());
+                (int)useScoped, g_dcopyRemsetCount, evacuatedSrcs.size(), srcs.size());
         fflush(stderr);
     }
 
@@ -7355,7 +7378,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // fix-up.
         if (g_dcopyCaptureModified)
         {
-            g_dcopyModifiedSlots.clear();
+            DCopyRemsetClearAll();
             InterlockedExchange(&g_dcopyRemsetOverflow, 0);
         }
         // A complete trace has re-established liveness mark-authoritatively and
