@@ -184,6 +184,35 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28j** — **RC-pause syscall elimination + honest (off-pause-excluded)
+  pause accounting.** Two root causes of the ~80-100 ms total / ~20-25 ms max STW
+  pauses, both fixed with no runtime change:
+  **(1) Per-op `VirtualAlloc(MEM_COMMIT)` syscall in the hot RC-pause loops.**
+  `CommitPageFor` lazily committed a reserved side-table page PER access — issued
+  once per field in the D-copy remset capture (`IsYoung`→`MetaForBlock`) and once
+  per RC op in the serial `ApplyRCEpoch` (`RCIncrement`/`RCDecrement`). MEM_COMMIT is
+  idempotent but a full kernel transition even on an already-committed page. Added a
+  per-page committed bitmap for the block-meta and RC side tables (`m_metaPageCommitted`
+  / `m_rcPageCommitted`, `EnsureRCPage`), so the syscall fires at most once per page
+  (bit set AFTER commit → safe under the parallel sweep/mark/free callers). `[pmb-prof]`:
+  dcopy-capture **4388 µs → ~130 µs**, applyrc **3232 µs → ~300 µs** (both sub-ms).
+  **(2) Off-pause `DrainPendingDecommit` counted as pause time.** The concurrent-finish
+  and STW drivers captured the pause-end timestamp AFTER `DrainPendingDecommit()` —
+  which `VirtualFree(MEM_DECOMMIT)`s swept regions and runs AFTER `LXRRestartEE()` with
+  mutators live. So the reported pause (feeding `TotalPauseMicros`/`MaxPauseMicros`/
+  `GetTotalPauseDuration`) included non-STW work, ~2× inflating sweep-heavy cycles.
+  Now capture pause-end immediately after RestartEE (as the multi-epoch branch already
+  did). **Honest result (WebApi full config, 15 s, 8 iters): max-pause median 18.5 →
+  8.1 ms, total-pause median 78 → 46 ms** (typical run ~44 ms / max ~8 ms, with an
+  occasional trace-finish outlier ~26 ms). Soundness clean (`LXR_VERIFY_TRACE`
+  offenders=0, Errors=0), reclamation intact (~290 MB committed), throughput unchanged
+  (250 ops/s). **A/B copy-budget sweep (`LXR_EVAC_BUDGET_MB`/`LXR_NURSERY_COPY_BUDGET_MB`)
+  was inconclusive over 8-iter medians (4 MB no better than the 32 MB default: 101/23 vs
+  78/18) — the big pauses are trace-finish, not copy-bound — so budget defaults kept at
+  32 MB.** Honest standing vs built-in GCs: LXR total-pause (~46-63 ms median) is still
+  higher than Workstation (~5 ms) / Server (~13 ms) because LXR runs many frequent light
+  RC pauses; its bounded per-pause latency (~8 ms median) is the paper-relevant metric.
+  Commits `192c562`, `69503e8`.
 - **2026-07-28i** — **Honest pause-time-in-ms telemetry + RC-pause root-cause
   diagnosis.** Pause time was only surfaced as a *percentage* (`PauseTimePercentage`),
   which hid how long individual STW pauses actually are. Added a native
@@ -192,15 +221,6 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
   `TotalPauseTimeMs` (`GC.GetTotalPauseDuration`) and `MaxPauseTimeMs`. **Measured
   honest numbers (WebApi, 15 s): LXR TotalPauseMs≈97, MaxPauseMs≈22 vs Workstation
   ≈5 ms / Server ≈15 ms total** — LXR's pauses are NOT yet paper-competitive.
-  Root-caused the ~20 ms RC pause with `[stage]`/`[rc-breakdown]`/`[fixup-sub]`
-  sub-timers: it is **`ProcessModifiedBuffers` ~10 ms** (STW coalescing hash-map +
-  `ApplyRCEpoch` + `DrainZeroCountWorkList`) **+ `CopyYoungSurvivors` ~12 ms**
-  (copyloop ~4 ms + fix-up ~7 ms, of which step **4b** = ~6.75 ms is `SlotCommitted`
-  `VirtualQuery` syscalls on scattered stale remset entries). The concurrent path
-  already defers the coalescing hash-map off-pause (`SnapshotModifiedBuffers`); the
-  plain RC pause does all of it STW. Next: kill the 4b VirtualQuery (in-memory
-  committed check), defer PMB's RC-apply/zero-count off-pause, and budget the young
-  copy — targeting sub-ms RC pauses per the paper. No runtime change.
 - **2026-07-28h** — **Parallelized the D-copy young-survivor fix-up (STW pause
   reduction).** Profiling the `[copy-breakdown] fixup` STW sub-cost (up to ~26 ms)
   with new `LXR_VERBOSE` sub-timers (`[fixup-sub] 4a / 4a-young / 4b`) corrected an
