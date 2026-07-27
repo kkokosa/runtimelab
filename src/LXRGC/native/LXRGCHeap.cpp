@@ -5914,6 +5914,7 @@ struct DCopy4bCtx
     std::vector<size_t>*                  bucketIdx;    // deduped region-slot indices to replay
     std::unordered_map<Object*, Object*>* forwarding;
     std::vector<DCopyMovedRange>*         movedRanges;  // sorted by oldStart
+    std::vector<std::pair<uint8_t*, uint8_t*>>* committed; // sorted [Start,cend) committed regions
     int64_t*                              laneForwarded;
     int64_t*                              laneRemsetDelta; // entries pruned per lane
 };
@@ -5923,6 +5924,7 @@ static void DCopy4bFn(int lane, int lanes, void* ctxp)
     DCopyFixupCtx fx;
     fx.forwarding = ctx->forwarding;
     fx.movedRanges = ctx->movedRanges;
+    const std::vector<std::pair<uint8_t*, uint8_t*>>& committed = *ctx->committed;
     int64_t delta = 0;
     const std::vector<size_t>& idx = *ctx->bucketIdx;
     for (size_t k = (size_t)lane; k < idx.size(); k += (size_t)lanes)
@@ -5951,8 +5953,19 @@ static void DCopy4bFn(int lane, int lanes, void* ctxp)
                 }
             }
             // (ii) Referrer region decommitted: the slot's own page is gone. Drop.
-            if (!fx.SlotCommitted(slot))
-                continue;
+            //     In-memory committed check (replaces a per-slot VirtualQuery syscall,
+            //     the former dominant 4b cost): a real logged slot is a field of a
+            //     mature object, which always lives below its region's alloc/used
+            //     watermark -- and that extent is committed iff the region's chunk is
+            //     Committed. Decommit is whole-region, so a slot whose containing
+            //     [Start,cend) is absent from this snapshot names a freed region. The
+            //     snapshot is built once under g_chunkLock before the pool dispatch.
+            {
+                size_t lo = 0, hi = committed.size();
+                while (lo < hi) { size_t mid = (lo + hi) >> 1; if (committed[mid].first <= sa) lo = mid + 1; else hi = mid; }
+                if (lo == 0 || sa >= committed[lo - 1].second)
+                    continue; // not within any committed region: drop
+            }
             // (iii) Redirect any reference into a moved source to its new home.
             fx.Rebase(slot);
             // (iv) PRUNE: keep only entries still naming a movable young target
@@ -6342,6 +6355,28 @@ void LXRCollector::CopyYoungSurvivors()
             std::sort(bucketIdx.begin(), bucketIdx.end());
             bucketIdx.erase(std::unique(bucketIdx.begin(), bucketIdx.end()), bucketIdx.end());
 
+            // Committed-region snapshot for the in-memory referrer-committed check
+            // (step (ii) in DCopy4bFn), replacing a per-slot VirtualQuery syscall.
+            // Snapshot [Start,cend) of every committed chunk under g_chunkLock, then
+            // sort by Start for binary search; released before RunOnPool (which takes
+            // g_poolLock) to avoid a g_chunkLock->g_poolLock inversion. g_chunks is
+            // stable during fix-up (mutators suspended, no alloc/registration).
+            std::vector<std::pair<uint8_t*, uint8_t*>> committedRanges;
+            {
+                EnterCriticalSection(&g_chunkLock);
+                committedRanges.reserve(g_chunkCount);
+                for (size_t i = 0; i < g_chunkCount; i++)
+                {
+                    ChunkRegion& c = g_chunks[i];
+                    if (!c.Committed) continue;
+                    uint8_t* cend = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+                    if (cend > c.Start)
+                        committedRanges.push_back({ c.Start, cend });
+                }
+                LeaveCriticalSection(&g_chunkLock);
+            }
+            std::sort(committedRanges.begin(), committedRanges.end());
+
             static int s_par4b = -1;
             if (s_par4b < 0)
             {
@@ -6351,7 +6386,7 @@ void LXRCollector::CopyYoungSurvivors()
             int lanes = (s_par4b && g_poolWorkers > 0 && bucketIdx.size() >= 16)
                             ? (g_poolWorkers + 1) : 1;
             std::vector<int64_t> laneForwarded((size_t)lanes, 0), laneDelta((size_t)lanes, 0);
-            DCopy4bCtx bctx{ &bucketIdx, &forwarding, &movedRanges, laneForwarded.data(), laneDelta.data() };
+            DCopy4bCtx bctx{ &bucketIdx, &forwarding, &movedRanges, &committedRanges, laneForwarded.data(), laneDelta.data() };
             RunOnPool(lanes, &DCopy4bFn, &bctx);
             for (int l = 0; l < lanes; l++)
             {
