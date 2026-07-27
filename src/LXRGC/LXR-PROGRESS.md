@@ -184,6 +184,35 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28k** — **Trace-finish evac fix-up reduction (incoming-edge remset
+  replay).** Profiled the multi-epoch trace-finish (`meFinish`) STW pause with a new
+  off-pause `LXR_FINISH_PROFILE` `[finish-prof]` print (captured AFTER `RestartEE`,
+  so the instrumentation never inflates the pause) split into closure / buffers /
+  evac / sweep, and Evacuate itself into copy / fix-up[4a / 4bRS{gather,replay} /
+  4bIntra] / free. Finding: the recurring dominant finish cost is **Evacuate's
+  incoming-edge remembered-set replay (4bRS)** — ~2–3 ms typical, pathologically up
+  to ~24 ms — NOT the copy loop (~40–260 µs) nor 4a/4b-intrablock (~10–150 µs).
+  Fixes (no runtime change): **(1)** replaced the per-slot committed **VirtualQuery
+  syscall** (single-region cache thrashed by scattered barrier-order slots → one
+  syscall each) with an **in-memory binary search over a committed-region snapshot**
+  (same technique as D-copy 4b, commit 4a4b854), taken once under `g_chunkLock`;
+  **(2)** **dropped the slot sort+unique** — it existed only to cluster same-region
+  slots for the VirtualQuery cache, which the snapshot makes irrelevant; the rebase
+  is idempotent (a slot already at an evac DEST is neither a forwarding key nor
+  inside a moved-source range → second visit is a no-op) so duplicates are harmless;
+  **(3)** unified the persistent + candidate-scope edge sets into one replay and left
+  a parallel-over-the-mark-pool safety valve (`Evac4bFn`/`EvacReplayIncoming`,
+  `LXR_EVAC_PARALLEL_4B`) gated to a **pathologically huge** remset
+  (`LXR_EVAC_PARALLEL_4B_MIN`, default 131072) — at typical counts (~10⁴) the
+  16-thread `RunOnPool` wakeup (~0.4 ms) exceeds the whole serial rebase, so it stays
+  serial. Also swapped the two remaining per-object `CommitPageFor(RCSlot)` syscalls
+  in the Evacuate/CopyYoungSurvivors copy loops for `EnsureRCPage`. Result: 4bRS
+  replay n≈9.6k dropped 1009 µs→545 µs (and the ~24 ms VirtualQuery outlier is gone);
+  4bRS whole ~2000–3000 µs → ~400–900 µs. Honest 8-iter WebApi medians (non-verbose):
+  **total 46→38.6 ms, max 8.1→6.0 ms**, tighter distribution (no ≥18 ms spikes).
+  Soundness: 5/5 verify runs + forced-parallel 3/3 all `misses=0`/`Errors=0`, ops
+  ~parity. Envs `LXR_EVAC_PARALLEL_4B`(=0 off), `LXR_EVAC_PARALLEL_4B_MIN`,
+  `LXR_FINISH_PROFILE`.
 - **2026-07-28j** — **RC-pause syscall elimination + honest (off-pause-excluded)
   pause accounting.** Two root causes of the ~80-100 ms total / ~20-25 ms max STW
   pauses, both fixed with no runtime change:

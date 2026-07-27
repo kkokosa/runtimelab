@@ -4564,6 +4564,137 @@ static void LXRPinHandle(Object** ref, void* ctx)
 // STW incremental evacuation (P3). Runs inside the trace pause, after
 // BackupTrace has marked every live object. Relocates the live objects out of
 // the most fragmented regions into fresh space and frees those regions.
+static int64_t g_evacCopyMicros = 0, g_evacFixupMicros = 0, g_evacFreeMicros = 0;
+static int64_t g_evac4aMicros = 0, g_evac4bRemsetMicros = 0;
+static int64_t g_evac4bReplayMicros = 0, g_evac4bSlots = 0;
+// Interior/byref support: each moved object's old address range and new base, so a
+// heap byref/interior pointer landing INSIDE a moved object can be rebased.
+// File-scope so the parallel 4b replay fn (Evac4bFn) can reference it.
+struct EvacMovedRange { uint8_t* oldStart; uint8_t* oldEnd; uint8_t* newStart; };
+// Parallel evac 4b incoming-edge replay (mirrors D-copy's DCopy4bFn, commit
+// 40a57b1): each lane replays a stripe of the deduped incoming-edge slot vector.
+// The former dominant trace-finish evac cost was this serial replay's per-slot
+// committed VirtualQuery + rebase; here the committed check is an in-memory
+// binary search over a committed-region snapshot (no syscall) and the rebase is
+// striped across the mark pool. Mutators are suspended and the marker parked, so
+// the heap fields are stable; each lane writes only its own (distinct) slots and
+// the forwarding map / movedRanges are read-only, so no locking is needed.
+struct Evac4bCtx
+{
+    std::vector<Object**>*                slots;        // deduped incoming-edge slots
+    std::unordered_map<Object*, Object*>* forwarding;
+    std::vector<EvacMovedRange>*          movedRanges;  // sorted by oldStart
+    std::vector<std::pair<uint8_t*, uint8_t*>>* committed; // sorted [Start,cend)
+    int64_t*                              laneForwarded;
+};
+static void Evac4bFn(int lane, int lanes, void* ctxp)
+{
+    Evac4bCtx* ctx = (Evac4bCtx*)ctxp;
+    std::unordered_map<Object*, Object*>& forwarding = *ctx->forwarding;
+    std::vector<EvacMovedRange>& movedRanges = *ctx->movedRanges;
+    const std::vector<std::pair<uint8_t*, uint8_t*>>& committed = *ctx->committed;
+    const std::vector<Object**>& slots = *ctx->slots;
+    int64_t forwarded = 0;
+    for (size_t k = (size_t)lane; k < slots.size(); k += (size_t)lanes)
+    {
+        Object** f = slots[k];
+        uint8_t* sa = (uint8_t*)f;
+        // Referrer region decommitted since insert: in-memory committed check
+        // (replaces the per-slot VirtualQuery syscall). Decommit is whole-region,
+        // so a slot absent from the committed snapshot names a freed region.
+        {
+            size_t lo = 0, hi = committed.size();
+            while (lo < hi) { size_t mid = (lo + hi) >> 1; if (committed[mid].first <= sa) lo = mid + 1; else hi = mid; }
+            if (lo == 0 || sa >= committed[lo - 1].second)
+                continue;
+        }
+        uint8_t* v = (uint8_t*)*f;
+        if (v == nullptr)
+            continue;
+        auto it = forwarding.find((Object*)v);
+        if (it != forwarding.end())
+        {
+            *f = it->second;
+            forwarded++;
+            continue;
+        }
+        if (movedRanges.empty())
+            continue;
+        size_t lo = 0, hi = movedRanges.size();
+        while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= v) lo = mid + 1; else hi = mid; }
+        if (lo == 0)
+            continue;
+        const EvacMovedRange& r = movedRanges[lo - 1];
+        if (v > r.oldStart && v < r.oldEnd)
+        {
+            *f = (Object*)(r.newStart + (v - r.oldStart));
+            forwarded++;
+        }
+    }
+    ctx->laneForwarded[lane] = forwarded;
+}
+// Snapshot the committed regions, then replay the incoming-edge rebase. Shared by
+// the persistent and legacy remembered-set paths.
+//
+// The former dominant trace-finish evac cost was this replay's per-slot committed
+// VirtualQuery (single-region cache thrashed by scattered slots -> one syscall
+// each, pathologically tens of ms on a large remset). It is now an in-memory
+// binary search over a committed-region snapshot, so slot ORDER no longer matters:
+// the previous sort+unique (added only to cluster same-region slots for the
+// VirtualQuery cache) is DROPPED. Duplicate slots are harmless - rebase is
+// idempotent (a slot already pointing at an evac DEST is neither a forwarding-map
+// key nor inside any moved-source range, so a second visit is a no-op), which also
+// makes the optional parallel path race-free without dedup. Parallel replay is a
+// safety valve for a pathologically huge remset only: at typical counts (~10^4)
+// the 16-thread RunOnPool wakeup (~0.4ms) exceeds the whole serial rebase, so the
+// default threshold keeps it serial.
+static void EvacReplayIncoming(std::vector<Object**>& slots,
+                               std::unordered_map<Object*, Object*>& forwarding,
+                               std::vector<EvacMovedRange>& movedRanges)
+{
+    if (slots.empty())
+        return;
+    LARGE_INTEGER rpFreq, rp0; QueryPerformanceFrequency(&rpFreq); QueryPerformanceCounter(&rp0);
+    g_evac4bSlots = (int64_t)slots.size();
+    // Committed-region snapshot for the in-memory referrer-committed check
+    // (replaces a per-slot VirtualQuery syscall). Snapshot under g_chunkLock, then
+    // release it BEFORE RunOnPool (which takes g_poolLock) to avoid a
+    // g_chunkLock->g_poolLock inversion. g_chunks is stable during fix-up
+    // (mutators suspended, no alloc/registration).
+    std::vector<std::pair<uint8_t*, uint8_t*>> committedRanges;
+    {
+        EnterCriticalSection(&g_chunkLock);
+        committedRanges.reserve(g_chunkCount);
+        for (size_t i = 0; i < g_chunkCount; i++)
+        {
+            ChunkRegion& c = g_chunks[i];
+            if (!c.Committed) continue;
+            uint8_t* cend = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+            if (cend > c.Start)
+                committedRanges.push_back({ c.Start, cend });
+        }
+        LeaveCriticalSection(&g_chunkLock);
+    }
+    std::sort(committedRanges.begin(), committedRanges.end());
+
+    static int s_par = -1, s_parMin = -1;
+    if (s_par < 0)
+    {
+        const char* e = getenv("LXR_EVAC_PARALLEL_4B");
+        s_par = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON (but gated by s_parMin)
+        const char* m = getenv("LXR_EVAC_PARALLEL_4B_MIN");
+        s_parMin = m ? (int)_atoi64(m) : 131072; // only parallelize a pathologically huge remset
+    }
+    int lanes = (s_par && g_poolWorkers > 0 && slots.size() >= (size_t)s_parMin)
+                    ? (g_poolWorkers + 1) : 1;
+    std::vector<int64_t> laneForwarded((size_t)lanes, 0);
+    Evac4bCtx ctx{ &slots, &forwarding, &movedRanges, &committedRanges, laneForwarded.data() };
+    RunOnPool(lanes, &Evac4bFn, &ctx);
+    for (int l = 0; l < lanes; l++)
+        InterlockedExchangeAdd64(&g_lxrCounters.EvacFieldsForwarded, laneForwarded[(size_t)l]);
+    LARGE_INTEGER rp1; QueryPerformanceCounter(&rp1);
+    g_evac4bReplayMicros = (long long)((rp1.QuadPart-rp0.QuadPart)*1000000/rpFreq.QuadPart);
+}
 void LXRCollector::Evacuate()
 {
     if (g_lxrGCHeap == nullptr || g_theGCToCLR == nullptr)
@@ -4716,7 +4847,7 @@ void LXRCollector::Evacuate()
     // address range and new base, so a heap byref/interior pointer that lands
     // *inside* a moved object (e.g. a runtime-async continuation's captured `ref`
     // field) can be rebased preserving its offset, not just object-start refs.
-    struct MovedRange { uint8_t* oldStart; uint8_t* oldEnd; uint8_t* newStart; };
+    typedef EvacMovedRange MovedRange; // file-scope type (shared with Evac4bFn)
     std::vector<MovedRange> movedRanges;
     uint8_t* destPtr = nullptr;
     uint8_t* destEnd = nullptr;
@@ -4787,8 +4918,8 @@ void LXRCollector::Evacuate()
             forwarding.emplace(o, (Object*)d);
             movedRanges.push_back({ (uint8_t*)o, (uint8_t*)o + sz, d });
             MarkObject((Object*)d);
-            CommitPageFor(RCSlot((Object*)d));
-            CommitPageFor(RCSlot(o));
+            EnsureRCPage(RCSlot((Object*)d));
+            EnsureRCPage(RCSlot(o));
             *RCSlot((Object*)d) = *RCSlot(o);
             *RCSlot(o) = 0; // source granule retired
             moved++;
@@ -4932,33 +5063,18 @@ void LXRCollector::Evacuate()
                 });
         // (b) Incoming edges from non-moved referrers.
         LARGE_INTEGER evB0; QueryPerformanceCounter(&evB0);
+        g_evac4aMicros = (long long)((evB0.QuadPart-evCopyEnd.QuadPart)*1000000/evPhFreq.QuadPart);
         if (s_persist)
         {
-            // Persistent remset entries can point into a region freed since insert.
-            // The line-reuse version catches the reclaim; a cached-VirtualQuery
-            // committed guard catches any residual (e.g. a store that raced ahead
-            // of the version-table commit).
-            uint8_t* cqBase = nullptr; size_t cqLen = 0; bool cqComm = false;
-            auto slotCommitted = [&](void* s) -> bool
-            {
-                if ((uint8_t*)s < cqBase || (uint8_t*)s >= cqBase + cqLen)
-                {
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (VirtualQuery(s, &mbi, sizeof(mbi)) == 0) { cqBase = nullptr; cqLen = 0; cqComm = false; return false; }
-                    cqBase = (uint8_t*)mbi.BaseAddress; cqLen = mbi.RegionSize; cqComm = (mbi.State == MEM_COMMIT);
-                }
-                return cqComm;
-            };
-            // Gather the surviving (non-stale, not-inside-a-moved-source) remset
-            // slots, then SORT them by address before the committed-VirtualQuery
-            // replay. This is the same fix as D-copy 4b (commit 4a4b854): the
-            // slotCommitted guard caches a single MEMORY_BASIC_INFORMATION region,
-            // so scattered insertion-order slots thrash it to ONE VirtualQuery
-            // syscall each - the dominant trace-finish evac cost (measured ~145ms,
-            // pathologically up to tens of seconds on a large remset). Sorting
-            // clusters same-region slots so the cache hits: ~one syscall per
-            // distinct region. std::unique drops duplicate logs.
-            std::vector<Object**> liveSlots;
+            // Combined incoming-edge slot set: the barrier-maintained persistent
+            // remset (candidate-target MUTATIONS this window) plus, under candidate
+            // scoping, the pre-existing candidate incoming edges the concurrent mark
+            // logged (g_evacEdgeLogs). Gather both, dropping stale (source line
+            // reclaimed) and moved-source (handled by (a)) slots, then replay the
+            // rebase in parallel over the mark pool with an in-memory committed
+            // check. This replaces the former serial sort + per-slot VirtualQuery
+            // replay - the measured dominant trace-finish evac cost (~2-24ms).
+            std::vector<Object**> slots;
             EnterCriticalSection(&g_remsetLock);
             for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
             {
@@ -4976,30 +5092,15 @@ void LXRCollector::Evacuate()
                         if (sa >= mr.oldStart && sa < mr.oldEnd)
                             continue; // slot inside a moved source: handled by (a)
                     }
-                    liveSlots.push_back(slot);
+                    slots.push_back(slot);
                 }
             }
             LeaveCriticalSection(&g_remsetLock);
-            // STW finish pause: mutators suspended, marker parked -> the remset is
-            // quiescent and the heap fields rebaseField touches are stable, so the
-            // committed-check + rebase can run outside g_remsetLock.
-            std::sort(liveSlots.begin(), liveSlots.end());
-            liveSlots.erase(std::unique(liveSlots.begin(), liveSlots.end()), liveSlots.end());
-            for (Object** slot : liveSlots)
-            {
-                if (!slotCommitted(slot))
-                    continue; // referrer region decommitted since insert
-                rebaseField(slot);
-            }
-            // Item F candidate-scoping: the barrier-maintained persistent remset
-            // above holds only candidate-target MUTATIONS this window. The
-            // pre-existing candidate incoming edges (from live objects the mark
-            // scanned) are in g_evacEdgeLogs, repopulated by this cycle's concurrent
-            // mark. Replay them too so the union covers every incoming candidate
-            // edge. Same moved-source skip + committed guard as above.
+            // Item F candidate-scoping: also replay the pre-existing candidate
+            // incoming edges (from live objects the mark scanned), in g_evacEdgeLogs,
+            // so the union covers every incoming candidate edge.
             if (scopeUnion)
             {
-                std::vector<Object**> markSlots;
                 EnterCriticalSection(&g_evacEdgeLock);
                 for (std::vector<Object**>* log : g_evacEdgeLogs)
                     for (Object** slot : *log)
@@ -5011,26 +5112,22 @@ void LXRCollector::Evacuate()
                         {
                             const MovedRange& mr = movedRanges[lo - 1];
                             if (sa >= mr.oldStart && sa < mr.oldEnd)
-                                continue; // slot inside a moved source: handled by (a)
+                                continue;
                         }
-                        markSlots.push_back(slot);
+                        slots.push_back(slot);
                     }
                 LeaveCriticalSection(&g_evacEdgeLock);
-                std::sort(markSlots.begin(), markSlots.end());
-                markSlots.erase(std::unique(markSlots.begin(), markSlots.end()), markSlots.end());
-                for (Object** slot : markSlots)
-                {
-                    if (!slotCommitted(slot))
-                        continue;
-                    rebaseField(slot);
-                }
             }
+            // STW finish pause: mutators suspended, marker parked -> the remset is
+            // quiescent and the heap fields are stable, so the parallel committed-
+            // check + rebase can run outside g_remsetLock.
+            EvacReplayIncoming(slots, forwarding, movedRanges);
         }
         else
         {
+            std::vector<Object**> slots;
             EnterCriticalSection(&g_evacEdgeLock);
             for (std::vector<Object**>* log : g_evacEdgeLogs)
-            {
                 for (Object** slot : *log)
                 {
                     uint8_t* sa = (uint8_t*)slot;
@@ -5042,14 +5139,15 @@ void LXRCollector::Evacuate()
                         if (sa >= mr.oldStart && sa < mr.oldEnd)
                             continue; // slot inside a moved source: handled by (a)
                     }
-                    rebaseField(slot);
+                    slots.push_back(slot);
                 }
-            }
             LeaveCriticalSection(&g_evacEdgeLock);
+            EvacReplayIncoming(slots, forwarding, movedRanges);
         }
         // (c) In-place survivors that share a 32 KiB Immix BLOCK with an evacuated
         //     object may hold INTRA-block references to objects that DID move.
         LARGE_INTEGER evB1; QueryPerformanceCounter(&evB1);
+        g_evac4bRemsetMicros = (long long)((evB1.QuadPart-evB0.QuadPart)*1000000/evPhFreq.QuadPart);
         static bool s_evacPhaseVerbose = getenv("LXR_VERBOSE") != nullptr;
         if (s_evacPhaseVerbose) { fprintf(stderr, "LXRGC: [evac-fixup] b_remset=%lldus\n", (long long)((evB1.QuadPart-evB0.QuadPart)*1000000/evPhFreq.QuadPart)); fflush(stderr); }
         //     Evacuation is per-OBJECT and our regions are sub-block (the sweep
@@ -5203,9 +5301,15 @@ void LXRCollector::Evacuate()
     }
     LeaveCriticalSection(&g_chunkLock);
 
+    LARGE_INTEGER evFreeEnd; QueryPerformanceCounter(&evFreeEnd);
+    {
+        auto usg = [&](LARGE_INTEGER a, LARGE_INTEGER b){ return (long long)((b.QuadPart-a.QuadPart)*1000000/evPhFreq.QuadPart); };
+        g_evacCopyMicros  = usg(evSel1, evCopyEnd);
+        g_evacFixupMicros = usg(evCopyEnd, evFixupEnd);
+        g_evacFreeMicros  = usg(evFixupEnd, evFreeEnd);
+    }
     if (verbose)
     {
-        LARGE_INTEGER evFreeEnd; QueryPerformanceCounter(&evFreeEnd);
         auto usp = [&](LARGE_INTEGER a, LARGE_INTEGER b){ return (long long)((b.QuadPart-a.QuadPart)*1000000/evPhFreq.QuadPart); };
         fprintf(stderr, "LXRGC: [evac-phases] copy=%lldus fixup=%lldus free+dcopy=%lldus\n",
                 usp(evSel1, evCopyEnd), usp(evCopyEnd, evFixupEnd), usp(evFixupEnd, evFreeEnd));
@@ -6212,8 +6316,8 @@ void LXRCollector::CopyYoungSurvivors()
             memcpy(d, o, sz);
             forwarding.emplace(o, (Object*)d);
             movedRanges.push_back({ (uint8_t*)o, (uint8_t*)o + sz, d });
-            CommitPageFor(RCSlot((Object*)d));
-            CommitPageFor(RCSlot(o));
+            EnsureRCPage(RCSlot((Object*)d));
+            EnsureRCPage(RCSlot(o));
             *RCSlot((Object*)d) = *RCSlot(o); // preserve the survivor's reference count
             *RCSlot(o) = 0;                   // source granule retired
             // The promoted copy is now MATURE but may hold young->young field
@@ -7523,7 +7627,25 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRRestartEE();
         QueryPerformanceCounter(&t1);   // TRUE pause end: mutators run from here
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
-        // Off-pause: replay the detached marking-window RC increments/decrements +
+        {
+            static int s_finishProfile = -1;
+            if (s_finishProfile < 0) s_finishProfile = (getenv("LXR_FINISH_PROFILE") != nullptr) ? 1 : 0;
+            if (s_finishProfile)
+            {
+                auto us = [&](LARGE_INTEGER a, LARGE_INTEGER b){ return (long long)((b.QuadPart - a.QuadPart) * 1000000 / freq.QuadPart); };
+                extern int64_t g_evacCopyMicros, g_evacFixupMicros, g_evacFreeMicros;
+                extern int64_t g_evac4aMicros, g_evac4bRemsetMicros;
+                extern int64_t g_evac4bReplayMicros, g_evac4bSlots;
+                fprintf(stderr, "LXRGC: [finish-prof] me total=%lldus closure=%lldus buffers=%lldus evac=%lldus(copy=%lld fix=%lld[4a=%lld 4bRS=%lld{gather=%lld replay=%lld n=%lld} 4bIntra=%lld] free=%lld) sweep+compact=%lldus\n",
+                        (long long)pauseMicros, us(tf0,tf1), us(tf1,tf2), us(tf2,tfEvac),
+                        (long long)g_evacCopyMicros, (long long)g_evacFixupMicros,
+                        (long long)g_evac4aMicros, (long long)g_evac4bRemsetMicros,
+                        (long long)(g_evac4bRemsetMicros - g_evac4bReplayMicros), (long long)g_evac4bReplayMicros, (long long)g_evac4bSlots,
+                        (long long)(g_evacFixupMicros - g_evac4aMicros - g_evac4bRemsetMicros),
+                        (long long)g_evacFreeMicros, us(tfEvac,tf3));
+                fflush(stderr);
+            }
+        }
         // recursive zero-count free cascade while mutators run. Sound even though
         // the sweep above may have decommitted reclaimed chunks: reclaimed regions
         // have RC cleared to 0 (ClearRCRange at every decommit site) and Drain-
@@ -7605,6 +7727,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // the concurrent-path AVs stem from an incomplete SATB (byref/bulk stores
         // that bypass the pluggable callback) rather than from the sweep/evac.
         static int s_concFinishFullTrace = (getenv("LXR_CONC_FINISH_FULLTRACE") != nullptr) ? 1 : 0;
+        // Off-pause finish breakdown: capture sub-phase QPC boundaries DURING the
+        // pause (cheap, no I/O) and print them AFTER RestartEE so the measurement
+        // itself does not inflate the pause. Gated by LXR_FINISH_PROFILE.
+        LARGE_INTEGER cf0=a0, cf1, cf2, cf3, cf4;
         if (s_concFinishFullTrace)
         {
             g_lxrCollector.BackupTrace();
@@ -7621,9 +7747,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         {
             g_lxrCollector.ConcurrentTraceFinish();
         }
+        QueryPerformanceCounter(&cf1); // finish-closure done
         LXRSetPhase("conc:finish-buffers");
         if (doBuffers)
             g_lxrCollector.ProcessModifiedBuffers();
+        QueryPerformanceCounter(&cf2); // buffers done
         // Item F: evacuate in this concurrent-trace finish pause (STW, marks
         // complete). The persistent remembered set supplies the fix-up set.
         if (doEvac)
@@ -7632,6 +7760,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             g_lxrCollector.Evacuate();
         }
         if (doEvac && g_evacCandidateScope) InterlockedExchange(&g_recordEvacEdges, 0);
+        QueryPerformanceCounter(&cf3); // evac done
         LXRSetPhase("conc:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
@@ -7642,6 +7771,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // reclaimed lines' reuse versions.
         if (g_remsetActive)
             g_lxrCollector.CompactRemsets();
+        QueryPerformanceCounter(&cf4); // sweep+compact done
         LXRSetPhase("conc:restart-finish");
         LXRRestartEE();
         QueryPerformanceCounter(&a1); // STW pause ends here — measure BEFORE off-pause decommit
@@ -7649,6 +7779,15 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
         int64_t finMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
+        static int s_finishProfile = -1;
+        if (s_finishProfile < 0) s_finishProfile = (getenv("LXR_FINISH_PROFILE") != nullptr) ? 1 : 0;
+        if (s_finishProfile)
+        {
+            auto us = [&](LARGE_INTEGER a, LARGE_INTEGER b){ return (long long)((b.QuadPart - a.QuadPart) * 1000000 / freq.QuadPart); };
+            fprintf(stderr, "LXRGC: [finish-prof] total=%lldus closure=%lldus buffers=%lldus evac=%lldus sweep+compact=%lldus\n",
+                    (long long)finMicros, us(cf0,cf1), us(cf1,cf2), us(cf2,cf3), us(cf3,cf4));
+            fflush(stderr);
+        }
 
         pauseMicros = snapMicros + finMicros;
         InterlockedExchangeAdd64(&g_lxrCounters.ConcSnapshotMicros, snapMicros);
