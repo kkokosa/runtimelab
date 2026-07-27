@@ -231,6 +231,7 @@ public:
 
     // --- RC side table (1 byte of saturating count per 8-byte granule) ---
     uint8_t* RCSlot(Object* obj) const;
+    void EnsureRCPage(uint8_t* slot); // lazily commit the RC-table page backing slot (per-page bit cache)
     void RCIncrement(Object* obj);
     bool RCDecrement(Object* obj); // returns true if the count reached zero
     // Item G (§3.5): thread-safe variants for parallel RC apply. Use a CAS loop on
@@ -554,6 +555,10 @@ private:
     size_t          m_loggedCommittedBytes = 0; // committed logged-table prefix (bytes)
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block
     size_t          m_blockCount = 0;
+    uint8_t*        m_metaPageCommitted = nullptr; // 1 bit / block-meta-table page: committed?
+    size_t          m_metaPageCount = 0;
+    uint8_t*        m_rcPageCommitted = nullptr;   // 1 bit / RC-table page: committed?
+    size_t          m_rcPageCount = 0;
     volatile int64_t m_reclaimedBytes = 0;   // cumulative bytes decommitted by sweeps
     // Deferred-RC root buffers (see CaptureRoots). Only ever touched by the single
     // collection thread, at STW pauses or the serialized off-pause drain, so no

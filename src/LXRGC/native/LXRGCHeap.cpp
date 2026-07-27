@@ -1229,6 +1229,11 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     m_rcTable = (uint8_t*)VirtualAlloc(nullptr, rcTableBytes, MEM_RESERVE, PAGE_READWRITE);
     if (m_rcTable == nullptr)
         return false;
+    // Per-page committed bitmap for the RC table so the hot serial RC apply
+    // (RCIncrement/RCDecrement) skips the VirtualAlloc(MEM_COMMIT) syscall once a
+    // page is committed. Was ~1us/RC-op (~3ms/RC pause on the serial path).
+    m_rcPageCount = (rcTableBytes + g_pageSize - 1) / g_pageSize;
+    m_rcPageCommitted = (uint8_t*)calloc((m_rcPageCount + 7) / 8, 1);
 
     // Mark side table for the backup trace: 1 bit per 8-byte granule. Reserved
     // only; committed on touch and decommitted wholesale after each trace to
@@ -1255,6 +1260,11 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     m_blockMeta = (lxr::BlockMeta*)VirtualAlloc(nullptr, metaBytes, MEM_RESERVE, PAGE_READWRITE);
     if (m_blockMeta == nullptr)
         return false;
+    // Per-page committed bitmap for the block-meta table so MetaForBlock (a very
+    // hot per-field call in the RC pause) can skip the VirtualAlloc(MEM_COMMIT)
+    // syscall once a page is committed. Was costing ~1us/field (~4ms/RC pause).
+    m_metaPageCount = (metaBytes + g_pageSize - 1) / g_pageSize;
+    m_metaPageCommitted = (uint8_t*)calloc((m_metaPageCount + 7) / 8, 1);
 
     // Immix line-mark side table: 1 bit per 256 B line. Reserved only; committed
     // and zeroed per trace over the used-heap prefix (see ResetMarks). Enables
@@ -1363,7 +1373,24 @@ lxr::BlockMeta* LXRCollector::MetaForBlock(uint8_t* blockAddr)
     size_t idx = (size_t)(blockAddr - m_heapBase) / lxr::kBlockSize;
     if (idx >= m_blockCount)
         return nullptr;
-    CommitPageFor((uint8_t*)&m_blockMeta[idx]);
+    // Fast path: commit the block-meta-table page lazily, but only once per page.
+    // A per-page committed bit avoids a VirtualAlloc(MEM_COMMIT) syscall on every
+    // call (this is the hottest per-field lookup in the RC pause).
+    uint8_t* addr = (uint8_t*)&m_blockMeta[idx];
+    if (m_metaPageCommitted != nullptr)
+    {
+        size_t pg = (size_t)((uintptr_t)addr - (uintptr_t)m_blockMeta) / g_pageSize;
+        if (!(m_metaPageCommitted[pg >> 3] & (uint8_t)(1u << (pg & 7))))
+        {
+            uintptr_t page = (uintptr_t)addr & ~((uintptr_t)g_pageSize - 1);
+            VirtualAlloc((void*)page, g_pageSize, MEM_COMMIT, PAGE_READWRITE);
+            m_metaPageCommitted[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+        }
+    }
+    else
+    {
+        CommitPageFor(addr);
+    }
     return &m_blockMeta[idx];
 }
 
@@ -1424,6 +1451,23 @@ uint8_t* LXRCollector::RCSlot(Object* obj) const
     return &m_rcTable[idx];
 }
 
+// Commit the RC-table page backing `slot` lazily, but only once per page (a
+// per-page committed bit avoids a VirtualAlloc syscall on every RC op). Safe
+// under the parallel free cascade: the bit is set only AFTER the commit, so a
+// set bit always implies a committed page; a race merely re-commits (idempotent).
+void LXRCollector::EnsureRCPage(uint8_t* slot)
+{
+    if (m_rcPageCommitted == nullptr) { CommitPageFor(slot); return; }
+    size_t pg = (size_t)((uintptr_t)slot - (uintptr_t)m_rcTable) / g_pageSize;
+    if (pg >= m_rcPageCount) { CommitPageFor(slot); return; }
+    if (!(m_rcPageCommitted[pg >> 3] & (uint8_t)(1u << (pg & 7))))
+    {
+        uintptr_t page = (uintptr_t)slot & ~((uintptr_t)g_pageSize - 1);
+        VirtualAlloc((void*)page, g_pageSize, MEM_COMMIT, PAGE_READWRITE);
+        m_rcPageCommitted[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+    }
+}
+
 void LXRCollector::RCIncrement(Object* obj)
 {
     if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
@@ -1432,7 +1476,7 @@ void LXRCollector::RCIncrement(Object* obj)
     // object is an increment via the coalescing barrier / root deferral, and young
     // objects still at RC 0 at the RC pause are implicitly dead (CollectNursery).
     uint8_t* slot = RCSlot(obj);
-    CommitPageFor(slot);
+    EnsureRCPage(slot);
     if (*slot != 0xFF) // 0xFF is the "stuck / overflowed" sentinel
         (*slot)++;
     InterlockedIncrement64(&g_lxrCounters.RCIncrements);
@@ -1443,7 +1487,7 @@ bool LXRCollector::RCDecrement(Object* obj)
     if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
         return false;
     uint8_t* slot = RCSlot(obj);
-    CommitPageFor(slot);
+    EnsureRCPage(slot);
     InterlockedIncrement64(&g_lxrCounters.RCDecrements);
     if (*slot == 0 || *slot == 0xFF)
         return false; // already zero, or stuck-high (resolved by backup trace)
@@ -3474,7 +3518,7 @@ void LXRCollector::ApplyRCEpoch(std::vector<Object*>& incs, std::vector<Object*>
             if ((uint8_t*)o < m_heapBase || (uint8_t*)o >= m_heapBase + m_heapBytes) return;
             uintptr_t pg = (uintptr_t)RCSlot(o) & pmask;
             if (pages.insert(pg).second)
-                VirtualAlloc((void*)pg, g_pageSize, MEM_COMMIT, PAGE_READWRITE);
+                EnsureRCPage(RCSlot(o));
         };
         for (Object* o : incs) commit(o);
         for (Object* o : decs) commit(o);
@@ -3516,6 +3560,9 @@ void LXRCollector::ProcessModifiedBuffers()
     // referent and spuriously decrements transients, making RC imprecise. The map
     // keeps the FIRST old value per slot (append order == store order within a
     // thread), which is the t_n value; *slot (read under STW) is the t_{n+1} value.
+    static int s_pmbProf = (getenv("LXR_PMB_PROFILE") != nullptr) ? 1 : 0;
+    LARGE_INTEGER pf; QueryPerformanceCounter(&pf); LARGE_INTEGER pq; QueryPerformanceFrequency(&pq);
+    LARGE_INTEGER pt0 = pf, pt1, pt15, pt2, pt3, pt4, pt5;
     EnterCriticalSection(&m_collectLock);
     EnterCriticalSection(&g_buffersLock);
     std::unordered_map<Object**, Object*> coalesced;
@@ -3532,6 +3579,7 @@ void LXRCollector::ProcessModifiedBuffers()
             PushFreeModifiedBuffer(buf);
     }
     LeaveCriticalSection(&g_buffersLock);
+    QueryPerformanceCounter(&pt1); // coalesce done
     // Item D-copy: maintain the persistent "references to young" remembered set.
     // For every modified slot whose CURRENT value (read under STW) is a young
     // object, append the slot to g_dcopyModifiedSlots. This set is NOT cleared per
@@ -3562,6 +3610,7 @@ void LXRCollector::ProcessModifiedBuffers()
                 break; // overflow: set abandoned, D-copy full-walks until next trace
         }
     }
+    QueryPerformanceCounter(&pt15); // dcopy-capture done
     // Deferred-RC root capture (paper §3.2.1): scan the roots at this STW pause so
     // root-reachable mature objects are incremented now and decremented at the
     // next pause (m_rootDeferredPrev). This is what makes RC self-standing rather
@@ -3569,6 +3618,7 @@ void LXRCollector::ProcessModifiedBuffers()
     // Buffers is only ever called under SuspendEE (STW / concurrent-finish pause).
     std::vector<Object*> rootsNow;
     CaptureRoots(rootsNow);
+    QueryPerformanceCounter(&pt2); // dcopy-capture + roots done
     // Increments before decrements (paper B/§3.2.1): apply ALL increments of the
     // final referents first, so an object that gains a new reference this epoch is
     // never transiently driven to zero (and freed) by an earlier field's decrement.
@@ -3587,8 +3637,10 @@ void LXRCollector::ProcessModifiedBuffers()
         if (kv.second != nullptr) decs.push_back(kv.second); // first old value (t_n)
     for (Object* r : m_rootDeferredPrev) decs.push_back(r);  // deferred root decs
     ApplyRCEpoch(incs, decs);
+    QueryPerformanceCounter(&pt3); // apply-rc done
     m_rootDeferredPrev.swap(rootsNow);   // this epoch's roots -> next epoch's decs
     DrainZeroCountWorkList();
+    QueryPerformanceCounter(&pt4); // drain-zero done
     // Restore the unlogged-bit invariant for the next epoch: every set logged bit
     // must correspond to a currently-buffered field. On a modified-buffer overflow
     // some first-logs set a bit without leaving a buffer entry, so wholesale-clear;
@@ -3601,6 +3653,14 @@ void LXRCollector::ProcessModifiedBuffers()
             ClearLoggedBit(kv.first);
     LeaveCriticalSection(&m_collectLock);
     InterlockedExchange(&g_modifiedOverflow, 0);
+    QueryPerformanceCounter(&pt5); // clear-logged done
+    if (s_pmbProf)
+    {
+        auto us = [&](LARGE_INTEGER a, LARGE_INTEGER b){ return (long long)((b.QuadPart - a.QuadPart) * 1000000 / pq.QuadPart); };
+        fprintf(stderr, "LXRGC:   [pmb-prof] fields=%zu coalesce=%lldus dcopy=%lldus roots=%lldus applyrc=%lldus drainzero=%lldus clearlog=%lldus\n",
+                coalesced.size(), us(pt0,pt1), us(pt1,pt15), us(pt15,pt2), us(pt2,pt3), us(pt3,pt4), us(pt4,pt5));
+        fflush(stderr);
+    }
 }
 
 // #1 concurrent/lazy decrements - STW half. Detach every mutator's coalescing-RC
