@@ -4100,13 +4100,11 @@ void LXRCollector::SweepAndSelectDefrag()
                         parsedMarked, parsedTotal);
         }
 
-        // Decommit the page-aligned interior of the dead region (the <=1 page
-        // fringe at each end may hold a neighbor's object header, so leave it).
+        // Decommit the page-aligned interior of the dead region (deferred off-pause
+        // by ReclaimRegionMemory; the <=1 page fringe at each end may hold a
+        // neighbor's object header, so it leaves that in place).
         LARGE_INTEGER swD0; QueryPerformanceCounter(&swD0);
         swFreedRegions++;
-        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
-        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
-        c.Committed = false;
         // Reclaimed => RC 0. Clear this region's RC bytes so no stale count
         // survives into the decommitted range (a later decrement of a
         // pre-sweep-logged old value would otherwise resurrect a dangling
@@ -4114,36 +4112,7 @@ void LXRCollector::SweepAndSelectDefrag()
         // ever held objects/RC; beyond UsedEnd the RC table is already zero.
         ClearRCRange(c.Start, c.UsedEnd);
         ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
-        if (g_deferDecommit)
-        {
-            // Defer the (expensive, per-page) VirtualFree(MEM_DECOMMIT) syscall to
-            // OFF-PAUSE (DrainPendingDecommit after RestartEE). The region is now in
-            // limbo: Committed=false, RC/logged cleared, but NOT yet on g_freeChunks
-            // (so no allocator can reuse it) and NOT yet physically decommitted. This
-            // moves the dominant sweep cost (vfree ~94% of decommit) out of the STW
-            // pause -- and with it the rare O(freed-pages) sweep spike. The pending
-            // range's pages stay committed until the drain; a deferred RC decrement
-            // into it finds RC 0 (floored) and its committed page never faults.
-            g_pendingDecommit.push_back({ dbeg, dend });
-            g_pendingFreeChunks.push_back(i);
-        }
-        else
-        {
-            if (dend > dbeg)
-            {
-                VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-                InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
-                InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
-            }
-            if (g_freeChunkTop == g_freeChunkCap)
-            {
-                size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
-                size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
-                if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
-            }
-            if (g_freeChunkTop < g_freeChunkCap)
-                g_freeChunks[g_freeChunkTop++] = i;
-        }
+        ReclaimRegionMemory(i);
         { LARGE_INTEGER swD1; QueryPerformanceCounter(&swD1); swDecommitTicks += swD1.QuadPart - swD0.QuadPart; }
     }
     LeaveCriticalSection(&g_chunkLock);
@@ -4208,6 +4177,41 @@ void LXRCollector::DrainPendingDecommit()
     }
     LeaveCriticalSection(&g_chunkLock);
     g_pendingFreeChunks.clear();
+}
+
+int64_t LXRCollector::ReclaimRegionMemory(size_t chunkIndex)
+{
+    ChunkRegion& c = g_chunks[chunkIndex];
+    uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
+    uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
+    int64_t bytes = (dend > dbeg) ? (int64_t)(dend - dbeg) : 0;
+    c.Committed = false;
+    if (g_deferDecommit)
+    {
+        // Off-pause: record the range + chunk index; DrainPendingDecommit (after
+        // RestartEE) frees the pages and only THEN publishes the chunk to the
+        // reusable free list. The region is in limbo until then (pages committed,
+        // RC/log to be cleared by the caller, unreachable by the allocator), so a
+        // deferred RC decrement into it finds RC 0 and its page never faults.
+        if (dend > dbeg) g_pendingDecommit.push_back({ dbeg, dend });
+        g_pendingFreeChunks.push_back(chunkIndex);
+        return bytes;
+    }
+    if (dend > dbeg)
+    {
+        VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+        InterlockedExchangeAdd64(&m_reclaimedBytes, bytes);
+        InterlockedExchangeAdd64(&g_committedInUse, -bytes);
+    }
+    if (g_freeChunkTop == g_freeChunkCap)
+    {
+        size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
+        size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
+        if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
+    }
+    if (g_freeChunkTop < g_freeChunkCap)
+        g_freeChunks[g_freeChunkTop++] = chunkIndex;
+    return bytes;
 }
 
 void LXRCollector::SetEvacActive(bool active) { InterlockedExchange(&g_evacActive, active ? 1 : 0); }
@@ -4810,27 +4814,11 @@ void LXRCollector::Evacuate()
         ChunkRegion& c = g_chunks[idx];
         if (!c.Committed)
             continue;
-        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
-        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
-        if (dend > dbeg)
-        {
-            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
-            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
-        }
-        c.Committed = false;
         // Reclaimed => RC 0 (see the sweep decommit site). Bounded to the used
         // extent that actually held objects/RC.
         ClearRCRange(c.Start, c.UsedEnd);
         ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
-        if (g_freeChunkTop == g_freeChunkCap)
-        {
-            size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
-            size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
-            if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
-        }
-        if (g_freeChunkTop < g_freeChunkCap)
-            g_freeChunks[g_freeChunkTop++] = idx;
+        ReclaimRegionMemory(idx); // decommit deferred off-pause
     }
     LeaveCriticalSection(&g_chunkLock);
 
@@ -5415,17 +5403,8 @@ void LXRCollector::CollectNursery()
         if (anyLive)
             continue;
 
-        // Dead young region: decommit its page-aligned interior and recycle it.
-        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
-        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
-        if (dend > dbeg)
-        {
-            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
-            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
-            bytesReclaimed += (int64_t)(dend - dbeg);
-        }
-        c.Committed = false;
+        // Dead young region: reclaim its memory (decommit deferred off-pause by
+        // ReclaimRegionMemory) and recycle it. RC/log cleared in-pause.
         RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryPasses);
         // Reclaimed => RC 0. Young objects are now reference-counted, so clear
         // their RC bytes as the region is decommitted (mirrors the sweep decommit
@@ -5433,14 +5412,7 @@ void LXRCollector::CollectNursery()
         // wild decrement can never index a live-looking slot here.
         ClearRCRange(c.Start, c.UsedEnd);
         ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
-        if (g_freeChunkTop == g_freeChunkCap)
-        {
-            size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
-            size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
-            if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
-        }
-        if (g_freeChunkTop < g_freeChunkCap)
-            g_freeChunks[g_freeChunkTop++] = i;
+        bytesReclaimed += ReclaimRegionMemory(i);
         regionsReclaimed++;
     }
     LeaveCriticalSection(&g_chunkLock);
@@ -6017,27 +5989,10 @@ void LXRCollector::CopyYoungSurvivors()
         ChunkRegion& c = g_chunks[idx];
         if (!c.Committed)
             continue;
-        uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
-        uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
-        if (dend > dbeg)
-        {
-            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
-            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
-            bytesFreed += (int64_t)(dend - dbeg);
-        }
-        c.Committed = false;
         RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryCopyPasses);
         ClearRCRange(c.Start, c.UsedEnd);   // reclaimed => RC 0 (mirror the sweep decommit site)
         ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
-        if (g_freeChunkTop == g_freeChunkCap)
-        {
-            size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
-            size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
-            if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
-        }
-        if (g_freeChunkTop < g_freeChunkCap)
-            g_freeChunks[g_freeChunkTop++] = idx;
+        bytesFreed += ReclaimRegionMemory(idx); // decommit deferred off-pause
         regionsFreed++;
     }
     LeaveCriticalSection(&g_chunkLock);
@@ -6169,33 +6124,16 @@ void LXRCollector::ReclaimMatureByRC()
 
         if (wholeDead && !rooted)
         {
-            // Whole-region dead by RC: decommit its page-aligned interior + recycle
-            // it (mirrors the sweep / nursery decommit path). NO mark bits -- they
+            // Whole-region dead by RC: reclaim its memory (decommit deferred
+            // off-pause by ReclaimRegionMemory) + recycle it. NO mark bits -- they
             // are stale outside a trace window.
-            uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
-            uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
-            if (dend > dbeg)
-            {
-                VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-                InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
-                InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
-                bytesReclaimed += (int64_t)(dend - dbeg);
-            }
-            c.Committed = false;
             // Reclaimed => RC 0 invariant + reused range must start unlogged (same
             // as the sweep/nursery decommit sites; closes the decommit-vs-decrement
             // race together with DrainZeroCountWorkList's committed-VirtualQuery
             // guard).
             ClearRCRange(c.Start, c.UsedEnd);
             ClearLoggedRange(c.Start, c.UsedEnd);
-            if (g_freeChunkTop == g_freeChunkCap)
-            {
-                size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
-                size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
-                if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
-            }
-            if (g_freeChunkTop < g_freeChunkCap)
-                g_freeChunks[g_freeChunkTop++] = i;
+            bytesReclaimed += ReclaimRegionMemory(i);
             regionsReclaimed++;
         }
         else if (carve)

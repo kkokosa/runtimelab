@@ -184,6 +184,29 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28c** — **All RC-pause / trace-finish region reclamation decommit moved
+  OFF-PAUSE via a single shared `ReclaimRegionMemory` helper — closes the last
+  non-paper-faithful cost inside the D-copy young-survivor copy.** Profiling the
+  RC-pause young-survivor copy (`CopyYoungSurvivors`) showed `[rc-breakdown] copy`
+  ≈ 7–9 ms split as: memcpy of survivors ~2–3 ms (paper-faithful — LXR §3.3 copies/
+  promotes nursery survivors to defragment), fix-up ~1 ms, and **~3 ms of in-pause
+  `VirtualFree(MEM_DECOMMIT)`** of the emptied young source regions (`freed=250 /
+  ~31 MB` per pass). LXR reclaims memory **off the critical path**, so the in-pause
+  decommit is the non-faithful part. **Fix (GC-side):** introduced
+  `LXRCollector::ReclaimRegionMemory(chunkIndex)` — sets `Committed=false` then either
+  defers (`g_deferDecommit`, default-on → push range+index to `g_pendingDecommit`/
+  `g_pendingFreeChunks`, drained off-pause by `DrainPendingDecommit` after `RestartEE`)
+  or inlines the `VirtualFree` (opt-out). Converted **all 5** reclaim sites to it:
+  `SweepAndSelectDefrag`, `CollectNursery`, `CopyYoungSurvivors` step 5,
+  `ReclaimMatureByRC`, and `Evacuate` step 5 (the sweep site previously had this logic
+  inline; now shared). The off-pause invariant is preserved: a region reaches
+  `g_freeChunks` (allocator-reusable) ONLY after it is physically decommitted; between
+  reclaim and drain it is in limbo (Committed=false, RC/log cleared, pages still
+  committed, unreachable by the allocator). **Result:** typical `[rc-breakdown] copy`
+  **7–9 ms → ~6 ms** (remainder = root pinning + source selection + memcpy + fix-up,
+  all paper-faithful); `[verify-nursery-copy]`/`[verify-evac]` misses=0, trace
+  offenders=0, Errors=0 across 6/6 WebApi iters; A/B `LXR_DEFER_DECOMMIT=0` (inline
+  path) equivalent + clean.
 - **2026-07-28b** — **Evacuation fix-up VirtualQuery thrash fixed (~26× on worst
   pass; eliminates a multi-*second* outlier) — same class of bug as the D-copy fix.**
   After deferring sweep decommit, the trace-finish pause's remaining spike (~144–223 ms,

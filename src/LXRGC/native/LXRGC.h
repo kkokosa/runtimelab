@@ -374,6 +374,15 @@ public:
     // reusable free list (preserving "every free chunk is decommitted").
     void DrainPendingDecommit();
 
+    // Reclaim a fully-dead region's memory: mark it uncommitted and either DEFER
+    // its decommit off-pause (g_deferDecommit, default) or VirtualFree + recycle
+    // it inline. Shared by every reclamation site (sweep, evac, nursery-copy,
+    // CollectNursery, ReclaimMatureByRC) so the expensive VirtualFree(MEM_DECOMMIT)
+    // syscall stays OFF the STW pause uniformly. Caller must hold g_chunkLock and
+    // remains responsible for any ClearRCRange/ClearLoggedRange/RecordFreed*
+    // bookkeeping. Returns the byte size of the page-aligned decommit interior.
+    int64_t ReclaimRegionMemory(size_t chunkIndex);
+
 
     // Item D: young/nursery collection at an RC pause. Reclaims young (this-epoch)
     // regions proven dead by a bounded closure over roots + handles + the complete
