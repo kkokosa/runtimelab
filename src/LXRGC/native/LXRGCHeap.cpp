@@ -4288,6 +4288,7 @@ void LXRCollector::Evacuate()
     }
 
     // 1. Pin all root/handle referents (interior roots resolve to their base).
+    LARGE_INTEGER evPinFreq, evPin0, evPin1; QueryPerformanceFrequency(&evPinFreq); QueryPerformanceCounter(&evPin0);
     std::unordered_set<Object*> pinned;
     InterlockedExchange(&g_evacUnresolvedInterior, 0);
     g_evacPinned = &pinned;
@@ -4295,6 +4296,8 @@ void LXRCollector::Evacuate()
     g_theGCToCLR->GcScanRoots(&LXRPinRoot, 2, 2, &sc);
     g_evacPinned = nullptr;
     LXRGCHandleStore::ForEachLiveHandle(&LXRPinHandle, &pinned);
+    QueryPerformanceCounter(&evPin1);
+    if (verbose) { fprintf(stderr, "LXRGC: [evac-pin] roots+handles=%lldus pinned=%zu unresolvedInterior=%ld\n", (long long)((evPin1.QuadPart-evPin0.QuadPart)*1000000/evPinFreq.QuadPart), pinned.size(), (long)g_evacUnresolvedInterior); fflush(stderr); }
 
     // If any interior root could not be resolved, its target is unpinned and
     // roots are not fixed up; moving anything risks dangling that root byref.
@@ -4316,6 +4319,7 @@ void LXRCollector::Evacuate()
     struct EvacRegion { size_t index; uint8_t* start; uint8_t* usedEnd; };
     struct EvacCand { size_t index; uint8_t* start; uint8_t* usedEnd; int64_t live; int64_t total; };
     std::vector<EvacCand> cands;
+    LARGE_INTEGER evSelFreq, evSel0, evSel1; QueryPerformanceFrequency(&evSelFreq); QueryPerformanceCounter(&evSel0);
     EnterCriticalSection(&g_chunkLock);
     for (size_t i = 0; i < g_chunkCount; i++)
     {
@@ -4342,7 +4346,8 @@ void LXRCollector::Evacuate()
         cands.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
     }
     LeaveCriticalSection(&g_chunkLock);
-
+    QueryPerformanceCounter(&evSel1);
+    if (verbose) { fprintf(stderr, "LXRGC: [evac-select] scan=%lldus cands=%zu (of %zu regions)\n", (long long)((evSel1.QuadPart-evSel0.QuadPart)*1000000/evSelFreq.QuadPart), cands.size(), g_chunkCount); fflush(stderr); }
     // Lowest occupancy (live/total) first: a.live/a.total < b.live/b.total, via
     // cross-multiplication (all terms positive) to avoid floating point.
     std::sort(cands.begin(), cands.end(), [](const EvacCand& a, const EvacCand& b) {
@@ -4474,6 +4479,7 @@ void LXRCollector::Evacuate()
     //    this, interior byrefs into moved objects dangle -> NRE in runtime-async.
     std::sort(movedRanges.begin(), movedRanges.end(),
               [](const MovedRange& a, const MovedRange& b) { return a.oldStart < b.oldStart; });
+    LARGE_INTEGER evPhFreq, evCopyEnd; QueryPerformanceFrequency(&evPhFreq); QueryPerformanceCounter(&evCopyEnd);
     auto rebaseField = [&forwarding, &movedRanges](Object** f)
     {
         uint8_t* v = (uint8_t*)*f;
@@ -4573,6 +4579,7 @@ void LXRCollector::Evacuate()
                     }
                 });
         // (b) Incoming edges from non-moved referrers.
+        LARGE_INTEGER evB0; QueryPerformanceCounter(&evB0);
         if (s_persist)
         {
             // Persistent remset entries can point into a region freed since insert.
@@ -4590,6 +4597,16 @@ void LXRCollector::Evacuate()
                 }
                 return cqComm;
             };
+            // Gather the surviving (non-stale, not-inside-a-moved-source) remset
+            // slots, then SORT them by address before the committed-VirtualQuery
+            // replay. This is the same fix as D-copy 4b (commit 4a4b854): the
+            // slotCommitted guard caches a single MEMORY_BASIC_INFORMATION region,
+            // so scattered insertion-order slots thrash it to ONE VirtualQuery
+            // syscall each - the dominant trace-finish evac cost (measured ~145ms,
+            // pathologically up to tens of seconds on a large remset). Sorting
+            // clusters same-region slots so the cache hits: ~one syscall per
+            // distinct region. std::unique drops duplicate logs.
+            std::vector<Object**> liveSlots;
             EnterCriticalSection(&g_remsetLock);
             for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
             {
@@ -4607,12 +4624,21 @@ void LXRCollector::Evacuate()
                         if (sa >= mr.oldStart && sa < mr.oldEnd)
                             continue; // slot inside a moved source: handled by (a)
                     }
-                    if (!slotCommitted(slot))
-                        continue; // referrer region decommitted since insert
-                    rebaseField(slot);
+                    liveSlots.push_back(slot);
                 }
             }
             LeaveCriticalSection(&g_remsetLock);
+            // STW finish pause: mutators suspended, marker parked -> the remset is
+            // quiescent and the heap fields rebaseField touches are stable, so the
+            // committed-check + rebase can run outside g_remsetLock.
+            std::sort(liveSlots.begin(), liveSlots.end());
+            liveSlots.erase(std::unique(liveSlots.begin(), liveSlots.end()), liveSlots.end());
+            for (Object** slot : liveSlots)
+            {
+                if (!slotCommitted(slot))
+                    continue; // referrer region decommitted since insert
+                rebaseField(slot);
+            }
         }
         else
         {
@@ -4637,6 +4663,9 @@ void LXRCollector::Evacuate()
         }
         // (c) In-place survivors that share a 32 KiB Immix BLOCK with an evacuated
         //     object may hold INTRA-block references to objects that DID move.
+        LARGE_INTEGER evB1; QueryPerformanceCounter(&evB1);
+        static bool s_evacPhaseVerbose = getenv("LXR_VERBOSE") != nullptr;
+        if (s_evacPhaseVerbose) { fprintf(stderr, "LXRGC: [evac-fixup] b_remset=%lldus\n", (long long)((evB1.QuadPart-evB0.QuadPart)*1000000/evPhFreq.QuadPart)); fflush(stderr); }
         //     Evacuation is per-OBJECT and our regions are sub-block (the sweep
         //     carves a block into several regions), so a referrer can sit in a
         //     DIFFERENT region of the SAME block as a moved object - including an
@@ -4714,6 +4743,7 @@ void LXRCollector::Evacuate()
     // dangle when a later nursery-copy relocates the young target. Re-register each
     // evac copy's young out-edges at the copy's stable (mature) slot. At a
     // TracePause finish the subsequent epoch bump clears these again, harmlessly.
+    LARGE_INTEGER evFixupEnd; QueryPerformanceCounter(&evFixupEnd);
     if (g_dcopyCaptureModified && !g_dcopyRemsetOverflow)
     {
         for (const MovedRange& r : movedRanges)
@@ -4806,6 +4836,10 @@ void LXRCollector::Evacuate()
 
     if (verbose)
     {
+        LARGE_INTEGER evFreeEnd; QueryPerformanceCounter(&evFreeEnd);
+        auto usp = [&](LARGE_INTEGER a, LARGE_INTEGER b){ return (long long)((b.QuadPart-a.QuadPart)*1000000/evPhFreq.QuadPart); };
+        fprintf(stderr, "LXRGC: [evac-phases] copy=%lldus fixup=%lldus free+dcopy=%lldus\n",
+                usp(evSel1, evCopyEnd), usp(evCopyEnd, evFixupEnd), usp(evFixupEnd, evFreeEnd));
         fprintf(stderr, "LXRGC: [evac] regions=%zu moved=%lld bytes=%lld pinnedSkipped=%lld fieldsForwarded=%lld freed=%zu fixup=%s(scoped=%lld fullwalk=%lld)\n",
                 evac.size(), (long long)g_lxrCounters.EvacObjects, (long long)g_lxrCounters.EvacBytesCopied,
                 (long long)g_lxrCounters.EvacPinnedSkipped, (long long)g_lxrCounters.EvacFieldsForwarded,

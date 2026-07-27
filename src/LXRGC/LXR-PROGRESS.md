@@ -184,6 +184,24 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28b** — **Evacuation fix-up VirtualQuery thrash fixed (~26× on worst
+  pass; eliminates a multi-*second* outlier) — same class of bug as the D-copy fix.**
+  After deferring sweep decommit, the trace-finish pause's remaining spike (~144–223 ms,
+  pathologically up to tens of seconds) was localized with phase timers to
+  `Evacuate()` step 4b — the persistent remembered-set replay. Its `slotCommitted`
+  guard caches a single `MEMORY_BASIC_INFORMATION` region and VirtualQuery's any slot
+  outside it; the ~32 K remset entries are in scattered barrier-insertion order, so the
+  single-region cache thrashes to **one VirtualQuery syscall per slot** = the entire
+  145 ms (matching `b_remset≈fixup`). **Fix (GC-side):** gather the surviving
+  (non-stale, not-inside-a-moved-source) slots into a vector, `std::sort` by address +
+  `std::unique`, then run the committed-check + rebase in address order so the cache
+  hits (~one syscall per distinct region). The check/rebase is moved outside
+  `g_remsetLock` (safe: STW finish, mutators suspended, marker parked). **Result:**
+  worst-pass evac fix-up **145 ms → ~5.5 ms**; whole `Evacuate` **~144–223 ms → ~6–12 ms**;
+  `[verify-evac] misses=0/offenders=0` across all iters; 10/12 WebApi iters clean (the
+  2 failures are the pre-existing flaky AV — 1 post-`##RESULT##` teardown, 1 mid-run
+  after a clean evac). Also moved the sweep `VirtualFree(MEM_DECOMMIT)` off-pause
+  (2026-07-28 entry).
 - **2026-07-28** — **Trace-finish sweep decommit moved OFF-PAUSE; trace-finish
   pause dominator re-identified as Evacuate (not sweep).** After the D-copy fix the
   trace-finish STW pause became the largest remaining pause. Profiled it with a new
