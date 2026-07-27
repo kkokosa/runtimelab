@@ -7644,10 +7644,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             g_lxrCollector.CompactRemsets();
         LXRSetPhase("conc:restart-finish");
         LXRRestartEE();
+        QueryPerformanceCounter(&a1); // STW pause ends here — measure BEFORE off-pause decommit
         // Off-pause: physically decommit the regions the STW sweep deferred.
         g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
-        QueryPerformanceCounter(&a1);
         int64_t finMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
 
         pauseMicros = snapMicros + finMicros;
@@ -7780,10 +7780,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("stw:restart");
         if (suspended)
             LXRRestartEE();
+        QueryPerformanceCounter(&t1); // TRUE pause end: mutators run from here
         // Off-pause: physically decommit the regions the STW sweep deferred.
         g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
-        QueryPerformanceCounter(&t1);
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
     }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
