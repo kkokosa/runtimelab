@@ -1664,6 +1664,23 @@ void LXRCollector::ClearLoggedBit(Object** slot)
     *word &= ~(LONG)(1u << (granule & 31));
 }
 
+// Atomic variant of ClearLoggedBit for the parallel SnapshotModifiedBuffers detach:
+// multiple lanes clear bits belonging to disjoint SLOTS but potentially sharing a
+// 32-granule word, so the read-modify-write must be atomic. Mutators are suspended
+// during the snapshot, so no concurrent SET (TryFirstLogField) races this clear.
+void LXRCollector::ClearLoggedBitAtomic(Object** slot)
+{
+    uint8_t* p = (uint8_t*)slot;
+    if (p < m_heapBase || p >= m_heapBase + m_heapBytes)
+        return;
+    size_t granule = (size_t)(p - m_heapBase) / lxr::kObjectGranule;
+    size_t byteOff = granule >> 3;
+    if (byteOff >= m_loggedCommittedBytes)
+        return;
+    LONG* word = (LONG*)m_loggedTable + (granule >> 5);
+    InterlockedAnd(word, ~(LONG)(1u << (granule & 31)));
+}
+
 // Clear every logged bit covering [start, end). CRITICAL for young RC soundness:
 // when a region is reclaimed and its address range is later REUSED for a fresh
 // object, that object's field slots must start UNlogged so the coalescing barrier
@@ -3663,6 +3680,34 @@ void LXRCollector::ProcessModifiedBuffers()
     }
 }
 
+// Parallel detach worker for SnapshotModifiedBuffers: each lane processes a
+// disjoint subset of the registered buffers, writing its triples into the
+// pre-assigned g_rcSnapEntries slice [base, base+Count). The per-entry cost - the
+// scattered *slot read (t_{n+1}) and the logged-bit clear - is latency-bound, so
+// striping the buffers across the mark pool scales the huge-epoch snapshot cliff
+// down near-linearly. Mutators are suspended, so *slot is stable and the atomic
+// logged-bit clear only guards lane-vs-lane word sharing.
+struct SnapBufJob { ModifiedBuffer* buf; size_t base; };
+struct SnapBufCtx { SnapBufJob* jobs; size_t njobs; int clearBits; };
+static void SnapBufScanFn(int lane, int lanes, void* ctxp)
+{
+    SnapBufCtx* ctx = (SnapBufCtx*)ctxp;
+    for (size_t j = (size_t)lane; j < ctx->njobs; j += (size_t)lanes)
+    {
+        ModifiedBuffer* buf = ctx->jobs[j].buf;
+        size_t base = ctx->jobs[j].base;
+        for (size_t i = 0; i < buf->Count; i++)
+        {
+            Object** slot = buf->Entries[i].Slot;
+            g_rcSnapEntries[base + i].Slot = slot;
+            g_rcSnapEntries[base + i].OldValue = buf->Entries[i].OldValue;
+            g_rcSnapEntries[base + i].NewValue = *slot; // t_{n+1}, stable under STW
+            if (ctx->clearBits)
+                g_poolCollector->ClearLoggedBitAtomic(slot);
+        }
+    }
+}
+
 // #1 concurrent/lazy decrements - STW half. Detach every mutator's coalescing-RC
 // modified buffer into g_rcSnap*, capturing (oldValue, newValue=*slot) while the
 // mutators are stopped so both reads are stable, then reset each buffer so
@@ -3683,6 +3728,58 @@ void LXRCollector::SnapshotModifiedBuffers()
     // mutations - no longer produces a multi-second STW coalescing cliff. Repeated
     // writes to one slot appear as multiple triples all carrying the SAME *slot
     // (read once here), so off-pause coalescing (first old + this new) is exact.
+    //
+    // Parallel path: on a huge epoch the scattered per-entry *slot read + logged-
+    // bit clear dominate the pause; stripe the buffers across the mark pool. Gather
+    // the non-empty buffers, size g_rcSnapEntries once for the whole epoch, assign
+    // each buffer a disjoint output slice, then RunOnPool. Falls through to the
+    // original serial loop for small epochs / no pool.
+    static int s_parSnap = -1, s_parSnapMin = -1;
+    if (s_parSnap < 0)
+    {
+        const char* e = getenv("LXR_PARALLEL_SNAPBUF");
+        s_parSnap = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+        const char* m = getenv("LXR_PARALLEL_SNAPBUF_MIN");
+        s_parSnapMin = (m != nullptr) ? atoi(m) : 16384;    // entries threshold
+    }
+    size_t total = 0;
+    std::vector<SnapBufJob> jobs;
+    for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
+    {
+        if (buf->Count > 0) { jobs.push_back(SnapBufJob{ buf, 0 }); total += buf->Count; }
+    }
+    int snLanes = (s_parSnap && g_poolWorkers > 0 && (int64_t)total >= (int64_t)s_parSnapMin)
+                      ? (g_poolWorkers + 1) : 1;
+    bool didParallel = false;
+    if (snLanes > 1 && !jobs.empty())
+    {
+        size_t need = g_rcSnapCount + total;
+        if (need > g_rcSnapCap)
+        {
+            size_t newCap = g_rcSnapCap ? g_rcSnapCap : 4096;
+            while (newCap < need) newCap *= 2;
+            RCSnapshotEntry* grown = (RCSnapshotEntry*)realloc(
+                g_rcSnapEntries, newCap * sizeof(RCSnapshotEntry));
+            if (grown != nullptr) { g_rcSnapEntries = grown; g_rcSnapCap = newCap; }
+        }
+        if (g_rcSnapCount + total <= g_rcSnapCap) // capacity secured
+        {
+            size_t off = g_rcSnapCount;
+            for (SnapBufJob& jb : jobs) { jb.base = off; off += jb.buf->Count; }
+            g_rcSnapCount = off;
+            SnapBufCtx ctx{ jobs.data(), jobs.size(), g_modifiedOverflow ? 0 : 1 };
+            RunOnPool(snLanes, &SnapBufScanFn, &ctx);
+            for (SnapBufJob& jb : jobs)
+            {
+                ModifiedBuffer* buf = jb.buf;
+                buf->Count = 0;
+                if (buf->InUse == 0) PushFreeModifiedBuffer(buf);
+            }
+            didParallel = true;
+        }
+        // else: realloc failed -> fall through to serial (self-grows)
+    }
+    if (!didParallel)
     for (ModifiedBuffer* buf = g_registeredBuffers; buf != nullptr; buf = buf->NextRegistered)
     {
         bool hadData = buf->Count > 0;
@@ -4102,6 +4199,40 @@ static void LXRPromoteRootFinal(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint3
     g_lxrCollector.PushMark(o);
 }
 
+// Parallel allocate-black chunk parse (mirrors the mark pool striping): each lane
+// parses its stripe of chunks and collects the window-born (>= region snapshot
+// high-water) not-yet-marked objects into a lane-local vector. The parse is the
+// O(live-heap) cost; the mark-claim + push is deferred to a small serial merge.
+// STW finish, pool idle, marker parked -> plain IsMarked reads are race-free (each
+// object lives in exactly one chunk owned by one lane).
+struct AllocBlackCtx { std::vector<Object*>* laneOut; };
+static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
+{
+    AllocBlackCtx* ctx = (AllocBlackCtx*)ctxp;
+    std::vector<Object*>& out = ctx->laneOut[lane];
+    for (size_t i = (size_t)lane; i < g_chunkCount; i += (size_t)lanes)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed)
+            continue;
+        uint8_t* floor = c.Start;
+        if (i < g_snapChunkCount && g_snapUsedEnd != nullptr && i < g_snapUsedEnd->size())
+            floor = (*g_snapUsedEnd)[i];
+        uint8_t* usedEnd = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        uint8_t* p = c.Start;
+        while (p < usedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0)
+                break;
+            if (p >= floor && !g_poolCollector->IsMarked(o))
+                out.push_back(o);
+            p += sz;
+        }
+    }
+}
+
 // Called under the STW *finish* pause. Consumes residual SATB, finishes the
 // closure, then applies allocate-black: every object allocated since the
 // snapshot (at/above its region's snapshot high-water) is retained this cycle so
@@ -4138,6 +4269,32 @@ void LXRCollector::ConcurrentTraceFinish()
                                                   : (m_heapBase + m_heapBytes);
     EnsureMarkCommitted(highWater);
 
+    // Parallelize the O(live-heap) allocate-black parse across the mark pool: it
+    // walks every object in every committed region to find window-born ones, a
+    // dominant heavy-cycle trace-finish cost. g_chunks is stable in the STW finish
+    // (mutators suspended, no alloc/registration), so the parse needs no g_chunkLock;
+    // g_poolWorkers-gated, serial for a small heap (dispatch overhead) or no pool.
+    static int s_parAB = -1;
+    if (s_parAB < 0)
+    {
+        const char* e = getenv("LXR_PARALLEL_ALLOCBLACK");
+        s_parAB = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+    }
+    int abLanes = (s_parAB && g_poolWorkers > 0 && g_chunkCount >= 64) ? (g_poolWorkers + 1) : 1;
+    if (abLanes > 1)
+    {
+        std::vector<std::vector<Object*>> laneOut((size_t)abLanes);
+        AllocBlackCtx ctx{ laneOut.data() };
+        RunOnPool(abLanes, &AllocBlackScanFn, &ctx);
+        for (std::vector<Object*>& v : laneOut)
+            for (Object* o : v)
+            {
+                PushMark(o); // atomic-claims then pushes; serial here, so stack-safe
+                InterlockedIncrement64(&g_lxrCounters.ConcAllocBlack);
+            }
+    }
+    else
+    {
     EnterCriticalSection(&g_chunkLock);
     for (size_t i = 0; i < g_chunkCount; i++)
     {
@@ -4177,6 +4334,7 @@ void LXRCollector::ConcurrentTraceFinish()
         }
     }
     LeaveCriticalSection(&g_chunkLock);
+    }
 
     // Trace the transitive closure of every allocate-black object just pushed, so
     // their referents (incl. snapshot-era objects they solely reference) are marked.
@@ -4567,6 +4725,7 @@ static void LXRPinHandle(Object** ref, void* ctx)
 static int64_t g_evacCopyMicros = 0, g_evacFixupMicros = 0, g_evacFreeMicros = 0;
 static int64_t g_evac4aMicros = 0, g_evac4bRemsetMicros = 0;
 static int64_t g_evac4bReplayMicros = 0, g_evac4bSlots = 0;
+static int64_t g_evacPinMicros = 0, g_evacSelMicros = 0;
 // Interior/byref support: each moved object's old address range and new base, so a
 // heap byref/interior pointer landing INSIDE a moved object can be rebased.
 // File-scope so the parallel 4b replay fn (Evac4bFn) can reference it.
@@ -4695,6 +4854,69 @@ static void EvacReplayIncoming(std::vector<Object**>& slots,
     LARGE_INTEGER rp1; QueryPerformanceCounter(&rp1);
     g_evac4bReplayMicros = (long long)((rp1.QuadPart-rp0.QuadPart)*1000000/rpFreq.QuadPart);
 }
+// Parallel evac candidate-selection scan. Each lane parses its stripe of committed
+// regions computing live/total occupancy (the O(live-heap) cost), stamps the
+// region's DeadPctEstimate (distinct region per lane -> race-free), applies the
+// fragmentation / candidate-scope / unresolved-interior filters, and collects the
+// survivors into a lane-local vector. STW finish, pool idle, marker parked.
+struct EvacSelCand { size_t index; uint8_t* start; uint8_t* usedEnd; int64_t live; int64_t total; };
+struct EvacSelCtx
+{
+    std::vector<EvacSelCand>*  laneCands;
+    const std::vector<uint8_t*>* unresolvedInteriors;
+    int64_t                    fragPct;
+};
+static void EvacSelFn(int lane, int lanes, void* ctxp)
+{
+    EvacSelCtx* ctx = (EvacSelCtx*)ctxp;
+    std::vector<EvacSelCand>& out = ctx->laneCands[lane];
+    const std::vector<uint8_t*>& unresolvedInteriors = *ctx->unresolvedInteriors;
+    for (size_t i = (size_t)lane; i < g_chunkCount; i += (size_t)lanes)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.Owner != nullptr || c.UsedEnd <= c.Start)
+            continue;
+        size_t total = 0, live = 0;
+        uint8_t* p = c.Start;
+        bool parseOk = true;
+        while (p < c.UsedEnd)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) { parseOk = false; break; }
+            total += sz;
+            if (g_poolCollector->IsMarked(o)) live += sz;
+            p += sz;
+        }
+        if (!parseOk || total == 0 || live == 0 || live == total)
+        {
+            c.DeadPctEstimate = 0;
+            continue;
+        }
+        int64_t deadPct = (int64_t)((total - live) * 100 / total);
+        c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct);
+        if (deadPct < ctx->fragPct)
+            continue;
+        if (g_evacCandidateScope)
+        {
+            bool allCand = true;
+            for (uint8_t* q = c.Start; q < c.UsedEnd; q += CONTEXT_ALLOC_QUANTUM)
+                if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
+            if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
+            if (!allCand)
+                continue;
+        }
+        if (!unresolvedInteriors.empty())
+        {
+            bool pinnedByInterior = false;
+            for (uint8_t* it : unresolvedInteriors)
+                if (it >= c.Start && it <= c.UsedEnd) { pinnedByInterior = true; break; }
+            if (pinnedByInterior)
+                continue;
+        }
+        out.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
+    }
+}
 void LXRCollector::Evacuate()
 {
     if (g_lxrGCHeap == nullptr || g_theGCToCLR == nullptr)
@@ -4728,6 +4950,7 @@ void LXRCollector::Evacuate()
     g_evacUnresolvedInteriorList = nullptr;
     LXRGCHandleStore::ForEachLiveHandle(&LXRPinHandle, &pinned);
     QueryPerformanceCounter(&evPin1);
+    g_evacPinMicros = (long long)((evPin1.QuadPart-evPin0.QuadPart)*1000000/evPinFreq.QuadPart);
     if (verbose) { fprintf(stderr, "LXRGC: [evac-pin] roots+handles=%lldus pinned=%zu unresolvedInterior=%ld\n", (long long)((evPin1.QuadPart-evPin0.QuadPart)*1000000/evPinFreq.QuadPart), pinned.size(), (long)g_evacUnresolvedInterior); fflush(stderr); }
 
     // An unresolvable interior/byref root no longer aborts the whole pass: below,
@@ -4754,9 +4977,32 @@ void LXRCollector::Evacuate()
     //    so registering destination chunks (which may realloc g_chunks) cannot
     //    invalidate the source list; indices stay valid across realloc.
     struct EvacRegion { size_t index; uint8_t* start; uint8_t* usedEnd; };
-    struct EvacCand { size_t index; uint8_t* start; uint8_t* usedEnd; int64_t live; int64_t total; };
+    typedef EvacSelCand EvacCand; // file-scope type shared with EvacSelFn
     std::vector<EvacCand> cands;
     LARGE_INTEGER evSelFreq, evSel0, evSel1; QueryPerformanceFrequency(&evSelFreq); QueryPerformanceCounter(&evSel0);
+    // Parallelize the O(live-heap) occupancy scan across the mark pool (a dominant
+    // heavy-cycle finish cost). g_chunks is stable in the STW finish, so no
+    // g_chunkLock is needed; each lane stamps DeadPctEstimate on its own (distinct)
+    // regions and collects candidates into a lane-local vector, merged below.
+    static int s_parSel = -1;
+    if (s_parSel < 0)
+    {
+        const char* e = getenv("LXR_PARALLEL_EVAC_SELECT");
+        s_parSel = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+    }
+    int selLanes = (s_parSel && g_poolWorkers > 0 && g_chunkCount >= 64) ? (g_poolWorkers + 1) : 1;
+    if (selLanes > 1)
+    {
+        std::vector<std::vector<EvacSelCand>> laneCands((size_t)selLanes);
+        EvacSelCtx sctx{ laneCands.data(), &unresolvedInteriors, s_fragPct };
+        RunOnPool(selLanes, &EvacSelFn, &sctx);
+        size_t tot = 0; for (auto& v : laneCands) tot += v.size();
+        cands.reserve(tot);
+        for (auto& v : laneCands)
+            cands.insert(cands.end(), v.begin(), v.end());
+    }
+    else
+    {
     EnterCriticalSection(&g_chunkLock);
     for (size_t i = 0; i < g_chunkCount; i++)
     {
@@ -4816,7 +5062,9 @@ void LXRCollector::Evacuate()
         cands.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
     }
     LeaveCriticalSection(&g_chunkLock);
+    }
     QueryPerformanceCounter(&evSel1);
+    g_evacSelMicros = (long long)((evSel1.QuadPart-evSel0.QuadPart)*1000000/evSelFreq.QuadPart);
     if (verbose) { fprintf(stderr, "LXRGC: [evac-select] scan=%lldus cands=%zu (of %zu regions)\n", (long long)((evSel1.QuadPart-evSel0.QuadPart)*1000000/evSelFreq.QuadPart), cands.size(), g_chunkCount); fflush(stderr); }
     // Lowest occupancy (live/total) first: a.live/a.total < b.live/b.total, via
     // cross-multiplication (all terms positive) to avoid floating point.
@@ -7567,6 +7815,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         QueryPerformanceCounter(&t1);
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
         phase = LXRPhase::RCPause;   // account the snapshot epoch as an RC pause
+        {
+            static int s_sp = -1;
+            if (s_sp < 0) s_sp = (getenv("LXR_FINISH_PROFILE") != nullptr) ? 1 : 0;
+            if (s_sp) { fprintf(stderr, "LXRGC: [snap-prof] total=%lldus bufs=%lldus snap=%lldus\n", (long long)pauseMicros, (long long)((tb1.QuadPart-tb0.QuadPart)*1000000/freq.QuadPart), (long long)((tb2.QuadPart-tb1.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
+        }
         if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace snapshot (pause=%lldus)\n", (long long)pauseMicros); fflush(stderr); }
     }
     else if (meFinish)
@@ -7636,8 +7889,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 extern int64_t g_evacCopyMicros, g_evacFixupMicros, g_evacFreeMicros;
                 extern int64_t g_evac4aMicros, g_evac4bRemsetMicros;
                 extern int64_t g_evac4bReplayMicros, g_evac4bSlots;
-                fprintf(stderr, "LXRGC: [finish-prof] me total=%lldus closure=%lldus buffers=%lldus evac=%lldus(copy=%lld fix=%lld[4a=%lld 4bRS=%lld{gather=%lld replay=%lld n=%lld} 4bIntra=%lld] free=%lld) sweep+compact=%lldus\n",
+                extern int64_t g_evacPinMicros, g_evacSelMicros;
+                fprintf(stderr, "LXRGC: [finish-prof] me total=%lldus closure=%lldus buffers=%lldus evac=%lldus(pin=%lld sel=%lld copy=%lld fix=%lld[4a=%lld 4bRS=%lld{gather=%lld replay=%lld n=%lld} 4bIntra=%lld] free=%lld) sweep+compact=%lldus\n",
                         (long long)pauseMicros, us(tf0,tf1), us(tf1,tf2), us(tf2,tfEvac),
+                        (long long)g_evacPinMicros, (long long)g_evacSelMicros,
                         (long long)g_evacCopyMicros, (long long)g_evacFixupMicros,
                         (long long)g_evac4aMicros, (long long)g_evac4bRemsetMicros,
                         (long long)(g_evac4bRemsetMicros - g_evac4bReplayMicros), (long long)g_evac4bReplayMicros, (long long)g_evac4bSlots,
@@ -7924,6 +8179,14 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+    }
+    static int s_pauseTag = -1;
+    if (s_pauseTag < 0) s_pauseTag = (getenv("LXR_FINISH_PROFILE") != nullptr) ? 1 : 0;
+    if (s_pauseTag && pauseMicros > 0) {
+        const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
+            (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
+        fprintf(stderr, "LXRGC: [pause-tag] type=%s pause=%lldus\n", ptag, (long long)pauseMicros);
+        fflush(stderr);
     }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     // Pause-time telemetry (feeds GetTotalPauseDuration / GetLastGCPercentTimeInGC,

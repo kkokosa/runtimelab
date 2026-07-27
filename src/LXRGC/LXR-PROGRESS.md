@@ -184,6 +184,34 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28l** — **Parallelized the three O(heap)/O(epoch) STW pause scans
+  (allocate-black, evac-select, snapshot-buffer detach).** After 2026-07-28k reduced
+  the trace-finish evac fix-up, the residual max-pause offenders (identified with a
+  new `LXR_FINISH_PROFILE` `[pause-tag]` per-pause type print + `[snap-prof]`
+  breakdown, both captured AFTER `RestartEE`) were three genuinely O(heap)/O(epoch)
+  full-parse walks that ran serially inside the STW pause: **(a)** `ConcurrentTrace-
+  Finish`'s **allocate-black** scan (walks every object in every committed region to
+  mark window-born ones), **(b)** `Evacuate`'s **evac-select** occupancy scan (walks
+  every object to compute per-region live/total), and **(c)** `SnapshotModified-
+  Buffers`' **detach** (the scattered per-entry `*slot` read of t_{n+1} + logged-bit
+  clear over the whole epoch's mutations) — the last was THE max-pause driver, a
+  **17–21 ms** snapshot spike on survival-paced multi-epoch windows that accumulated
+  millions of modified-field entries. All three now stripe across the existing mark
+  pool (`RunOnPool`, `LXR_GC_THREADS`): `AllocBlackScanFn`/`EvacSelFn` collect into
+  lane-local vectors merged serially after join (`PushMark`/candidate-sort are not
+  thread-safe); `SnapBufScanFn` writes into pre-assigned disjoint `g_rcSnapEntries`
+  slices (buffers gathered + sized once up front) using an **atomic** logged-bit
+  clear (`ClearLoggedBitAtomic`, `InterlockedAnd` — lanes share 32-granule words).
+  Safe because the STW finish/snapshot suspends mutators + parks the marker, so
+  `g_chunks`/buffers are stable (no `g_chunkLock` needed), marks are atomic, and each
+  object/slot belongs to exactly one lane. Result: worst snapshot **20.8→~6–9 ms**
+  (`bufs` 17389→6064 µs), honest 8-iter WebApi medians **max 17.9→8.5 ms, total
+  53.3→41.8 ms** (the 18–21 ms bimodal spike eliminated; profiled measured-window max
+  ~4.7 ms). Soundness: 5/5 verify (3 parallel + 2 serial-fallback) `misses=0`/
+  `Errors=0`, A/B all-parallel-off equivalent. No runtime change. Envs
+  `LXR_PARALLEL_ALLOCBLACK`, `LXR_PARALLEL_EVAC_SELECT`, `LXR_PARALLEL_SNAPBUF`
+  (=0 off), `LXR_PARALLEL_SNAPBUF_MIN` (entries threshold, default 16384),
+  `LXR_FINISH_PROFILE` (adds `[pause-tag]`/`[snap-prof]`).
 - **2026-07-28k** — **Trace-finish evac fix-up reduction (incoming-edge remset
   replay).** Profiled the multi-epoch trace-finish (`meFinish`) STW pause with a new
   off-pause `LXR_FINISH_PROFILE` `[finish-prof]` print (captured AFTER `RestartEE`,
