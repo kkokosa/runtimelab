@@ -33,6 +33,13 @@ if (-not (Test-Path $dotnet)) { throw "net11 SDK not found at $dotnet" }
 $fw = Join-Path $RuntimeRepo "artifacts\bin\testhost\net11.0-windows-$Configuration-x64\shared\Microsoft.NETCore.App\11.0.0"
 if (-not (Test-Path $fw)) { throw "Custom testhost framework not found at $fw. Build the runtime first." }
 
+# The testhost's shared-framework coreclr.dll/clrjit.dll can lag behind a fresh
+# `coreclr` subset build (testhost is only refreshed by a full runtime build),
+# producing a coreclr/System.Private.CoreLib ABI mismatch that fatally crashes at
+# startup (InitHelpers/StaticsHelpers static-init AV). Overlay the newest
+# coreclr.dll/clrjit.dll from the coreclr artifacts dir on top of the framework.
+$coreclrBin = Join-Path $RuntimeRepo "artifacts\bin\coreclr\windows.x64.$Configuration"
+
 $gcDll = Join-Path $root "native\obj\$Configuration\LXRGC.dll"
 if (-not (Test-Path $gcDll)) { throw "LXRGC.dll not built. Run native\build.ps1 first." }
 
@@ -47,6 +54,14 @@ foreach ($sample in $Samples) {
 
     # Overlay the pluggable-barrier runtime over the stock self-contained one.
     Copy-Item "$fw\*.dll" $pub -Force
+    # ...then the freshest coreclr/clrjit + matching SPC from the coreclr build,
+    # so a lagging testhost cannot leave a mismatched coreclr next to a newer SPC.
+    if (Test-Path $coreclrBin) {
+        foreach ($f in "coreclr.dll", "clrjit.dll", "System.Private.CoreLib.dll") {
+            $src = Join-Path $coreclrBin $f
+            if (Test-Path $src) { Copy-Item $src $pub -Force }
+        }
+    }
     Copy-Item $gcDll $pub -Force
     Write-Host "overlaid custom runtime + LXRGC.dll into $sample\publish" -ForegroundColor Green
 }

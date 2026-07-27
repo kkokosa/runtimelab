@@ -184,6 +184,33 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28m** — **Precise per-pause STW latency measurement (paper-grade tail
+  latency), uniform across all three GCs.** The report's pause column was derived
+  from the 1Hz `dotnet-counters` "% time in GC" series, whose sampling missed LXR's
+  sub-5ms pauses entirely (they fell between samples → LXR read ~0). Replaced with
+  a real per-pause distribution: **(1)** the native GC, when `LXR_PAUSE_LOG` names a
+  file, appends one `type,micros` line per pause (QPC-timed, captured AFTER
+  `RestartEE` so the log write never inflates the pause; `LXRGCHeap.cpp` ~L8191).
+  **(2)** the WebApi sample hosts a `GcPauseCollector`: for the built-in GCs an
+  in-process `EventListener` on `Microsoft-Windows-DotNETRuntime` (GC keyword 0x1)
+  pairs `GCSuspendEEBegin_V1`→`GCRestartEEEnd_V1` to time each STW window exactly;
+  for LXRGC (which fires NO ETW/EventPipe GC events, and where attaching EventPipe
+  at startup risks the known hang) it reads `LXR_PAUSE_LOG` instead. Both paths emit
+  one flat `PauseSamplesMs` list in `##RESULT##`. **(3)** the harness sets a per-run
+  `LXR_PAUSE_LOG`, parses the samples into `PauseDistMsStats` (avg/p50/p90/p95/p99/
+  max/total/count via `Get-Percentile`), and the report renders headline
+  "Precise STW pause - max/p99/p50 (ms)" rows + a per-pause percentile bar chart.
+  Verified 15s WebApi canary ×3 modes: real non-zero LXR percentiles (count=20,
+  p50=2.05ms, max=22.73ms) vs Server (17 pauses, max 4.05ms) / Workstation (max
+  5.82ms) — an honest tail LXR must still drive down. Two harness robustness fixes
+  found while validating: **(i)** `build-samples.ps1` now re-overlays the freshest
+  `coreclr.dll`/`clrjit.dll`/`System.Private.CoreLib.dll` from
+  `artifacts\bin\coreclr` on top of the (potentially lagging) testhost framework —
+  a stale-coreclr/fresh-SPC ABI mismatch fatally crashed startup at
+  `WebApplication.CreateBuilder` (InitHelpers static-init AV). **(ii)** the per-run
+  pause-log path uses `Convert-Path` (not `[IO.Path]::GetFullPath`, which resolves
+  against the process `CurrentDirectory` PowerShell does not sync with its location).
+  No runtime change.
 - **2026-07-28l** — **Parallelized the three O(heap)/O(epoch) STW pause scans
   (allocate-black, evac-select, snapshot-buffer detach).** After 2026-07-28k reduced
   the trace-finish evac fix-up, the residual max-pause offenders (identified with a

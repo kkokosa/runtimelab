@@ -8188,6 +8188,29 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         fprintf(stderr, "LXRGC: [pause-tag] type=%s pause=%lldus\n", ptag, (long long)pauseMicros);
         fflush(stderr);
     }
+    // Exact per-pause distribution log (paper-grade latency data): when LXR_PAUSE_LOG
+    // names a file, append one "type,micros" line per pause (QPC-timed, captured
+    // AFTER RestartEE so the log write never inflates the pause). This is the LXR
+    // side of the cross-GC pause-distribution harness (the built-in GCs are captured
+    // in-process via a GC-event EventListener, which sees nothing for standalone LXR
+    // since it fires no ETW/EventPipe GC events). fflush per line so an Environment.
+    // Exit(0) teardown never loses samples; pauses are infrequent so the cost is nil.
+    if (pauseMicros > 0) {
+        static int s_pauseLogInit = 0;
+        static FILE* s_pauseLog = nullptr;
+        if (s_pauseLogInit == 0) {
+            s_pauseLogInit = 1;
+            const char* path = getenv("LXR_PAUSE_LOG");
+            if (path != nullptr && path[0] != '\0')
+                s_pauseLog = fopen(path, "w");
+        }
+        if (s_pauseLog != nullptr) {
+            const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
+                (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
+            fprintf(s_pauseLog, "%s,%lld\n", ptag, (long long)pauseMicros);
+            fflush(s_pauseLog);
+        }
+    }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     // Pause-time telemetry (feeds GetTotalPauseDuration / GetLastGCPercentTimeInGC,
     // consumed by the dotnet.gc.pause.time meter + "% Time in GC" EventCounter, and

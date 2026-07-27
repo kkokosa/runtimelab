@@ -204,7 +204,7 @@ $allScenarios = @(
 $gcModeDefs = @(
     [pscustomobject]@{ Id = "workstation"; DisplayName = "Workstation GC"; Env = @{ DOTNET_gcServer = "0" }; RemoveEnv = @("DOTNET_GCName") },
     [pscustomobject]@{ Id = "server";      DisplayName = "Server GC";      Env = @{ DOTNET_gcServer = "1" }; RemoveEnv = @("DOTNET_GCName") },
-    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_LINE_REUSE = "1"; LXR_CONC_DECREMENTS = "1"; LXR_YOUNG_RC = "1"; LXR_NURSERY = "1"; LXR_MULTIEPOCH = "1"; LXR_GC_THREADS = "16"; DOTNET_ReadyToRun = "0" }; RemoveEnv = @("DOTNET_gcServer") }
+    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_LINE_REUSE = "1"; LXR_CONC_DECREMENTS = "1"; LXR_YOUNG_RC = "1"; LXR_NURSERY = "1"; LXR_NURSERY_COPY = "1"; LXR_MULTIEPOCH = "1"; LXR_GC_THREADS = "16"; DOTNET_ReadyToRun = "0" }; RemoveEnv = @("DOTNET_gcServer") }
 )
 
 $scenarioMap = @{}
@@ -505,6 +505,20 @@ foreach ($scenarioId in $Scenarios) {
         $csvBase = Join-Path $rawDir $label
         $runStart = Get-Date
 
+        # Precise per-pause STW samples (ms). The webapi sample self-reports these
+        # in its ##RESULT## (built-in GCs via an in-process EventListener pairing
+        # GCSuspendEEBegin->GCRestartEEEnd; LXRGC via its LXR_PAUSE_LOG file, since
+        # it fires no GC events). Reset per run so a prior run's samples never leak.
+        $pauseSamplesMs = $null
+        # Per-run LXR pause log: the LXRGC native collector appends "type,micros"
+        # per pause here; the webapi app reads it back to fill PauseSamplesMs. MUST
+        # be absolute - the app runs with a different CWD (its publish dir), so a
+        # relative path would resolve differently for the native writer vs here.
+        # Convert-Path (not [IO.Path]::GetFullPath, which uses the process
+        # CurrentDirectory PowerShell does NOT keep in sync with its location).
+        $lxrPauseLog = Join-Path (Convert-Path $rawDir) "$label.pauselog"
+        if (Test-Path $lxrPauseLog) { Remove-Item $lxrPauseLog -Force -ErrorAction SilentlyContinue }
+
         try {
         switch ($scenario.Kind) {
             "console" {
@@ -533,10 +547,14 @@ foreach ($scenarioId in $Scenarios) {
                 $env2 = @{} + $gcMode.Env
                 $env2["LXRGC_BENCH_DURATION_SECONDS"] = "$DurationSeconds"
                 $env2["LXRGC_BENCH_LABEL"] = $label
+                # LXRGC self-reports each STW pause to this file (harmless for the
+                # built-in GCs, which use the in-process EventListener instead).
+                $env2["LXR_PAUSE_LOG"] = $lxrPauseLog
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "WebApi.exe") -WorkingDirectory $publishDir `
                     -Arguments "" -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs 3000
                 $resultJson = Get-ResultLineJson $run.StdOut
                 if (-not $resultJson) { Write-Host $run.StdOut; Write-Host $run.StdErr; throw "No ##RESULT## for $label" }
+                $pauseSamplesMs = @($resultJson.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $summary = [ordered]@{
                     OperationsTotal      = $resultJson.Operations
                     OpsPerSecondOverall  = $resultJson.OpsPerSecond
@@ -550,6 +568,8 @@ foreach ($scenarioId in $Scenarios) {
                     TotalCommittedBytes  = $resultJson.TotalCommittedBytes
                     GcName               = $resultJson.GcName
                     Errors               = $resultJson.Errors
+                    TotalPauseTimeMs     = $resultJson.TotalPauseTimeMs
+                    MaxPauseTimeMs       = $resultJson.MaxPauseTimeMs
                 }
                 $durationActual = $resultJson.DurationSeconds
             }
@@ -753,6 +773,25 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
         Write-Host ("  done in {0:N0}s wall (bench duration {1:N1}s), gen0/1/2={2}/{3}/{4}" -f `
             $elapsedWall.TotalSeconds, $durationActual, $summary.Gen0Collections, $summary.Gen1Collections, $summary.Gen2Collections)
 
+        # Exact per-pause STW distribution (see webapi GcPauseCollector): p50/p95/
+        # p99/max computed from every real pause, uniform across all three GCs. This
+        # is the authoritative pause metric; the 1Hz PauseTimeMsStats above is a
+        # coarse counter-derived fallback that misses LXR's sub-5ms pauses. Empty
+        # for scenarios that don't self-report per-pause samples.
+        $pauseDistVals = @($pauseSamplesMs | Where-Object { $_ -ne $null } | ForEach-Object { [double]$_ })
+        $pauseDistStats = if ($pauseDistVals.Count -gt 0) {
+            [ordered]@{
+                Avg   = ($pauseDistVals | Measure-Object -Average).Average
+                P50   = Get-Percentile $pauseDistVals 50
+                P90   = Get-Percentile $pauseDistVals 90
+                P95   = Get-Percentile $pauseDistVals 95
+                P99   = Get-Percentile $pauseDistVals 99
+                Max   = ($pauseDistVals | Measure-Object -Maximum).Maximum
+                Total = ($pauseDistVals | Measure-Object -Sum).Sum
+                Count = $pauseDistVals.Count
+            }
+        } else { $null }
+
         $allRuns += [pscustomobject]@{
             ScenarioId      = $scenario.Id
             ScenarioName    = $scenario.DisplayName
@@ -762,6 +801,7 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
             Summary         = $summary
             PauseTimePctStats = (Get-Stats $pauseVals)
             PauseTimeMsStats  = (Get-Stats $pauseMsVals)
+            PauseDistMsStats  = $pauseDistStats
             WorkingSetStats   = (Get-Stats $wsValsAll)
             AllocRateMBStats  = (Get-Stats $allocRateVals)
             OpsPerSecStats    = (Get-Stats $opsVals)
