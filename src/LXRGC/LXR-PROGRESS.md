@@ -184,6 +184,28 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28** — **Trace-finish sweep decommit moved OFF-PAUSE; trace-finish
+  pause dominator re-identified as Evacuate (not sweep).** After the D-copy fix the
+  trace-finish STW pause became the largest remaining pause. Profiled it with a new
+  `[sweep-breakdown]` timer (verbose-gated): the steady-state sweep (~5–7 ms) was
+  ~94 % `VirtualFree(MEM_DECOMMIT)` — a per-page-PTE syscall O(freed pages), and the
+  suspected source of a rare multi-hundred-ms spike. **Fix (GC-side, `LXR_DEFER_DECOMMIT`,
+  default ON):** the STW sweep now only marks a dead region reclaimed
+  (`Committed=false` + `ClearRCRange`/`ClearLoggedRange`, all cheap) and records its
+  page range + chunk index to pending lists; it does NOT `VirtualFree` and does NOT
+  publish the chunk to the reusable free list. A new `DrainPendingDecommit()` runs
+  **after `LXRRestartEE`** (off-pause, mutators live) at all three collection-driver
+  sites (meFinish, concurrent-finish, STW): it `VirtualFree`s each range, updates the
+  committed/reclaimed counters, then pushes the indices onto `g_freeChunks`. Invariant
+  preserved: a region is on `g_freeChunks` only *after* it is decommitted; limbo
+  regions (dead, pages still committed, not yet reusable) are unreachable by the
+  allocator, and their RC is already 0 so an off-pause deferred decrement into one
+  no-ops. **Result:** in-pause sweep dropped from ~5–7 ms (mostly decommit) to
+  **<2 ms**; `[verify-nursery-copy]/[verify-evac] misses=0/offenders=0` across all
+  iters; A/B `LXR_DEFER_DECOMMIT=0` equivalent + clean. **Key re-finding:** the
+  `finish breakdown` "sweep" timer actually spanned `Evacuate()`+sweep; splitting it
+  (`evac=` vs `sweep=`) showed the real trace-finish spike is **`Evacuate` (up to
+  ~144 ms)**, with sweep now <2 ms. Evacuate is the next pause target.
 - **2026-07-27** — **D-copy pause bottleneck root-caused & fixed (37× on worst
   pass); prior 4a-young attribution + the JIT-runtime-change plan REFUTED — no runtime
   change needed.** The 2026-07-24 entry blamed the ~68–97 ms RC pause on the 4a-young

@@ -368,6 +368,13 @@ public:
     // candidates for the next cycle (Immix defragmentation).
     void SweepAndSelectDefrag();
 
+    // Off-pause drain of deferred region decommits recorded by the STW sweep.
+    // Runs AFTER RestartEE: VirtualFree(MEM_DECOMMIT) each pending range, update
+    // committed/reclaimed counters, then push the freed chunk indices onto the
+    // reusable free list (preserving "every free chunk is decommitted").
+    void DrainPendingDecommit();
+
+
     // Item D: young/nursery collection at an RC pause. Reclaims young (this-epoch)
     // regions proven dead by a bounded closure over roots + handles + the complete
     // mature->young remembered set (item F) + young->young edges. Reclaim-only

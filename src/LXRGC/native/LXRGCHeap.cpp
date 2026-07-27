@@ -837,6 +837,21 @@ static size_t g_freeChunkTop = 0;
 static size_t g_freeChunkCap = 0;
 static CRITICAL_SECTION g_chunkLock;
 
+// Deferred (off-pause) decommit (LXR_DEFER_DECOMMIT, default ON). The sweep runs
+// under STW; the dominant sweep cost is VirtualFree(MEM_DECOMMIT) (~94% of the
+// decommit phase, O(freed pages), and the source of the rare multi-hundred-ms
+// sweep spike when a large dead area is reclaimed at once). Instead of freeing
+// pages inside the pause, the sweep records dead regions here (Committed=false,
+// RC/logged already cleared, but NOT yet on g_freeChunks so no allocator can
+// reuse them, and NOT yet physically decommitted). DrainPendingDecommit() runs
+// AFTER RestartEE (mutators live) to VirtualFree each range and THEN push the
+// index onto g_freeChunks -- preserving the invariant that every g_freeChunks
+// entry is decommitted. Serialized by the single-driver collection loop, so the
+// drain always completes before the next sweep.
+static int g_deferDecommit = 1;
+static std::vector<std::pair<uint8_t*, uint8_t*>> g_pendingDecommit;
+static std::vector<size_t> g_pendingFreeChunks;
+
 // Immix line reuse (LXR difference #2, LXR_LINE_REUSE): stack of region indices
 // that are FreeRun == reusable dead line-runs carved from retained regions by
 // the sweep. Popped by the allocator before it extends the heap watermark, so
@@ -3989,7 +4004,9 @@ void LXRCollector::SweepAndSelectDefrag()
     // some live objects are kept (LXR would evacuate/defragment them - future
     // work). Runs inside the same stop-the-world pause as BackupTrace so the
     // mark bits and region high-water marks are stable.
+    LARGE_INTEGER swPreLock, swPostLock; QueryPerformanceCounter(&swPreLock);
     EnterCriticalSection(&g_chunkLock);
+    QueryPerformanceCounter(&swPostLock);
     // Line reuse carves dead runs out of RETAINED regions on mark-authoritative
     // cycles only, when the line marks were populated this cycle and evacuation
     // (the alternative defragmentation strategy) is not running: on those cycles
@@ -4000,6 +4017,10 @@ void LXRCollector::SweepAndSelectDefrag()
                       (g_lineMarksValid != 0) && (g_evacActive == 0) &&
                       (g_conservativeKeepAliveThisCycle == 0);
     size_t sweepCount = g_chunkCount;
+    bool sweepVerbose = getenv("LXR_VERBOSE") != nullptr;
+    LARGE_INTEGER swFreq, swClk0; QueryPerformanceFrequency(&swFreq); QueryPerformanceCounter(&swClk0);
+    int64_t swLivenessTicks = 0, swCarveTicks = 0, swDecommitTicks = 0;
+    int64_t swLiveRegions = 0, swCarvedRegions = 0, swFreedRegions = 0;
     for (size_t i = 0; i < sweepCount; i++)
     {
         ChunkRegion& c = g_chunks[i];
@@ -4026,17 +4047,25 @@ void LXRCollector::SweepAndSelectDefrag()
         // ConcurrentQueue slot), so its region is kept without relying on the
         // (possibly incomplete) trace. Both tests are parse-free side-table
         // scans, so a misparse can never wrongly reclaim a live region.
+        LARGE_INTEGER swL0; QueryPerformanceCounter(&swL0);
         bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd) ||
                        (!g_traceCompleteThisCycle &&
                         (AnyRCNonZeroInRange(c.Start, c.UsedEnd) ||
                          IsYoung((Object*)c.Start)));
+        { LARGE_INTEGER swL1; QueryPerformanceCounter(&swL1); swLivenessTicks += swL1.QuadPart - swL0.QuadPart; }
         if (anyLive)
         {
             // Retained region: recover its dead line runs for reuse (Immix line
             // recycling). CarveFreeRuns may realloc g_chunks, so do not touch 'c'
             // afterwards - continue to the next index.
+            swLiveRegions++;
             if (carveLines)
+            {
+                LARGE_INTEGER swC0; QueryPerformanceCounter(&swC0);
                 CarveFreeRuns(i);
+                LARGE_INTEGER swC1; QueryPerformanceCounter(&swC1);
+                swCarveTicks += swC1.QuadPart - swC0.QuadPart; swCarvedRegions++;
+            }
             continue;
         }
 
@@ -4073,14 +4102,10 @@ void LXRCollector::SweepAndSelectDefrag()
 
         // Decommit the page-aligned interior of the dead region (the <=1 page
         // fringe at each end may hold a neighbor's object header, so leave it).
+        LARGE_INTEGER swD0; QueryPerformanceCounter(&swD0);
+        swFreedRegions++;
         uint8_t* dbeg = (uint8_t*)(((uintptr_t)c.Start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
         uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
-        if (dend > dbeg)
-        {
-            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-            InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
-            InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
-        }
         c.Committed = false;
         // Reclaimed => RC 0. Clear this region's RC bytes so no stale count
         // survives into the decommitted range (a later decrement of a
@@ -4089,6 +4114,89 @@ void LXRCollector::SweepAndSelectDefrag()
         // ever held objects/RC; beyond UsedEnd the RC table is already zero.
         ClearRCRange(c.Start, c.UsedEnd);
         ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
+        if (g_deferDecommit)
+        {
+            // Defer the (expensive, per-page) VirtualFree(MEM_DECOMMIT) syscall to
+            // OFF-PAUSE (DrainPendingDecommit after RestartEE). The region is now in
+            // limbo: Committed=false, RC/logged cleared, but NOT yet on g_freeChunks
+            // (so no allocator can reuse it) and NOT yet physically decommitted. This
+            // moves the dominant sweep cost (vfree ~94% of decommit) out of the STW
+            // pause -- and with it the rare O(freed-pages) sweep spike. The pending
+            // range's pages stay committed until the drain; a deferred RC decrement
+            // into it finds RC 0 (floored) and its committed page never faults.
+            g_pendingDecommit.push_back({ dbeg, dend });
+            g_pendingFreeChunks.push_back(i);
+        }
+        else
+        {
+            if (dend > dbeg)
+            {
+                VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+                InterlockedExchangeAdd64(&m_reclaimedBytes, (int64_t)(dend - dbeg));
+                InterlockedExchangeAdd64(&g_committedInUse, -(int64_t)(dend - dbeg));
+            }
+            if (g_freeChunkTop == g_freeChunkCap)
+            {
+                size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
+                size_t* grown = (size_t*)realloc(g_freeChunks, nc * sizeof(size_t));
+                if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
+            }
+            if (g_freeChunkTop < g_freeChunkCap)
+                g_freeChunks[g_freeChunkTop++] = i;
+        }
+        { LARGE_INTEGER swD1; QueryPerformanceCounter(&swD1); swDecommitTicks += swD1.QuadPart - swD0.QuadPart; }
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    if (sweepVerbose)
+    {
+        LARGE_INTEGER swClk1; QueryPerformanceCounter(&swClk1);
+        auto us = [&](int64_t t){ return (long long)(t * 1000000 / swFreq.QuadPart); };
+        fprintf(stderr, "LXRGC: [sweep-breakdown] total=%lldus lockwait=%lldus regions=%zu live=%lld carved=%lld freed=%lld | liveness=%lldus carve=%lldus decommit=%lldus deferred=%d pending=%zu chunkCountNow=%zu\n",
+                us(swClk1.QuadPart - swClk0.QuadPart), us(swPostLock.QuadPart - swPreLock.QuadPart), sweepCount,
+                (long long)swLiveRegions, (long long)swCarvedRegions, (long long)swFreedRegions,
+                us(swLivenessTicks), us(swCarveTicks), us(swDecommitTicks),
+                (int)g_deferDecommit, g_pendingDecommit.size(), g_chunkCount);
+        fflush(stderr);
+    }
+    if (carveLines && getenv("LXR_VERIFY_TRACE") != nullptr)
+        fprintf(stderr, "LXRGC: [sweep] line reuse: carved %lld run(s) / %lld MiB cumulative; freeRunStack=%llu\n",
+                (long long)g_carveRunsTotal, (long long)(g_carveBytesTotal >> 20),
+                (unsigned long long)g_freeRunTop);
+}
+
+// Off-pause drain of deferred region decommits (see g_deferDecommit). Called by
+// the collection driver after LXRRestartEE, while mutators run. Regions here are
+// in limbo (Committed=false, RC/logged cleared, NOT yet on g_freeChunks so the
+// allocator cannot hand them out, and their pages are still committed). We
+// VirtualFree each range, then publish the indices to g_freeChunks so they become
+// reusable -- preserving the invariant that every g_freeChunks entry is
+// decommitted. The single-driver collection loop serializes this against the next
+// sweep, so the pending vectors are drained before they can be re-populated.
+void LXRCollector::DrainPendingDecommit()
+{
+    if (g_pendingDecommit.empty() && g_pendingFreeChunks.empty())
+        return;
+    int64_t freedBytes = 0;
+    for (auto& r : g_pendingDecommit)
+    {
+        uint8_t* dbeg = r.first;
+        uint8_t* dend = r.second;
+        if (dend > dbeg)
+        {
+            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+            freedBytes += (int64_t)(dend - dbeg);
+        }
+    }
+    if (freedBytes != 0)
+    {
+        InterlockedExchangeAdd64(&m_reclaimedBytes, freedBytes);
+        InterlockedExchangeAdd64(&g_committedInUse, -freedBytes);
+    }
+    g_pendingDecommit.clear();
+
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t idx : g_pendingFreeChunks)
+    {
         if (g_freeChunkTop == g_freeChunkCap)
         {
             size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
@@ -4096,13 +4204,10 @@ void LXRCollector::SweepAndSelectDefrag()
             if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
         }
         if (g_freeChunkTop < g_freeChunkCap)
-            g_freeChunks[g_freeChunkTop++] = i;
+            g_freeChunks[g_freeChunkTop++] = idx;
     }
     LeaveCriticalSection(&g_chunkLock);
-    if (carveLines && getenv("LXR_VERIFY_TRACE") != nullptr)
-        fprintf(stderr, "LXRGC: [sweep] line reuse: carved %lld run(s) / %lld MiB cumulative; freeRunStack=%llu\n",
-                (long long)g_carveRunsTotal, (long long)(g_carveBytesTotal >> 20),
-                (unsigned long long)g_freeRunTop);
+    g_pendingFreeChunks.clear();
 }
 
 void LXRCollector::SetEvacActive(bool active) { InterlockedExchange(&g_evacActive, active ? 1 : 0); }
@@ -6205,6 +6310,10 @@ HRESULT LXRGCHeap::Initialize()
     }
     if (g_lineReuse < 0)
         g_lineReuse = (getenv("LXR_LINE_REUSE") != nullptr) ? 1 : 0;
+    {
+        const char* e = getenv("LXR_DEFER_DECOMMIT");
+        g_deferDecommit = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON
+    }
     if (g_lineReuseMinBytes == 0)
     {
         const char* e = getenv("LXR_LINE_MIN");
@@ -6837,11 +6946,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             LXRSetPhase("me:evacuate");
             g_lxrCollector.Evacuate();
         }
+        LARGE_INTEGER tfEvac; QueryPerformanceCounter(&tfEvac);
         LXRSetPhase("me:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
         QueryPerformanceCounter(&tf3);
-        if (verbose) { fprintf(stderr, "LXRGC: [stage]   finish breakdown: finish=%lldus bufs=%lldus sweep=%lldus\n", (long long)((tf1.QuadPart-tf0.QuadPart)*1000000/freq.QuadPart), (long long)((tf2.QuadPart-tf1.QuadPart)*1000000/freq.QuadPart), (long long)((tf3.QuadPart-tf2.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
+        if (verbose) { fprintf(stderr, "LXRGC: [stage]   finish breakdown: finish=%lldus bufs=%lldus evac=%lldus sweep=%lldus\n", (long long)((tf1.QuadPart-tf0.QuadPart)*1000000/freq.QuadPart), (long long)((tf2.QuadPart-tf1.QuadPart)*1000000/freq.QuadPart), (long long)((tfEvac.QuadPart-tf2.QuadPart)*1000000/freq.QuadPart), (long long)((tf3.QuadPart-tfEvac.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
         // Item F: PRUNE the persistent remembered set (drop stale/duplicate
         // entries; rebuild from marks on prior overflow) instead of clearing it -
         // clearing would drop the evac copies' just-recorded memcpy out-edges that
@@ -6868,6 +6978,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (doBuffers)
             g_lxrCollector.ProcessSnapshotDecrements();
         QueryPerformanceCounter(&td1);
+        // Off-pause: physically decommit the regions the STW sweep deferred (the
+        // dominant former in-pause cost). Mutators are live; limbo regions are not
+        // yet on the free list so the allocator can't hand them out mid-drain.
+        g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
         phase = LXRPhase::TracePause; // account the finish epoch as a trace pause
         if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace finish (pause=%lldus offpauseDec=%lldus spans=%lld)\n",
@@ -6967,6 +7081,8 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             g_lxrCollector.CompactRemsets();
         LXRSetPhase("conc:restart-finish");
         LXRRestartEE();
+        // Off-pause: physically decommit the regions the STW sweep deferred.
+        g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
         QueryPerformanceCounter(&a1);
         int64_t finMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
@@ -7101,6 +7217,8 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("stw:restart");
         if (suspended)
             LXRRestartEE();
+        // Off-pause: physically decommit the regions the STW sweep deferred.
+        g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
         QueryPerformanceCounter(&t1);
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
