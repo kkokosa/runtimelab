@@ -184,6 +184,30 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28h** — **Parallelized the D-copy young-survivor fix-up (STW pause
+  reduction).** Profiling the `[copy-breakdown] fixup` STW sub-cost (up to ~26 ms)
+  with new `LXR_VERBOSE` sub-timers (`[fixup-sub] 4a / 4a-young / 4b`) corrected an
+  earlier misattribution: the dominant cost is **step 4b** (the per-evacuation-region
+  remembered-set replay), NOT the 4a-young young-space rescan. 4b spends its time in
+  `SlotCommitted`'s per-slot `VirtualQuery` syscall on scattered, mostly-stale remset
+  entries (the set over-captures: ~4.7 K entries pruned to ~560; referrer regions get
+  decommitted, targets die/promote). Both scans are embarrassingly parallel — regions
+  / region-slot buckets are disjoint, `movedRanges`/`forwarding` are read-only, and no
+  two lanes write the same field — so both are now dispatched across the existing mark
+  worker pool via `RunOnPool`: **(4a-young)** snapshot the young-region `[start,cend)`
+  ranges under `g_chunkLock`, release it (avoids a `g_chunkLock→g_poolLock` inversion),
+  then stride regions across lanes (`DCopy4aYoungFn`, each lane a private `DCopyFixupCtx`,
+  per-lane forwarded counts merged back). **(4b)** gather the deduped set of region-slot
+  bucket indices covered by the evacuated regions and stride them across lanes
+  (`DCopy4bFn`, per-lane private VirtualQuery cache + forwarded + remset-prune-delta,
+  merged after). Gated on `g_poolWorkers>0` and a ≥16-region/bucket threshold, else a
+  single inline lane. Result (16 threads, WebApi full config): **4a-young ~26 ms→<0.6 ms;
+  4b ~16 ms→~5.5 ms** (VirtualQuery latency overlaps but caps at ~3× on the kernel VAD
+  lock); whole fixup ~26 ms→~6 ms worst; `PauseTimePercentage` 9→1. Verified sound:
+  3/3 WebApi + ConsoleApp iters `[verify-nursery-copy]/[verify-evac] misses=0`,
+  `Errors=0`, no `PARITY-FALLBACK`, throughput ~250 ops/s unchanged; A/B
+  `LXR_DCOPY_PARALLEL_4AYOUNG=0`/`LXR_DCOPY_PARALLEL_4B=0` serial path equivalent + clean.
+  Both flags default-ON. No runtime change.
 - **2026-07-28g** — **GC metric/pause-telemetry fidelity fixes (3 concerns raised
   from the smoke run).** (a) **`GC.GetTotalAllocatedBytes` was under-reporting ~80x**
   (ASP.NET Core showed ~690 KB where Workstation/Server GC saw ~55 MB). Root cause:

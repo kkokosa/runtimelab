@@ -5861,6 +5861,114 @@ struct DCopyFixupCtx
 };
 static DCopyFixupCtx* g_dcopyFixup = nullptr;
 
+// Parallel 4a-young fix-up: the young-space rescan (rebase the out-edges of every
+// live young object so young->young edges to moved survivors are corrected) is the
+// dominant D-copy STW sub-cost (~O(young space); ~26 ms with ~500 young regions),
+// because the JIT elides the write barrier on young->young init stores so these
+// edges are in no remembered set and MUST be found by scanning. The scan is
+// embarrassingly parallel: regions are disjoint, movedRanges/forwarding are read
+// only, and two lanes never write the same field. Each lane owns a private
+// DCopyFixupCtx and strides the snapshotted young-region list.
+struct DCopy4aYoungCtx
+{
+    std::vector<std::pair<uint8_t*, uint8_t*>>* regions;   // snapshot [start, cend)
+    std::unordered_map<Object*, Object*>*       forwarding;
+    std::vector<DCopyMovedRange>*               movedRanges; // sorted by oldStart
+    int64_t*                                    laneForwarded; // [lanes], merged after
+};
+static void DCopy4aYoungFn(int lane, int lanes, void* ctxp)
+{
+    DCopy4aYoungCtx* ctx = (DCopy4aYoungCtx*)ctxp;
+    DCopyFixupCtx fx;
+    fx.forwarding = ctx->forwarding;
+    fx.movedRanges = ctx->movedRanges;
+    auto rebaseField = [&fx](Object** f) { fx.Rebase(f); };
+    const std::vector<std::pair<uint8_t*, uint8_t*>>& regions = *ctx->regions;
+    for (size_t i = (size_t)lane; i < regions.size(); i += (size_t)lanes)
+    {
+        uint8_t* p = regions[i].first;
+        uint8_t* cend = regions[i].second;
+        while (p < cend)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            p += sz;
+            if (fx.IsMovedSource(o))
+                continue; // relocated source granule (dead): copy scanned by 4a
+            GCScanObjectRefs(o, sz, rebaseField);
+        }
+    }
+    ctx->laneForwarded[lane] = fx.forwarded;
+}
+
+// Parallel 4b fix-up: replay the per-evacuation-region remembered set (mature->young
+// incoming edges). This is the dominant D-copy sub-cost because SlotCommitted() issues
+// a VirtualQuery syscall per scattered stale slot (the remset over-captures: most
+// entries name referrers whose region was decommitted since, or targets that have
+// since died/promoted, and are pruned). Buckets keyed by distinct region-slots are
+// disjoint, so lanes striding a deduped bucket-index list never touch the same bucket
+// (and thus never the same slot); each lane owns a private VirtualQuery cache + counters.
+struct DCopy4bCtx
+{
+    std::vector<size_t>*                  bucketIdx;    // deduped region-slot indices to replay
+    std::unordered_map<Object*, Object*>* forwarding;
+    std::vector<DCopyMovedRange>*         movedRanges;  // sorted by oldStart
+    int64_t*                              laneForwarded;
+    int64_t*                              laneRemsetDelta; // entries pruned per lane
+};
+static void DCopy4bFn(int lane, int lanes, void* ctxp)
+{
+    DCopy4bCtx* ctx = (DCopy4bCtx*)ctxp;
+    DCopyFixupCtx fx;
+    fx.forwarding = ctx->forwarding;
+    fx.movedRanges = ctx->movedRanges;
+    int64_t delta = 0;
+    const std::vector<size_t>& idx = *ctx->bucketIdx;
+    for (size_t k = (size_t)lane; k < idx.size(); k += (size_t)lanes)
+    {
+        std::vector<Object**>& bucket = g_dcopyRemsetBuckets[idx[k]];
+        if (bucket.empty())
+            continue;
+        size_t before = bucket.size();
+        std::sort(bucket.begin(), bucket.end());
+        bucket.erase(std::unique(bucket.begin(), bucket.end()), bucket.end());
+        size_t keepW = 0;
+        for (Object** slot : bucket)
+        {
+            uint8_t* sa = (uint8_t*)slot;
+            // (i) Slot inside a moved source region: relocated (its copy's out-edges
+            //     are fixed by 4a) and the source region is freed after this pass. Drop.
+            if (!fx.movedRanges->empty())
+            {
+                size_t lo = 0, hi = fx.movedRanges->size();
+                while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx.movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                if (lo != 0)
+                {
+                    const DCopyMovedRange& mr = (*fx.movedRanges)[lo - 1];
+                    if (sa >= mr.oldStart && sa < mr.oldEnd)
+                        continue;
+                }
+            }
+            // (ii) Referrer region decommitted: the slot's own page is gone. Drop.
+            if (!fx.SlotCommitted(slot))
+                continue;
+            // (iii) Redirect any reference into a moved source to its new home.
+            fx.Rebase(slot);
+            // (iv) PRUNE: keep only entries still naming a movable young target
+            //      (may be copied in a later budget-limited pass). IsYoung() also
+            //      bounds-checks, so a non-heap/non-young value is dropped.
+            Object* cur = *slot;
+            if (cur != nullptr && g_poolCollector->IsYoung(cur))
+                bucket[keepW++] = slot;
+        }
+        bucket.resize(keepW);
+        delta += (int64_t)(before - keepW);
+    }
+    ctx->laneForwarded[lane] = fx.forwarded;
+    ctx->laneRemsetDelta[lane] = delta;
+}
+
 void LXRCollector::CopyYoungSurvivors()
 {
     static int s_enabled = -1;
@@ -6126,6 +6234,7 @@ void LXRCollector::CopyYoungSurvivors()
                           g_dcopyRemsetOverflow ? "D-copy old->young remset exceeded its cap"
                                                 : "D-copy modified-slot capture unavailable");
 
+    LARGE_INTEGER clkSub4a{}, clkSub4ay{};
     if (useScoped)
     {
         // 4a. Outgoing edges of moved survivors: scan each destination copy. This
@@ -6134,6 +6243,7 @@ void LXRCollector::CopyYoungSurvivors()
         //     inside a moved range). Bounded by the moved live bytes.
         for (const DCopyMovedRange& r : movedRanges)
             GCScanObjectRefs((Object*)r.newStart, (size_t)(r.oldEnd - r.oldStart), rebaseField);
+        QueryPerformanceCounter(&clkSub4a);
         // 4a-young. Young->young incoming edges are NOT in the remembered set: the
         //     JIT elides the write barrier on stores that initialize a freshly-
         //     allocated (nursery) object, since an intra-generational young->young
@@ -6143,32 +6253,49 @@ void LXRCollector::CopyYoungSurvivors()
         //     -- the retired sources' kept-in-place survivors AND the active alloc
         //     chunks (up to alloc_ptr) -- skipping relocated sources (their mature
         //     copies are covered by 4a) and our mature dest chunks (IsYoung false).
+        //
+        //     Snapshot the young-region [start, cend) ranges under the chunk lock,
+        //     then rebase in parallel across the mark worker pool (the scan is
+        //     region-disjoint and read-only except for the fields it rewrites). The
+        //     lock is released BEFORE RunOnPool (which takes g_poolLock) to avoid a
+        //     g_chunkLock->g_poolLock ordering; g_chunks is stable here anyway (no
+        //     allocation/registration happens during fix-up under STW).
         {
-            EnterCriticalSection(&g_chunkLock);
             static int s_no4aYoung = (getenv("LXR_DCOPY_NO_4AYOUNG") != nullptr) ? 1 : 0;
-            size_t nregions = s_no4aYoung ? 0 : g_chunkCount;
-            for (size_t i = 0; i < nregions; i++)
+            static int s_par4a = -1;
+            if (s_par4a < 0)
             {
-                ChunkRegion& c = g_chunks[i];
-                if (!c.Committed || c.FreeRun || c.UsedEnd <= c.Start)
-                    continue;
-                if (!IsYoung((Object*)c.Start))
-                    continue; // mature (incl. this pass's promotion dests): via 4a/4b
-                uint8_t* cend = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-                uint8_t* p = c.Start;
-                while (p < cend)
-                {
-                    Object* o = (Object*)p;
-                    size_t sz = LXRObjectSize(o);
-                    if (sz == 0) break;
-                    p += sz;
-                    if (fx.IsMovedSource(o))
-                        continue; // relocated source granule (dead): copy scanned by 4a
-                    GCScanObjectRefs(o, sz, rebaseField);
-                }
+                const char* e = getenv("LXR_DCOPY_PARALLEL_4AYOUNG");
+                s_par4a = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
             }
-            LeaveCriticalSection(&g_chunkLock);
+            std::vector<std::pair<uint8_t*, uint8_t*>> youngRegions;
+            if (!s_no4aYoung)
+            {
+                EnterCriticalSection(&g_chunkLock);
+                youngRegions.reserve(g_chunkCount);
+                for (size_t i = 0; i < g_chunkCount; i++)
+                {
+                    ChunkRegion& c = g_chunks[i];
+                    if (!c.Committed || c.FreeRun || c.UsedEnd <= c.Start)
+                        continue;
+                    if (!IsYoung((Object*)c.Start))
+                        continue; // mature (incl. this pass's promotion dests): via 4a/4b
+                    uint8_t* cend = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+                    youngRegions.push_back({ c.Start, cend });
+                }
+                LeaveCriticalSection(&g_chunkLock);
+            }
+            // Parallelize only when the pool exists and there is enough work to
+            // amortize the wake/join; otherwise a single lane runs inline.
+            int lanes = (s_par4a && g_poolWorkers > 0 && youngRegions.size() >= 16)
+                            ? (g_poolWorkers + 1) : 1;
+            std::vector<int64_t> laneForwarded((size_t)lanes, 0);
+            DCopy4aYoungCtx yctx{ &youngRegions, &forwarding, &movedRanges, laneForwarded.data() };
+            RunOnPool(lanes, &DCopy4aYoungFn, &yctx);
+            for (int l = 0; l < lanes; l++)
+                fx.forwarded += laneForwarded[(size_t)l];
         }
+        QueryPerformanceCounter(&clkSub4ay);
         // 4b. Incoming edges from MATURE referrers, replayed PER EVACUATED REGION.
         //     The paper (§3.3) keeps a per-evacuation-BLOCK remembered set and, at
         //     evacuation time, processes only the remsets of the blocks in the
@@ -6189,64 +6316,52 @@ void LXRCollector::CopyYoungSurvivors()
         //     single-region VirtualQuery cache locality) and replay+prune as the
         //     former flat set, so stale entries (target promoted/died) are dropped
         //     and steady-state buckets stay small.
-        g_dcopyFixup = &fx;
-        auto replayBucket = [&](std::vector<Object**>& bucket)
-        {
-            if (bucket.empty())
-                return;
-            size_t before = bucket.size();
-            std::sort(bucket.begin(), bucket.end());
-            bucket.erase(std::unique(bucket.begin(), bucket.end()), bucket.end());
-            size_t keepW = 0;
-            for (Object** slot : bucket)
-            {
-                uint8_t* sa = (uint8_t*)slot;
-                // (i) Slot inside a moved source region: its container is relocated
-                //     (its copy's out-edges are fixed by 4a) and the source region
-                //     is freed after this pass -- the slot address itself dies. Drop.
-                if (!fx.movedRanges->empty())
-                {
-                    size_t lo = 0, hi = fx.movedRanges->size();
-                    while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx.movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
-                    if (lo != 0)
-                    {
-                        const DCopyMovedRange& mr = (*fx.movedRanges)[lo - 1];
-                        if (sa >= mr.oldStart && sa < mr.oldEnd)
-                            continue; // drop: handled by 4a, source region reclaimed
-                    }
-                }
-                // (ii) Referrer region freed by an earlier RC pause / this pass's
-                //      zero-count cascade: the slot's own page is gone. Drop it.
-                if (!fx.SlotCommitted(slot))
-                    continue;
-                // (iii) Redirect any reference into a moved source to its new home.
-                fx.Rebase(slot);
-                // (iv) PRUNE: keep only entries that still name a movable young
-                //      target (it may be copied in a LATER budget-limited pass).
-                //      Soundness: a field dropped here has a non-young current value;
-                //      any later store making it point at a young object re-logs it
-                //      (coalescing bit cleared when its buffer was processed), so it
-                //      is re-captured -- no live mature->young edge is lost.
-                Object* cur = *slot;
-                if (cur != nullptr && (uint8_t*)cur >= m_heapBase && (uint8_t*)cur < m_heapBase + m_heapBytes && IsYoung(cur))
-                    bucket[keepW++] = slot;
-            }
-            bucket.resize(keepW);
-            g_dcopyRemsetCount -= (before - keepW);
-        };
+        //
+        //     The replay is parallelized across the mark worker pool: gather the
+        //     deduped set of region-slot bucket indices covered by the evacuated
+        //     regions, then stride them across lanes. Buckets are disjoint per
+        //     region-slot so no two lanes touch the same bucket/slot; SlotCommitted
+        //     VirtualQuery latency (the dominant cost on scattered stale entries)
+        //     overlaps across threads.
         if (!g_dcopyRemsetBuckets.empty())
         {
             size_t nbuckets = g_dcopyRemsetBuckets.size();
+            std::vector<size_t> bucketIdx;
+            bucketIdx.reserve(evacuatedSrcs.size());
             for (const SrcRegion& sr : evacuatedSrcs)
             {
                 size_t rs0 = (size_t)(sr.start - m_heapBase) / CONTEXT_ALLOC_QUANTUM;
                 size_t rs1 = (size_t)((sr.usedEnd - 1) - m_heapBase) / CONTEXT_ALLOC_QUANTUM;
                 if (rs1 >= nbuckets) rs1 = nbuckets - 1;
                 for (size_t rs = rs0; rs <= rs1; rs++)
-                    replayBucket(g_dcopyRemsetBuckets[rs]);
+                    if (!g_dcopyRemsetBuckets[rs].empty())
+                        bucketIdx.push_back(rs);
             }
+            // Dedup: two sub-region evacuees can share a 128KB region-slot; a shared
+            // bucket must be processed by exactly one lane (else double prune/rebase).
+            std::sort(bucketIdx.begin(), bucketIdx.end());
+            bucketIdx.erase(std::unique(bucketIdx.begin(), bucketIdx.end()), bucketIdx.end());
+
+            static int s_par4b = -1;
+            if (s_par4b < 0)
+            {
+                const char* e = getenv("LXR_DCOPY_PARALLEL_4B");
+                s_par4b = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+            }
+            int lanes = (s_par4b && g_poolWorkers > 0 && bucketIdx.size() >= 16)
+                            ? (g_poolWorkers + 1) : 1;
+            std::vector<int64_t> laneForwarded((size_t)lanes, 0), laneDelta((size_t)lanes, 0);
+            DCopy4bCtx bctx{ &bucketIdx, &forwarding, &movedRanges, laneForwarded.data(), laneDelta.data() };
+            RunOnPool(lanes, &DCopy4bFn, &bctx);
+            for (int l = 0; l < lanes; l++)
+            {
+                fx.forwarded += laneForwarded[(size_t)l];
+                g_dcopyRemsetCount -= laneDelta[(size_t)l];
+            }
+            if (verbose)
+                fprintf(stderr, "LXRGC:   [4b-detail] evacSrcs=%zu buckets=%zu lanes=%d nbuckets=%zu\n",
+                        evacuatedSrcs.size(), bucketIdx.size(), lanes, nbuckets);
         }
-        g_dcopyFixup = nullptr;
     }
     else
     {
@@ -6278,6 +6393,11 @@ void LXRCollector::CopyYoungSurvivors()
                 (long long)((clkAfterCopy.QuadPart - clk0.QuadPart) * 1000000 / clkFreq.QuadPart),
                 (long long)((clkAfterFixup.QuadPart - clkAfterCopy.QuadPart) * 1000000 / clkFreq.QuadPart),
                 (int)useScoped, g_dcopyRemsetCount, evacuatedSrcs.size(), srcs.size());
+        if (useScoped)
+            fprintf(stderr, "LXRGC:   [fixup-sub] 4a=%lldus 4a-young=%lldus 4b=%lldus\n",
+                    (long long)((clkSub4a.QuadPart - clkAfterCopy.QuadPart) * 1000000 / clkFreq.QuadPart),
+                    (long long)((clkSub4ay.QuadPart - clkSub4a.QuadPart) * 1000000 / clkFreq.QuadPart),
+                    (long long)((clkAfterFixup.QuadPart - clkSub4ay.QuadPart) * 1000000 / clkFreq.QuadPart));
         fflush(stderr);
     }
 
