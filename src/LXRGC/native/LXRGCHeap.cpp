@@ -303,6 +303,58 @@ static volatile LONG g_remsetActive = 0; // logging gate: open while evacuation 
 static volatile LONG g_remsetOverflow = 0;
 static volatile LONG g_evacActive = 0;   // STW evacuation gate (P3)
 
+// --- Item F (paper §3.3): candidate-scoped evacuation remembered set ---------
+// The paper's per-block remembered sets record only inter-block edges whose
+// TARGET is an evacuation CANDIDATE selected at the start of the trace, and the
+// trace rebuilds them each cycle. Recording all inter-block edges heap-wide (as
+// the persistent barrier remset does) is O(all edges); scoping to candidates
+// bounds both the remset size and the finish-pause replay cost.
+//
+// We approximate the per-block candidate set with a committed bytemap keyed by
+// 128 KiB region-slot (== CONTEXT_ALLOC_QUANTUM, the minimum chunk granule). A
+// set byte means "this region-slot overlaps an evac candidate selected for this
+// trace"; the hot barrier, the mark closures, and evac-copy edge recording all
+// gate their inter-block edge recording on it. Selection uses each region's
+// persisted DeadPctEstimate (stamped by the previous Evacuate's occupancy scan),
+// so it is a cheap side-table read at the snapshot pause (no live-heap walk).
+static uint8_t* g_evacCandidate      = nullptr;  // committed bytemap, 1 byte/region-slot
+static uint8_t* g_evacCandidateBase  = nullptr;  // == heap base
+static size_t   g_evacCandidateSlots = 0;
+static volatile LONG g_evacCandidateScope = 0;   // 1 => candidate-scoped recording active this cycle
+static int      g_evacCandidateEnabled = -1;     // env LXR_EVAC_CANDIDATE_SCOPE (default ON)
+
+static inline bool CandidateScopeEnabled()
+{
+    if (g_evacCandidateEnabled < 0)
+        g_evacCandidateEnabled = (getenv("LXR_EVAC_CANDIDATE_SCOPE") != nullptr &&
+                                  getenv("LXR_EVAC_CANDIDATE_SCOPE")[0] == '0') ? 0 : 1;
+    return g_evacCandidateEnabled != 0;
+}
+
+// Is 'p' inside a region-slot currently flagged as an evacuation candidate?
+static inline bool IsEvacCandidateAddr(void* p)
+{
+    uint8_t* a = (uint8_t*)p;
+    if (g_evacCandidate == nullptr || a < g_evacCandidateBase) return false;
+    size_t slot = (size_t)(a - g_evacCandidateBase) / CONTEXT_ALLOC_QUANTUM;
+    if (slot >= g_evacCandidateSlots) return false;
+    return g_evacCandidate[slot] != 0;
+}
+
+// Mark every 128 KiB region-slot overlapping [start,end) as a candidate. Chunks
+// are not region-slot aligned, so over-approximating to the covered slots is
+// sound (a non-candidate address never becomes a candidate spuriously in a way
+// that drops an edge; extra candidate slots only over-record, never under).
+static inline void SetEvacCandidateRange(uint8_t* start, uint8_t* end)
+{
+    if (g_evacCandidate == nullptr || end <= start) return;
+    size_t s0 = (start <= g_evacCandidateBase) ? 0
+              : (size_t)(start - g_evacCandidateBase) / CONTEXT_ALLOC_QUANTUM;
+    size_t s1 = (size_t)((end - 1) - g_evacCandidateBase) / CONTEXT_ALLOC_QUANTUM;
+    for (size_t s = s0; s <= s1 && s < g_evacCandidateSlots; s++)
+        g_evacCandidate[s] = 1;
+}
+
 // Lock-free prepend of a remset buffer (see RegisterModifiedBuffer): the barrier
 // must not take a CRITICAL_SECTION in cooperative mode or it can deadlock
 // SuspendEE. The collector only traverses the registry under STW (evacuation).
@@ -876,6 +928,9 @@ struct ChunkRegion
                                   // sub-run carved from a retained region, available to
                                   // hand back to an allocator context. Parseable as
                                   // [Start,UsedEnd); never decommitted while listed.
+    uint8_t           DeadPctEstimate; // Item F: last Evacuate's occupancy scan result
+                                  // (dead bytes / total, 0-100); predicts evac candidacy
+                                  // at the next trace's snapshot (0 => not a candidate).
 };
 static ChunkRegion* g_chunks = nullptr;
 static size_t g_chunkCount = 0;
@@ -1117,6 +1172,7 @@ static int AppendRegionLocked(uint8_t* start, uint8_t* usedEnd, size_t size, boo
     g_chunks[idx].Owner = nullptr;
     g_chunks[idx].Committed = true;
     g_chunks[idx].FreeRun = freeRun;
+    g_chunks[idx].DeadPctEstimate = 0;
     return idx;
 }
 
@@ -1198,6 +1254,16 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     size_t lineVerBytes = (heapReservedBytes / lxr::kLineSize) * sizeof(uint16_t);
     m_lineReuseVer = (uint16_t*)VirtualAlloc(nullptr, lineVerBytes, MEM_RESERVE, PAGE_READWRITE);
     if (m_lineReuseVer == nullptr)
+        return false;
+
+    // Item F (paper §3.3): evacuation-candidate bytemap, 1 byte per 128 KiB
+    // region-slot. Small enough (heap/128KB bytes; 128 KiB for a 16 GiB heap) to
+    // commit up front. Read by the hot barrier + mark closures, so keep it fully
+    // resident rather than lazy-committed.
+    g_evacCandidateBase  = heapBase;
+    g_evacCandidateSlots = heapReservedBytes / CONTEXT_ALLOC_QUANTUM + 1;
+    g_evacCandidate = (uint8_t*)VirtualAlloc(nullptr, g_evacCandidateSlots, MEM_COMMIT, PAGE_READWRITE);
+    if (g_evacCandidate == nullptr)
         return false;
 
     InitializeCriticalSection(&m_collectLock);
@@ -1749,7 +1815,14 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
     {
         uintptr_t sblk = (uintptr_t)slot     & ~(lxr::kBlockSize - 1);
         uintptr_t tblk = (uintptr_t)newValue & ~(lxr::kBlockSize - 1);
-        if (sblk != tblk)
+        // Item F (paper §3.3): when candidate-scoping is active this trace, record
+        // ONLY edges whose TARGET is an evacuation candidate (the paper's per-block
+        // remset). This bounds the persistent remset (and its finish-pause replay)
+        // to candidate incoming edges. Pre-existing candidate edges not mutated
+        // this window are supplied by the concurrent mark (g_evacEdgeLogs), so the
+        // union stays complete. When scoping is off, record every inter-block edge
+        // (the prior heap-wide behaviour).
+        if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(newValue)))
         {
             RemsetBuffer* rb = t_remsetBuffer;
             if (rb == nullptr || rb->Count >= RemsetBuffer::kCapacity)
@@ -2762,7 +2835,7 @@ void LXRCollector::DrainMarkStack()
             {
                 uintptr_t sblk = (uintptr_t)ref   & ~(lxr::kBlockSize - 1);
                 uintptr_t tblk = (uintptr_t)child & ~(lxr::kBlockSize - 1);
-                if (sblk != tblk) RecordEvacEdge(ref);
+                if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(child))) RecordEvacEdge(ref);
             }
             if (g_nurseryGuard > 0 && child != nullptr && InFreedYoung((uint8_t*)child))
             {
@@ -2852,7 +2925,7 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
             {
                 uintptr_t sblk = (uintptr_t)ref & ~(lxr::kBlockSize - 1);
                 uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
-                if (sblk != tblk) RecordEvacEdge(ref);
+                if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(c))) RecordEvacEdge(ref);
             }
             if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
             {
@@ -3018,7 +3091,7 @@ void LXRCollector::ScanBigRefArrayChunk(Object* o, size_t slotStart, size_t slot
         {
             uintptr_t sblk = (uintptr_t)ref & ~(lxr::kBlockSize - 1);
             uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
-            if (sblk != tblk) RecordEvacEdge(ref);
+            if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(c))) RecordEvacEdge(ref);
         }
         if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
         {
@@ -3728,6 +3801,63 @@ void LXRCollector::CaptureRoots(std::vector<Object*>& out)
     out.assign(seen.begin(), seen.end());
 }
 
+// Item F (paper §3.3): select the evacuation candidates for the trace that is
+// about to start, using each region's persisted DeadPctEstimate (from the last
+// Evacuate's occupancy scan). Runs at the snapshot/backup STW pause BEFORE the
+// mark, so the barrier + concurrent mark can scope inter-block edge recording to
+// candidate targets for the whole trace window. Cheap: a side-table read per
+// region, no live-heap walk. Regions with no estimate yet (never evac-scanned)
+// are not candidates, so evacuation warms up over the first few traces.
+static void SelectEvacCandidates()
+{
+    // Clear last cycle's candidate bytemap. On a 16 GiB heap this is a 128 KiB
+    // memset; only the used prefix is ever non-zero but clearing all is trivial.
+    if (g_evacCandidate == nullptr) { InterlockedExchange(&g_evacCandidateScope, 0); return; }
+    // The occupancy predictor (DeadPctEstimate) is stamped from the line-mark
+    // table by the sweep, so candidate-scoping requires line reuse to be enabled.
+    // When scoping is disabled (A/B), evac off, or the predictor is unavailable,
+    // record ALL inter-block edges (the pre-existing heap-wide behaviour) and do
+    // NOT candidate-restrict evacuation.
+    if (!CandidateScopeEnabled() || g_evacActive == 0 || g_lineReuse == 0)
+    {
+        memset(g_evacCandidate, 0, g_evacCandidateSlots);
+        InterlockedExchange(&g_evacCandidateScope, 0);
+        return;
+    }
+    static int64_t s_fragPct = -1;
+    if (s_fragPct < 0)
+    {
+        const char* f = getenv("LXR_EVAC_FRAG_PCT");
+        s_fragPct = f ? _atoi64(f) : 50;
+    }
+    memset(g_evacCandidate, 0, g_evacCandidateSlots);
+    size_t nCand = 0;
+    EnterCriticalSection(&g_chunkLock);
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.FreeRun || c.UsedEnd <= c.Start)
+            continue;
+        if ((int64_t)c.DeadPctEstimate < s_fragPct)
+            continue;
+        SetEvacCandidateRange(c.Start, c.UsedEnd);
+        nCand++;
+    }
+    LeaveCriticalSection(&g_chunkLock);
+    // Scope is active for the WHOLE trace whenever enabled (even with 0 candidates
+    // this cycle): the barrier + mark then record nothing and Evacuate moves
+    // nothing, which keeps the invariant "evacuate ONLY candidates whose incoming
+    // edges are (re)recorded this cycle" - so the persistent remset's history is
+    // never trusted for a non-candidate region (avoids a scope-transition dangle).
+    InterlockedExchange(&g_evacCandidateScope, 1);
+    if (getenv("LXR_VERBOSE") != nullptr)
+    {
+        fprintf(stderr, "LXRGC: [evac-cand] selected %zu candidate regions (>=%lld%% dead est)\n",
+                nCand, (long long)s_fragPct);
+        fflush(stderr);
+    }
+}
+
 void LXRCollector::BackupTrace()
 {
     // LXR's periodic backup trace: a stop-the-world mark from all roots that
@@ -3741,6 +3871,10 @@ void LXRCollector::BackupTrace()
 
     g_markTop = 0;
     ResetMarks(); // clear all mark bits before this pass
+
+    // Item F: pick this trace's evacuation candidates from the previous cycle's
+    // occupancy estimates (must precede any edge recording below).
+    SelectEvacCandidates();
 
     // 1. Handle roots (strong and - conservatively - weak: over-retention is
     //    always safe, under-retention is not).
@@ -3789,6 +3923,11 @@ void LXRCollector::ConcurrentTraceSnapshot()
 
     g_markTop = 0;
     ResetMarks();
+
+    // Item F: select this trace's evacuation candidates BEFORE opening the SATB
+    // window, so the barrier (armed just below) and the concurrent mark scope
+    // their inter-block edge recording to candidate targets for the whole window.
+    SelectEvacCandidates();
 
     // Open the SATB window BEFORE seeding roots so any mutator deletion that
     // races the snapshot is captured (the mutators are suspended here, so this
@@ -4112,6 +4251,23 @@ void LXRCollector::SweepAndSelectDefrag()
             // recycling). CarveFreeRuns may realloc g_chunks, so do not touch 'c'
             // afterwards - continue to the next index.
             swLiveRegions++;
+            // Item F: stamp the occupancy predictor for next trace's candidate
+            // selection from the line marks (cheap: O(lines/8), a side-table read).
+            // Must precede CarveFreeRuns (it may realloc g_chunks, invalidating c).
+            if (CandidateScopeEnabled() && g_lineMarksValid && m_lineMarkTable != nullptr)
+            {
+                size_t firstLine = (size_t)(c.Start - m_heapBase) / lxr::kLineSize;
+                size_t lastLine  = (size_t)((c.UsedEnd - 1) - m_heapBase) / lxr::kLineSize;
+                size_t totalLines = lastLine - firstLine + 1, liveLines = 0;
+                for (size_t line = firstLine; line <= lastLine; line++)
+                {
+                    size_t byteIdx = line >> 3;
+                    if (byteIdx >= m_lineMarkCommittedBytes) break;
+                    if (m_lineMarkTable[byteIdx] & (uint8_t)(1u << (line & 7))) liveLines++;
+                }
+                int64_t deadPct = totalLines ? (int64_t)((totalLines - liveLines) * 100 / totalLines) : 0;
+                c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct);
+            }
             if (carveLines)
             {
                 LARGE_INTEGER swC0; QueryPerformanceCounter(&swC0);
@@ -4396,10 +4552,31 @@ void LXRCollector::Evacuate()
             p += sz;
         }
         if (!parseOk || total == 0 || live == 0 || live == total)
-            continue; // unparseable, empty, fully dead (sweep handles), or fully live
+        {
+            c.DeadPctEstimate = 0; // not an evac candidate: fully dead (sweep),
+                                   // fully live (0 dead), empty, or unparseable
+            continue;
+        }
         int64_t deadPct = (int64_t)((total - live) * 100 / total);
+        c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct); // Item F predictor
         if (deadPct < s_fragPct)
             continue;
+        // Item F candidate-scoping: only evacuate regions selected as candidates
+        // at the trace's snapshot. Their incoming inter-block edges are the ONLY
+        // ones the (candidate-scoped) barrier + mark recorded this cycle, so a non-
+        // candidate region (e.g. one that fragmented only after the snapshot) has
+        // no complete remembered set and MUST NOT move (it stays put, and will be a
+        // candidate next cycle). Every 128 KiB slot the region overlaps must be
+        // flagged (edge recording is slot-granular).
+        if (g_evacCandidateScope)
+        {
+            bool allCand = true;
+            for (uint8_t* q = c.Start; q < c.UsedEnd; q += CONTEXT_ALLOC_QUANTUM)
+                if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
+            if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
+            if (!allCand)
+                continue;
+        }
         cands.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
     }
     LeaveCriticalSection(&g_chunkLock);
@@ -4594,16 +4771,29 @@ void LXRCollector::Evacuate()
     // incomplete: persistent set -> a barrier drop this interval (repaired only at
     // the *next* CompactRemsets); legacy set -> a lane overflow or a conservative-
     // keep-alive cycle (objects marked without a field scan, so no out-edges logged).
+    // Item F candidate-scoping (scopeUnion): the persistent remset is now scoped to
+    // candidate-target MUTATIONS and the concurrent mark supplies the pre-existing
+    // candidate live edges (g_evacEdgeLogs) - so BOTH must be complete (neither the
+    // remset nor an evac-edge lane overflowed, and no conservative-keep-alive object
+    // was marked without a field scan).
+    bool scopeUnion = s_persist && (g_evacCandidateScope != 0);
     bool useScoped = s_scopedFixup &&
-        (s_persist ? (g_remsetActive && g_remsetOverflow == 0)
-                   : (g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0));
+        (scopeUnion ? (g_remsetActive && g_remsetOverflow == 0 &&
+                       g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0)
+         : s_persist ? (g_remsetActive && g_remsetOverflow == 0)
+                     : (g_evacEdgeOverflow == 0 && g_conservativeKeepAliveThisCycle == 0));
 
     // A dormant parity fallback firing: the scoped (remembered-set) fix-up was
     // requested but a real remset incompleteness forced the sound full-heap walk.
     // (Distinguish from the intentional A/B disable, LXR_EVAC_SCOPED_FIXUP=0.)
     if (s_scopedFixup && !useScoped)
     {
-        const char* why = s_persist
+        const char* why = scopeUnion
+            ? (!g_remsetActive ? "candidate-scoped remset inactive (g_remsetActive=0)"
+               : g_remsetOverflow ? "candidate-scoped persistent remset overflowed"
+               : g_evacEdgeOverflow ? "candidate-scoped mark edge-log overflowed"
+                                    : "conservative-keep-alive cycle (object marked without a field scan)")
+            : s_persist
             ? (g_remsetActive ? "persistent remset barrier-dropped an inter-block edge this interval"
                               : "persistent remset inactive (g_remsetActive=0)")
             : (g_evacEdgeOverflow ? "legacy evac-edge lane overflowed its cap"
@@ -4695,6 +4885,40 @@ void LXRCollector::Evacuate()
                 if (!slotCommitted(slot))
                     continue; // referrer region decommitted since insert
                 rebaseField(slot);
+            }
+            // Item F candidate-scoping: the barrier-maintained persistent remset
+            // above holds only candidate-target MUTATIONS this window. The
+            // pre-existing candidate incoming edges (from live objects the mark
+            // scanned) are in g_evacEdgeLogs, repopulated by this cycle's concurrent
+            // mark. Replay them too so the union covers every incoming candidate
+            // edge. Same moved-source skip + committed guard as above.
+            if (scopeUnion)
+            {
+                std::vector<Object**> markSlots;
+                EnterCriticalSection(&g_evacEdgeLock);
+                for (std::vector<Object**>* log : g_evacEdgeLogs)
+                    for (Object** slot : *log)
+                    {
+                        uint8_t* sa = (uint8_t*)slot;
+                        size_t lo = 0, hi = movedRanges.size();
+                        while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                        if (lo != 0)
+                        {
+                            const MovedRange& mr = movedRanges[lo - 1];
+                            if (sa >= mr.oldStart && sa < mr.oldEnd)
+                                continue; // slot inside a moved source: handled by (a)
+                        }
+                        markSlots.push_back(slot);
+                    }
+                LeaveCriticalSection(&g_evacEdgeLock);
+                std::sort(markSlots.begin(), markSlots.end());
+                markSlots.erase(std::unique(markSlots.begin(), markSlots.end()), markSlots.end());
+                for (Object** slot : markSlots)
+                {
+                    if (!slotCommitted(slot))
+                        continue;
+                    rebaseField(slot);
+                }
             }
         }
         else
@@ -6948,6 +7172,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("me:snapshot");
         g_lxrCollector.ConcurrentTraceSnapshot();
         QueryPerformanceCounter(&tb2);
+        // Item F: candidate-scoping selected this trace's evac candidates inside
+        // ConcurrentTraceSnapshot. When active, the concurrent mark repopulates the
+        // evac remembered set for the CURRENT candidates (g_evacEdgeLogs), supplying
+        // the pre-existing candidate incoming edges the (candidate-scoped) barrier
+        // no longer records heap-wide. Reset + arm recording before the marker runs.
+        if (doEvac && g_evacCandidateScope) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
         if (verbose) { fprintf(stderr, "LXRGC: [stage]   snapshot breakdown: bufs=%lldus snap=%lldus\n", (long long)((tb1.QuadPart-tb0.QuadPart)*1000000/freq.QuadPart), (long long)((tb2.QuadPart-tb1.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
         LXREnsureMarkerThread();
         InterlockedExchange(&g_traceCompleteThisCycle, 0);
@@ -7000,6 +7230,9 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             LXRSetPhase("me:evacuate");
             g_lxrCollector.Evacuate();
         }
+        // Item F: recording window closes once Evacuate has consumed the scoped
+        // remembered set (ConcurrentTraceFinish above recorded the final-drain edges).
+        if (doEvac && g_evacCandidateScope) InterlockedExchange(&g_recordEvacEdges, 0);
         LARGE_INTEGER tfEvac; QueryPerformanceCounter(&tfEvac);
         LXRSetPhase("me:finish-sweep");
         if (doSweep)
@@ -7061,6 +7294,9 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         }
         LXRSetPhase("conc:snapshot");
         g_lxrCollector.ConcurrentTraceSnapshot();
+        // Item F: arm candidate-scoped evac-remset repopulation for the concurrent
+        // mark (see the multi-epoch snapshot path for rationale).
+        if (doEvac && g_evacCandidateScope) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
         LXRSetPhase("conc:restart-snapshot");
         LXRRestartEE();
         QueryPerformanceCounter(&a1);
@@ -7123,6 +7359,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             LXRSetPhase("conc:evacuate");
             g_lxrCollector.Evacuate();
         }
+        if (doEvac && g_evacCandidateScope) InterlockedExchange(&g_recordEvacEdges, 0);
         LXRSetPhase("conc:finish-sweep");
         if (doSweep)
             g_lxrCollector.SweepAndSelectDefrag();
