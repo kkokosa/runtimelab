@@ -3401,7 +3401,18 @@ void LXRCollector::ProcessModifiedBuffers()
     // so an A->B edge created in an earlier pause must be retained until B is
     // promoted or the epoch turns over. Reset happens at the trace epoch bump
     // (ResetDCopyRemset). On overflow we abandon the set and D-copy full-walks.
-    if (g_dcopyCaptureModified && !g_dcopyRemsetOverflow)
+    //
+    // Skip capture entirely WHILE A TRACE WINDOW IS OPEN. A concurrent trace spans
+    // many RC pauses; throughout it CopyYoungSurvivors self-skips (it never moves
+    // young under an in-flight trace), so nothing prunes this set, yet every RC
+    // pause here would keep appending. At trace completion the window's young ages
+    // to mature and the whole set is cleared (see the g_traceEpoch bump), so any
+    // slot captured during the window is discarded unused. Capturing it anyway is
+    // pure waste that let the set balloon to ~1M entries across a long trace -- a
+    // single ~330 ms D-copy pass dominated by the O(n log n) re-sort of that dead
+    // accumulation. Gating on !g_traceWindowOpen keeps the set bounded to the
+    // inter-trace window that D-copy actually consumes.
+    if (g_dcopyCaptureModified && !g_dcopyRemsetOverflow && !g_traceWindowOpen)
     {
         for (const auto& kv : coalesced)
         {
@@ -5893,8 +5904,56 @@ void LXRCollector::CopyYoungSurvivors()
         g_dcopyModifiedSlots.erase(std::unique(g_dcopyModifiedSlots.begin(), g_dcopyModifiedSlots.end()),
                                    g_dcopyModifiedSlots.end());
         g_dcopyFixup = &fx;
+        // Replay AND prune in one pass. The remembered set is otherwise reset only
+        // at a trace epoch bump, so between traces it monotonically accumulates
+        // every mature->young slot ever logged -- including entries whose target
+        // has since been promoted (copied => now mature), died, or had its region
+        // freed. Those stale entries are pure dead weight: they cannot name a
+        // movable young object, yet each still costs a load + moved-range search +
+        // committed check every RC pause, and the O(n log n) re-sort above. Left
+        // unbounded this ballooned to ~1M slots on a burst (a single ~330 ms RC
+        // pause; ~94 ms of it just the re-sort). The LXR paper instead keeps
+        // remembered sets "up to date" via the barrier and scopes them to the
+        // evacuation set, so it never replays stale/irrelevant edges. We approximate
+        // that here: retain an entry only while it still names a movable young
+        // target (it may be copied in a LATER budget-limited pass); drop everything
+        // else. This keeps the set bounded to live young incoming edges, so steady-
+        // state passes stay small and the re-sort cheap. Soundness: we only drop a
+        // slot after Rebase whose CURRENT value is not a young object, and any store
+        // that later makes such a field point at a young object re-logs it (the
+        // coalescing bit was cleared when its buffer was processed), so it is
+        // re-captured -- no live mature->young edge into a survivor is lost.
+        size_t keepW = 0;
         for (Object** slot : g_dcopyModifiedSlots)
-            LXRDCopyRemsetVisit(slot, nullptr);
+        {
+            uint8_t* sa = (uint8_t*)slot;
+            // (i) Slot inside a moved source region: its container object is being
+            //     relocated (its copy's out-edges are fixed by 4a) and the source
+            //     region is freed after this pass -- the slot address itself dies.
+            //     Drop it.
+            if (!fx.movedRanges->empty())
+            {
+                size_t lo = 0, hi = fx.movedRanges->size();
+                while (lo < hi) { size_t mid = (lo + hi) >> 1; if ((*fx.movedRanges)[mid].oldStart <= sa) lo = mid + 1; else hi = mid; }
+                if (lo != 0)
+                {
+                    const DCopyMovedRange& mr = (*fx.movedRanges)[lo - 1];
+                    if (sa >= mr.oldStart && sa < mr.oldEnd)
+                        continue; // drop: handled by 4a, source region reclaimed
+                }
+            }
+            // (ii) Referrer region freed by an earlier RC pause / this pass's
+            //      zero-count cascade: the slot's own page is gone. Drop it.
+            if (!fx.SlotCommitted(slot))
+                continue;
+            // (iii) Redirect any reference into a moved source to its new location.
+            fx.Rebase(slot);
+            // (iv) PRUNE: keep only entries that still name a movable young target.
+            Object* cur = *slot;
+            if (cur != nullptr && (uint8_t*)cur >= m_heapBase && (uint8_t*)cur < m_heapBase + m_heapBytes && IsYoung(cur))
+                g_dcopyModifiedSlots[keepW++] = slot;
+        }
+        g_dcopyModifiedSlots.resize(keepW);
         g_dcopyFixup = nullptr;
     }
     else

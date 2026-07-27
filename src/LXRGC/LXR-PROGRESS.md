@@ -184,6 +184,38 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28d** — **D-copy remembered-set balloon fixed (a ~330 ms RC pause on
+  1.09M slots eliminated); compared against the paper's remembered-set design.**
+  Canary profiling caught a single ~330 ms RC pause whose `[copy-breakdown]` showed
+  `modslots=1092646` and `fixup=229640us` — the D-copy young-survivor fix-up replaying
+  a **1.09-million-entry** persistent remembered set (a microbenchmark attributed ~94 ms
+  of that to the per-pass `std::sort` alone, the rest to the scattered `*slot` loads).
+  **Paper comparison (§ "combining RC and remembered sets"):** LXR *initializes each
+  remembered set at the start of an SATB trace and scopes it to the evacuation set of
+  high-fragmentation blocks*, and the field-logging barrier *keeps them up to date*; it
+  never accumulates or replays edges outside the evacuation candidates. Ours instead
+  logged **every** mature→young slot into one flat global set reset only at the next
+  trace — so a long (multi-epoch) concurrent trace, during which `CopyYoungSurvivors`
+  self-skips (never moves young under an in-flight trace) and therefore never prunes,
+  let the set grow without bound while every RC pause kept appending. Every slot so
+  captured is discarded unused at trace completion (the window's young ages to mature
+  and the set is cleared). **Fix (two parts, GC-side):** (1) **gate capture on
+  `!g_traceWindowOpen`** — do not append to the D-copy remset while a trace is in
+  flight, since those entries are provably dead by trace end and D-copy consumes the
+  set only between traces; (2) **prune during the 4b replay** — retain an entry only
+  while it still names a movable young target (drop promoted/mature, dead, freed-region,
+  and relocated-source slots), matching the paper's "keep remsets up to date" instead
+  of accumulating stale edges. Soundness: an entry is dropped only after re-reading its
+  current value; any later store that makes a field point at a young object re-logs it
+  (coalescing bit cleared each pause), so no live incoming edge into a survivor is lost —
+  `LXR_VERIFY_TRACE` confirms 0 unforwarded refs. **Result:** `modslots` **1.09M →
+  ~570** and stable; `[copy-breakdown] fixup` **229 ms → ~3 ms**; max `[rc-breakdown]
+  copy` **~330 ms → ~7.5–8 ms** with no spike, across 6/6 WebApi iters (Errors=0,
+  offenders=0, 0 misses); D-copy still moves 635–807 survivors / frees 244–311 regions
+  per pass. **Residual vs paper:** a genuinely burst-heavy inter-trace window could
+  still make the (now-pruned) set large; the fully paper-faithful bound is a per-
+  evacuation-block remembered set (only edges into the evac set), a larger structural
+  change tracked for future work.
 - **2026-07-28c** — **All RC-pause / trace-finish region reclamation decommit moved
   OFF-PAUSE via a single shared `ReclaimRegionMemory` helper — closes the last
   non-paper-faithful cost inside the D-copy young-survivor copy.** Profiling the
