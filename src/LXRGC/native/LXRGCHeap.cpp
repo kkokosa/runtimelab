@@ -7083,7 +7083,7 @@ void LXRGCHeap::GetMemoryInfo(uint64_t* highMemLoadThresholdBytes,
     if (pauseInfoRaw)
     {
         pauseInfoRaw[0] = (uint64_t)(g_lxrCounters.LastPauseMicros * 10);
-        pauseInfoRaw[1] = 0;
+        pauseInfoRaw[1] = (uint64_t)(g_lxrCounters.MaxPauseMicros * 10);
     }
 }
 
@@ -7705,6 +7705,8 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         static LARGE_INTEGER s_firstPauseQpc = { 0 };
         LARGE_INTEGER nowQpc; QueryPerformanceCounter(&nowQpc);
         g_lxrCounters.LastPauseMicros = pauseMicros;
+        if (pauseMicros > g_lxrCounters.MaxPauseMicros)
+            g_lxrCounters.MaxPauseMicros = pauseMicros;
         if (s_firstPauseQpc.QuadPart == 0)
             s_firstPauseQpc = nowQpc;
         int64_t elapsedMicros =

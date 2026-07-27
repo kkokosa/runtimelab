@@ -150,6 +150,16 @@ static async Task RunBenchmarkAndExitAsync(WebApplication app, Counter<long> ops
     result.HeapSizeBytes = memInfo.HeapSizeBytes;
     result.TotalCommittedBytes = memInfo.TotalCommittedBytes;
     result.PauseTimePercentage = memInfo.PauseTimePercentage;
+    // Honest pause-time-in-ms telemetry (the percentage alone hides how long
+    // individual STW pauses actually are). TotalPauseTimeMs is cumulative wall
+    // clock spent stopped; MaxPauseTimeMs is the single longest STW pause (the
+    // headline latency figure for a low-pause collector). PauseDurations[1] is
+    // the collector's max-pause counter (LXRGC); the built-in GCs only report the
+    // latest GC's durations there, so MaxPauseTimeMs is meaningful for LXRGC and
+    // best-effort otherwise.
+    result.TotalPauseTimeMs = GC.GetTotalPauseDuration().TotalMilliseconds;
+    var pd = memInfo.PauseDurations;
+    result.MaxPauseTimeMs = pd.Length > 1 ? pd[1].TotalMilliseconds : (pd.Length > 0 ? pd[0].TotalMilliseconds : 0);
 
     string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = false });
     Console.WriteLine("##RESULT##" + json);
@@ -213,5 +223,7 @@ internal class BenchResult
     public long HeapSizeBytes { get; set; }
     public long TotalCommittedBytes { get; set; }
     public double PauseTimePercentage { get; set; }
+    public double TotalPauseTimeMs { get; set; }
+    public double MaxPauseTimeMs { get; set; }
     public long Errors { get; set; }
 }

@@ -184,6 +184,23 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28i** — **Honest pause-time-in-ms telemetry + RC-pause root-cause
+  diagnosis.** Pause time was only surfaced as a *percentage* (`PauseTimePercentage`),
+  which hid how long individual STW pauses actually are. Added a native
+  `MaxPauseMicros` counter (longest single STW pause) exposed via
+  `GetGCMemoryInfo().PauseDurations[1]`, and the WebApi bench now reports
+  `TotalPauseTimeMs` (`GC.GetTotalPauseDuration`) and `MaxPauseTimeMs`. **Measured
+  honest numbers (WebApi, 15 s): LXR TotalPauseMs≈97, MaxPauseMs≈22 vs Workstation
+  ≈5 ms / Server ≈15 ms total** — LXR's pauses are NOT yet paper-competitive.
+  Root-caused the ~20 ms RC pause with `[stage]`/`[rc-breakdown]`/`[fixup-sub]`
+  sub-timers: it is **`ProcessModifiedBuffers` ~10 ms** (STW coalescing hash-map +
+  `ApplyRCEpoch` + `DrainZeroCountWorkList`) **+ `CopyYoungSurvivors` ~12 ms**
+  (copyloop ~4 ms + fix-up ~7 ms, of which step **4b** = ~6.75 ms is `SlotCommitted`
+  `VirtualQuery` syscalls on scattered stale remset entries). The concurrent path
+  already defers the coalescing hash-map off-pause (`SnapshotModifiedBuffers`); the
+  plain RC pause does all of it STW. Next: kill the 4b VirtualQuery (in-memory
+  committed check), defer PMB's RC-apply/zero-count off-pause, and budget the young
+  copy — targeting sub-ms RC pauses per the paper. No runtime change.
 - **2026-07-28h** — **Parallelized the D-copy young-survivor fix-up (STW pause
   reduction).** Profiling the `[copy-breakdown] fixup` STW sub-cost (up to ~26 ms)
   with new `LXR_VERBOSE` sub-timers (`[fixup-sub] 4a / 4a-young / 4b`) corrected an

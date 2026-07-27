@@ -147,6 +147,7 @@ struct LXRCounters
     volatile int64_t RCPausePauseMicros;    // cumulative light-pause time (us)
     volatile int64_t TracePausePauseMicros; // cumulative full-pause time (us)
     volatile int64_t LastPauseMicros;       // last STW pause duration (us)
+    volatile int64_t MaxPauseMicros;        // longest single STW pause observed (us)
     volatile int64_t LastGCPercentTimeInGC; // last pause as % of the interval since the prior pause (0..100)
 
     // P2 barrier extensions: SATB deletion barrier + remembered sets.
