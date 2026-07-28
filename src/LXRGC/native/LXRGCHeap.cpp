@@ -4943,6 +4943,8 @@ static int64_t g_evacCopyMicros = 0, g_evacFixupMicros = 0, g_evacFreeMicros = 0
 static int64_t g_evac4aMicros = 0, g_evac4bRemsetMicros = 0;
 static int64_t g_evac4bReplayMicros = 0, g_evac4bSlots = 0;
 static int64_t g_evacPinMicros = 0, g_evacSelMicros = 0;
+// Temporary instrumentation for the 4b-intra scan (LXR_FINISH_PROFILE).
+static volatile LONG64 g_intraObjsParsed = 0, g_intraObjsScanned = 0, g_intraRegions = 0;
 // Interior/byref support: each moved object's old address range and new base, so a
 // heap byref/interior pointer landing INSIDE a moved object can be rebased.
 // File-scope so the parallel 4b replay fn (Evac4bFn) can reference it.
@@ -5022,6 +5024,9 @@ struct EvacIntraCtx
     std::unordered_map<Object*, Object*>* forwarding;
     std::vector<EvacMovedRange>*          movedRanges;  // sorted by oldStart
     size_t                                chunkCount;
+    bool                                  blockGate;    // restrict ref-scan to touched-block objects
+    bool                                  markSkip;     // jump survivor-to-survivor via mark bitmap
+    bool                                  fullwalk;     // scan ALL regions (remset-incomplete fallback), no block scoping
 };
 static void EvacIntraFn(int lane, int lanes, void* ctxp)
 {
@@ -5061,22 +5066,119 @@ void LXRCollector::EvacIntraScanStripe(int lane, int lanes, void* ctxp)
         if (!c.Committed) continue;
         uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
         if (end <= c.Start) continue;
-        bool overlaps = false;
-        for (uint8_t* b = (uint8_t*)((uintptr_t)c.Start & ~(lxr::kBlockSize - 1));
-             b < end; b += lxr::kBlockSize)
-            if (touchedBlocks.count((uintptr_t)b)) { overlaps = true; break; }
-        if (!overlaps) continue;
+        if (!ctx->fullwalk)
+        {
+            bool overlaps = false;
+            for (uint8_t* b = (uint8_t*)((uintptr_t)c.Start & ~(lxr::kBlockSize - 1));
+                 b < end; b += lxr::kBlockSize)
+                if (touchedBlocks.count((uintptr_t)b)) { overlaps = true; break; }
+            if (!overlaps) continue;
+        }
+        InterlockedIncrement64(&g_intraRegions);
+        int64_t locParsed = 0, locScanned = 0;
+        bool blockGate = ctx->blockGate && !ctx->fullwalk;
+        // Only objects that physically sit in a TOUCHED block can hold the intra-
+        // block edges this step must rebase: an intra-block reference has referrer
+        // and referent in the SAME 32 KiB block, and every moved (referent) object
+        // was in a touched block, so its intra-block referrer is too. Inter-block
+        // edges are already replayed via the remembered set (4bRS). We therefore
+        // still parse the whole region (needed to keep object boundaries - there is
+        // no object-start map to seek into a block), but restrict the expensive
+        // per-object ref-scan to touched-block objects. This bounds the O(fields)
+        // work to the evac-set's block span (copy budget) instead of the whole of
+        // every region that merely overlaps a touched block (which, for a large
+        // live region or the active alloc region, dwarfed the copy set and made
+        // this the trace-finish STW dominator on heavy cycles). A per-block-cached
+        // membership test keeps the common run of small same-block objects to one
+        // hash probe per block. Gated by LXR_EVAC_INTRA_BLOCKGATE (default ON).
+        uintptr_t cachedBlk = (uintptr_t)-1;
+        bool cachedTouched = false;
+        // When no conservative interior keep-alive fired this cycle, every set mark
+        // bit is a marked OBJECT START, so jump survivor-to-survivor via the mark
+        // bitmap (FirstMarkedAtOrAfter) instead of linearly parsing (and paying an
+        // LXRObjectSize + a cache miss for) every DEAD object too. Evac source
+        // regions are >=50% dead by selection, so this skips the bulk of the walk;
+        // the earlier whole-region linear parse dominated the trace-finish STW pause
+        // (~35 ms parsing ~175k objects to rebase ~30). Only marked survivors can
+        // hold a live intra-block edge, so nothing is missed. Conservative keep-
+        // alive marks a single interior granule (not an object start), which would
+        // misparse here, so fall back to the linear parse for that (rare) cycle.
+        if (ctx->markSkip)
+        {
+            uint8_t* q = FirstMarkedAtOrAfter(c.Start, end);
+            while (q < end)
+            {
+                Object* o = (Object*)q;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0) break;
+                uint8_t* oend = q + sz;
+                locParsed++;
+                bool skip = false;
+                if (blockGate)
+                {
+                    uintptr_t startBlk = (uintptr_t)o & ~(lxr::kBlockSize - 1);
+                    uintptr_t lastBlk  = (uintptr_t)(oend - 1) & ~(lxr::kBlockSize - 1);
+                    bool touched;
+                    if (startBlk == lastBlk)
+                    {
+                        if (startBlk != cachedBlk)
+                        { cachedBlk = startBlk; cachedTouched = touchedBlocks.count(startBlk) != 0; }
+                        touched = cachedTouched;
+                    }
+                    else
+                    {
+                        touched = false;
+                        for (uintptr_t bb = startBlk; bb <= lastBlk; bb += lxr::kBlockSize)
+                            if (touchedBlocks.count(bb)) { touched = true; break; }
+                    }
+                    skip = !touched;
+                }
+                if (!skip && forwarding.find(o) == forwarding.end())
+                {
+                    locScanned++;
+                    GCScanObjectRefs(o, sz, rebaseField); // o is marked (bitmap) => survivor
+                }
+                q = FirstMarkedAtOrAfter(oend, end);
+            }
+            InterlockedAdd64(&g_intraObjsParsed, locParsed);
+            InterlockedAdd64(&g_intraObjsScanned, locScanned);
+            continue;
+        }
         uint8_t* p = c.Start;
         while (p < end)
         {
             Object* o = (Object*)p;
             size_t sz = LXRObjectSize(o);
             if (sz == 0) break;
-            p += sz;
+            uint8_t* oend = p + sz;
+            p = oend;
+            locParsed++;
+            if (blockGate)
+            {
+                uintptr_t startBlk = (uintptr_t)o & ~(lxr::kBlockSize - 1);
+                uintptr_t lastBlk  = (uintptr_t)(oend - 1) & ~(lxr::kBlockSize - 1);
+                bool touched;
+                if (startBlk == lastBlk)
+                {
+                    if (startBlk != cachedBlk)
+                    { cachedBlk = startBlk; cachedTouched = touchedBlocks.count(startBlk) != 0; }
+                    touched = cachedTouched;
+                }
+                else
+                {
+                    touched = false;
+                    for (uintptr_t bb = startBlk; bb <= lastBlk; bb += lxr::kBlockSize)
+                        if (touchedBlocks.count(bb)) { touched = true; break; }
+                }
+                if (!touched) continue;
+            }
             if (forwarding.find(o) != forwarding.end()) continue; // moved source
             if (!IsMarked(o)) continue;                            // dead
+            locScanned++;
             GCScanObjectRefs(o, sz, rebaseField);
         }
+        InterlockedAdd64(&g_intraObjsParsed, locParsed);
+        InterlockedAdd64(&g_intraObjsScanned, locScanned);
     }
 }
 // Snapshot the committed regions, then replay the incoming-edge rebase. Shared by
@@ -5716,37 +5818,70 @@ void LXRCollector::Evacuate()
             const char* e = getenv("LXR_EVAC_PARALLEL_INTRA");
             s_parIntra = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
         }
+        static int s_intraBlockGate = -1;
+        if (s_intraBlockGate < 0)
+        {
+            const char* e = getenv("LXR_EVAC_INTRA_BLOCKGATE");
+            s_intraBlockGate = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+        }
+        static int s_intraMarkSkip = -1;
+        if (s_intraMarkSkip < 0)
+        {
+            const char* e = getenv("LXR_EVAC_INTRA_MARKSKIP");
+            s_intraMarkSkip = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+        }
         int intraLanes = (s_parIntra && g_poolWorkers > 0 && g_chunkCount >= 64) ? (g_poolWorkers + 1) : 1;
-        EvacIntraCtx ictx{ &touchedBlocks, &forwarding, &movedRanges, g_chunkCount };
+        // Mark-skip is unsafe if a conservative interior keep-alive set a mark bit
+        // at a non-object-start granule this cycle (it would misparse); fall back to
+        // the linear parse then.
+        bool markSkip = (s_intraMarkSkip != 0) && (g_conservativeKeepAliveThisCycle == 0);
+        EvacIntraCtx ictx{ &touchedBlocks, &forwarding, &movedRanges, g_chunkCount, s_intraBlockGate != 0, markSkip, false };
+        g_intraObjsParsed = 0; g_intraObjsScanned = 0; g_intraRegions = 0;
+        if (getenv("LXR_FINISH_PROFILE") != nullptr)
+        { fprintf(stderr, "LXRGC: [intra-instr] touchedBlocks=%zu evacRegions=%zu chunks=%zu\n",
+                  touchedBlocks.size(), evac.size(), g_chunkCount); fflush(stderr); }
         if (intraLanes > 1)
             RunOnPool(intraLanes, &EvacIntraFn, &ictx);
         else
             EvacIntraScanStripe(0, 1, &ictx);
+        if (getenv("LXR_FINISH_PROFILE") != nullptr)
+        { fprintf(stderr, "LXRGC: [intra-instr] regionsParsed=%lld objsParsed=%lld objsScanned=%lld\n",
+                  (long long)g_intraRegions, (long long)g_intraObjsParsed, (long long)g_intraObjsScanned); fflush(stderr); }
     }
     else
     {
         InterlockedIncrement64(&g_lxrCounters.EvacFullWalkFallbacks);
-        for (size_t i = 0; i < g_chunkCount; i++)
+        // Remembered set incomplete (overflow / barrier drop / conservative keep-
+        // alive) -> sound O(marked-heap) rebase of EVERY marked object's fields.
+        // Reuse the intra worker in fullwalk mode: scan all regions (no block
+        // scoping), mark-skip over dead objects, and stripe across the mark pool.
+        // This was a SERIAL whole-heap parse (~34 ms) on heavy multi-epoch cycles
+        // where the remset overflows. markSkip is unsafe under conservative keep-
+        // alive (non-object-start marks), which is also one of the overflow causes.
+        static int s_fwMarkSkip = -1;
+        if (s_fwMarkSkip < 0)
         {
-            ChunkRegion& c = g_chunks[i];
-            if (!c.Committed)
-                continue;
-            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-            uint8_t* p = c.Start;
-            while (p < end)
-            {
-                Object* o = (Object*)p;
-                size_t sz = LXRObjectSize(o);
-                if (sz == 0)
-                    break;
-                p += sz;
-                if (forwarding.find(o) != forwarding.end())
-                    continue; // dead source
-                if (!IsMarked(o))
-                    continue; // unreachable garbage: sweep will handle
-                GCScanObjectRefs(o, sz, rebaseField);
-            }
+            const char* e = getenv("LXR_EVAC_FULLWALK_MARKSKIP");
+            s_fwMarkSkip = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
         }
+        static int s_fwPar = -1;
+        if (s_fwPar < 0)
+        {
+            const char* e = getenv("LXR_EVAC_FULLWALK_PARALLEL");
+            s_fwPar = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+        }
+        std::unordered_set<uintptr_t> emptyBlocks;
+        bool fwMarkSkip = (s_fwMarkSkip != 0) && (g_conservativeKeepAliveThisCycle == 0);
+        EvacIntraCtx fwctx{ &emptyBlocks, &forwarding, &movedRanges, g_chunkCount, false, fwMarkSkip, true };
+        int fwLanes = (s_fwPar && g_poolWorkers > 0 && g_chunkCount >= 64) ? (g_poolWorkers + 1) : 1;
+        g_intraObjsParsed = 0; g_intraObjsScanned = 0; g_intraRegions = 0;
+        if (fwLanes > 1)
+            RunOnPool(fwLanes, &EvacIntraFn, &fwctx);
+        else
+            EvacIntraScanStripe(0, 1, &fwctx);
+        if (getenv("LXR_FINISH_PROFILE") != nullptr)
+        { fprintf(stderr, "LXRGC: [intra-instr] FULLWALK regionsParsed=%lld objsParsed=%lld objsScanned=%lld\n",
+                  (long long)g_intraRegions, (long long)g_intraObjsParsed, (long long)g_intraObjsScanned); fflush(stderr); }
     }
     // Item D-copy: an evac copy M' is produced by memcpy, so M's mature->young
     // edges are duplicated into M' at NEW slot addresses while the D-copy old->

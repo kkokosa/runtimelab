@@ -184,6 +184,34 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28q** — **Optimized the evac fix-up 4b-intra step: mega evac-cycle
+  fix-up 34 ms → 3.1 ms; clean MaxPause on WebApi 15.9 ms (all sound).** Clean
+  (verify-unset) production profiling isolated the residual trace-finish STW spike
+  on evac-heavy multi-epoch cycles to the evac fix-up "intra" reference-rebase, in
+  particular its **whole-heap fallback** taken when the persistent remembered set /
+  evac edge-log overflows (which happens precisely on the heaviest multi-epoch
+  cycles). Three sound fixes to `Evacuate`'s intra reference-rebase
+  (`EvacIntraScanStripe`), all `LXR_VERIFY_TRACE` clean (verify-evac UNFORWARDED=0,
+  offenders=0, Errors=0): **(1) block-gate** (`LXR_EVAC_INTRA_BLOCKGATE`, default
+  on) — intra-block edges only exist in objects physically in a touched 32 KiB
+  block, so the expensive per-object field scan is gated to touched-block marked
+  survivors (inter-block edges are covered by the 4bRS remset). **(2) mark-skip**
+  (`LXR_EVAC_INTRA_MARKSKIP`, default on) — parse survivor-to-survivor via the
+  object-start mark bitmap (`FirstMarkedAtOrAfter`) instead of a linear parse over
+  the ≥50%-dead evac-source regions, skipping dead objects entirely (disabled on
+  conservative-keep-alive cycles, whose interior marks would misparse). On the
+  scoped path this cut objsParsed 175 023 → ~300. **(3) parallel + mark-skip
+  fullwalk fallback** — the overflow fallback rebases every marked object's fields
+  (the sound O(marked-heap) backstop); it was a *serial* whole-heap parse (~34 ms
+  on the worst mega-cycle). It now reuses the intra worker in a `fullwalk` mode
+  (scan all regions, no block scoping, mark-skip) striped across the mark pool
+  (`LXR_EVAC_FULLWALK_PARALLEL` / `LXR_EVAC_FULLWALK_MARKSKIP`, both default on).
+  Verified on a 150 s WebApi run: the one fullwalk mega-cycle rebased 1 894 906
+  marked survivors across 2611 regions in 4bIntra **3.1 ms** (vs ~34 ms serial),
+  total finish pause 15.9 ms; the whole clean run MaxPause 15.9 ms / TotalPause
+  117.8 ms (Errors=0). Also committed `30db815` — evac-select skips the redundant
+  O(objects) occupancy parse for non-candidate regions (the authoritative
+  `DeadPctEstimate` re-stamp is the subsequent sweep), sel ~3 ms → ~0.1 ms.
 - **2026-07-28p** — **Bounded evacuation + parallelized the trace-finish STW
   dominators: worst multi-epoch finish pause 82 ms → 21 ms (all sound).** After
   the profiling passes below showed the trace-finish STW cost migrating between
