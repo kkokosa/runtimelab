@@ -5168,6 +5168,22 @@ static void EvacSelFn(int lane, int lanes, void* ctxp)
         ChunkRegion& c = g_chunks[i];
         if (!c.Committed || c.Owner != nullptr || c.UsedEnd <= c.Start)
             continue;
+        // Candidate-scope pre-filter (cheap): when candidate-scoped recording is
+        // active this cycle, only candidate regions can be evacuated (non-candidates
+        // have no complete remembered set). Test candidacy FIRST - a 1-byte/128KiB
+        // bytemap read - so non-candidate regions skip the O(objects) occupancy
+        // parse entirely (the dominant heavy-cycle cost). Their DeadPctEstimate is
+        // left as-is; the sweep re-stamps it from line marks later this same finish,
+        // so nothing downstream reads a stale value.
+        if (g_evacCandidateScope)
+        {
+            bool allCand = true;
+            for (uint8_t* q = c.Start; q < c.UsedEnd; q += CONTEXT_ALLOC_QUANTUM)
+                if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
+            if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
+            if (!allCand)
+                continue;
+        }
         size_t total = 0, live = 0;
         uint8_t* p = c.Start;
         bool parseOk = true;
@@ -5189,15 +5205,6 @@ static void EvacSelFn(int lane, int lanes, void* ctxp)
         c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct);
         if (deadPct < ctx->fragPct)
             continue;
-        if (g_evacCandidateScope)
-        {
-            bool allCand = true;
-            for (uint8_t* q = c.Start; q < c.UsedEnd; q += CONTEXT_ALLOC_QUANTUM)
-                if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
-            if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
-            if (!allCand)
-                continue;
-        }
         if (!unresolvedInteriors.empty())
         {
             bool pinnedByInterior = false;
@@ -5301,6 +5308,17 @@ void LXRCollector::Evacuate()
         ChunkRegion& c = g_chunks[i];
         if (!c.Committed || c.Owner != nullptr || c.UsedEnd <= c.Start)
             continue;
+        // Candidate-scope pre-filter (see EvacSelFn): skip non-candidate regions'
+        // occupancy parse; the sweep re-stamps their DeadPctEstimate this finish.
+        if (g_evacCandidateScope)
+        {
+            bool allCand = true;
+            for (uint8_t* q = c.Start; q < c.UsedEnd; q += CONTEXT_ALLOC_QUANTUM)
+                if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
+            if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
+            if (!allCand)
+                continue;
+        }
         size_t total = 0, live = 0;
         uint8_t* p = c.Start;
         bool parseOk = true;
@@ -5323,22 +5341,6 @@ void LXRCollector::Evacuate()
         c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct); // Item F predictor
         if (deadPct < s_fragPct)
             continue;
-        // Item F candidate-scoping: only evacuate regions selected as candidates
-        // at the trace's snapshot. Their incoming inter-block edges are the ONLY
-        // ones the (candidate-scoped) barrier + mark recorded this cycle, so a non-
-        // candidate region (e.g. one that fragmented only after the snapshot) has
-        // no complete remembered set and MUST NOT move (it stays put, and will be a
-        // candidate next cycle). Every 128 KiB slot the region overlaps must be
-        // flagged (edge recording is slot-granular).
-        if (g_evacCandidateScope)
-        {
-            bool allCand = true;
-            for (uint8_t* q = c.Start; q < c.UsedEnd; q += CONTEXT_ALLOC_QUANTUM)
-                if (!IsEvacCandidateAddr(q)) { allCand = false; break; }
-            if (allCand && !IsEvacCandidateAddr(c.UsedEnd - 1)) allCand = false;
-            if (!allCand)
-                continue;
-        }
         // Exclude a region that a live but unresolvable interior/byref root points
         // into: moving it could dangle that byref. Keep it in place (still swept /
         // RC-reclaimed when it becomes wholly dead). Interiors are typically 0-1
