@@ -169,6 +169,7 @@ struct LXRCounters
     volatile int64_t EvacTimeBudgetHits;    // evac passes cut short by the wall-clock budget
     volatile int64_t EvacRemsetFixups;      // moved-object refs forwarded via the scoped remset
     volatile int64_t EvacFullWalkFallbacks; // evac cycles that fell back to the O(heap) fixup walk
+    volatile int64_t AllocBackpressureStalls; // allocations that blocked on a forced trace (hard-cap backpressure)
 
     // P4 concurrency: SATB backup trace whose transitive mark runs while the
     // mutators execute, bracketed by two brief stop-the-world pauses.

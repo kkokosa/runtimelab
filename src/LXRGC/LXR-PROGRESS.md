@@ -1031,3 +1031,37 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
   can do a cheap dirty-card mature→young scan instead of O(heap) fullscan). Survivor
   copy-at-RC-pause deferred (survivors stay young → compacted by the trace-cycle
   `Evacuate`). D stays ⚠️.
+
+- **2026-07-24** — **Allocation backpressure: bound peak footprint under a
+  pure-allocation MT storm (env `LXR_GC_BACKPRESSURE_MB`, default 256, 0=off).**
+  Under a pathological 16-thread zero-delay pure-allocation burst (`gcperfsim-mt-
+  throughput`) the fire-and-forget soft trigger let N allocator threads outrun the
+  single collector without bound (committed grew to the full ~3.4 GB allocation).
+  Added a hard cap: in `AllocateSlow` (after `FinalizeChunk`, in PREEMPTIVE mode so
+  `SuspendEE` can suspend the parked thread) a thread whose committed-in-use has run
+  past `true-live + max(floor, live/2)` BLOCKS on a loop of forced collections until
+  committed falls under the cap. Three interlocking fixes were needed to make it
+  actually bind: (1) **true-live baseline** `g_lastSyncTraceCommitted`, updated ONLY
+  by a synchronous STW trace — concurrent/multi-epoch `meFinish` traces allocate-
+  black-retain their window's young so their post-trace committed ratchets with the
+  runaway heap and is not a valid live proxy; (2) **`g_forceSyncTrace` refcount** that
+  (a) suppresses the async multi-epoch trigger and the in-`RunLXRCollection` `meStart`
+  so the collector reaches TRACE_IDLE, then forces the SYNCHRONOUS STW trace (zero
+  mutator window → nothing allocate-blacked → mark-authoritative sweep frees all dead
+  young → committed drops to true-live); (b) is a refcount not a flag so one exiting
+  parked thread can't clear it while others are still parked (which would let a
+  spurious `meStart` reopen the concurrent window); (3) **cooperative marker abort** —
+  `ConcurrentTraceDrain` breaks its yield loop early when `g_forceSyncTrace>0` so the
+  in-flight concurrent trace finalizes promptly (the STW finish pause re-scans all
+  roots+handles and completes the closure, so the early break is sound). Result on the
+  burst: reclamation engages, committed bounded to ~1.5x the collector's genuine
+  reclaimable working set; `final_heap`/committed no longer runs to the full
+  allocation. Verified SOUND under `LXR_VERIFY_TRACE` (offenders=0, markStackDrops=0,
+  no AV) and a NO-OP on well-behaved workloads (ConsoleApp: 0 stalls, unchanged
+  behavior). The residual peak footprint (~3.3-3.4 GB private, dominated by ~1.8 GB
+  genuinely-reclaimable-but-not-yet-aged nursery + side tables) reflects the young-RC
+  grace period, not an accounting bug. **Caveat (pre-existing, NOT from this change):**
+  the unified concurrent config still intermittently hangs (~1-2/6) under this extreme
+  zero-delay 16-thread storm; reproduced identically with backpressure DISABLED
+  (`LXR_GC_BACKPRESSURE_MB=0`, all backpressure code inert), so it is the known STW/
+  concurrent MT-storm flakiness, tracked separately.

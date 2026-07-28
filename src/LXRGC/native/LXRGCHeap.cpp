@@ -731,6 +731,17 @@ static uint32_t g_pageSize = 4096;
 // the sweep decommits dead regions). This is what GetTotalBytesInUse reports, so
 // GC.GetTotalMemory() visibly drops when LXR reclaims.
 static volatile int64_t g_committedInUse = 0;
+// Diagnostic high-water of g_committedInUse (LXR_BP_DEBUG). Lets us distinguish a
+// real committed spike (backpressure not binding / accounting drift) from the OS
+// working-set peak counting non-heap resident pages (side tables, decommit lag).
+static volatile int64_t g_peakCommitted = 0;
+static inline void LXRNoteCommitted()
+{
+    int64_t c = g_committedInUse;
+    int64_t p = g_peakCommitted;
+    while (c > p && InterlockedCompareExchange64(&g_peakCommitted, c, p) != p)
+        p = g_peakCommitted;
+}
 
 // Allocation-triggered collection: run a STW LXR cycle once committed-in-use has
 // grown by this many bytes since the last collection (0 disables; overridable via
@@ -741,6 +752,26 @@ static void RequestLXRCollection(bool wait, bool forceTrace);
 static void LXRCollectorThreadProc(void*);
 static volatile int64_t g_gcTriggerBytes = -1; // -1 = uninitialized; resolved lazily
 static volatile int64_t g_gcGrowthPct = 50;    // adaptive budget: % of live heap
+// Allocation backpressure (bounds peak footprint under a pure-allocation storm).
+// The soft trigger above is FIRE-AND-FORGET, so N zero-delay allocator threads
+// can outrun the single collector without bound (heap grows to the full
+// allocation). This is an absolute hard cap: once committed-in-use has run this
+// far AHEAD of the size retained after the last collection, the allocating thread
+// BLOCKS on a synchronous forced trace (see AllocateSlow), throttling mutators to
+// the collector's reclamation rate. The trip point is live + max(floor, live/2)
+// (~1.5x true-live) so it never binds on a gradually-growing legitimate live heap
+// (which only ever grows a little between collections), only on a runaway
+// allocation rate. 0 disables it.
+static volatile int64_t g_gcBackpressureBytes = -1; // -1 = uninitialized; env LXR_GC_BACKPRESSURE_MB (0=off)
+// Backpressure forces a SYNCHRONOUS STW trace (not the long concurrent multi-epoch
+// trace). Under a pure-allocation storm the concurrent trace window is long, and
+// EVERYTHING allocated during it is allocate-blacked (kept live) and RETAINED by
+// the sweep -> committed never drops and the live baseline ratchets, so the cap
+// stops binding. A synchronous STW trace has NO mutator window: nothing is
+// allocate-blacked, so the mark-authoritative sweep reclaims all dead young and
+// committed drops back to true-live. Set only while a backpressure park drives
+// collections; honored in RunLXRCollection when the collector is trace-idle.
+static volatile LONG g_forceSyncTrace = 0; // refcount of allocator threads parked in backpressure driving forced sync STW traces
 static volatile LONG g_inCollection = 0;       // reentrancy guard for RunLXRCollection
 
 // --- LXR phase model (P1) -------------------------------------------------
@@ -755,6 +786,14 @@ enum class LXRPhase { RCPause, TracePause };
 static volatile LONG g_requestTrace = 0;          // sticky: next cycle must be a full trace
 static volatile int64_t g_epochsSinceTrace = 0;   // RC epochs since the last full trace
 static volatile int64_t g_lastTraceCommitted = 0; // committed-in-use right after the last trace
+// True-live proxy for backpressure: committed-in-use right after the last
+// SYNCHRONOUS STW trace only. Concurrent/multi-epoch (meFinish) traces retain
+// their window's allocate-blacked young, so their post-trace committed ratchets
+// up with a runaway heap and is NOT a valid live baseline. A zero-window STW
+// trace reclaims all dead young, so its post-trace committed IS true-live.
+// Starts 0 so the first backpressure park (committed >= floor) fires a sync
+// trace that stamps this low, then the cap max(floor,live) keeps binding.
+static volatile int64_t g_lastSyncTraceCommitted = 0;
 static volatile int64_t g_traceBudgetBytes = -1;  // -1 = uninitialized; growth before forcing a trace
 static volatile int64_t g_traceEveryEpochs = -1;  // force a trace at least every N epochs (0 = off)
 
@@ -1114,6 +1153,7 @@ static uint8_t* ReuseChunk(gc_alloc_context* owner, int* outIndex)
             continue;
         size_t recommitted = CommitRange(c.Start, c.Size); // recommit the decommitted interior
         InterlockedExchangeAdd64(&g_committedInUse, (int64_t)recommitted);
+        LXRNoteCommitted();
         memset(c.Start, 0, c.Size);         // hand back zeroed memory like a fresh commit
         c.Owner = owner;
         c.UsedEnd = c.Start;
@@ -4314,6 +4354,12 @@ void LXRCollector::ConcurrentTraceDrain()
         bool moreSatb = (size_t)g_lxrCounters.SatbMarks != before;
         if (g_markTop == 0 && !moreSatb)
             break;              // quiescent (mutators may still trickle; finish mops up)
+        if (g_forceSyncTrace > 0)
+            break;              // backpressure is parking allocators and needs this trace
+                                // FINALIZED now; quiesce immediately so meFinish runs on
+                                // the next request. Sound: the STW finish pause re-scans
+                                // all roots+handles and completes the closure, so any
+                                // residual grey/SATB is mopped up there (no missed live).
         Sleep(0);               // yield so mutators make progress / accrue SATB work
     }
 }
@@ -5549,6 +5595,7 @@ void LXRCollector::Evacuate()
                 return nullptr;
             size_t committed = CommitRange(base, claim);
             InterlockedExchangeAdd64(&g_committedInUse, (int64_t)committed);
+            LXRNoteCommitted();
             curDestIndex = RegisterChunk(base, claim, nullptr);
             destPtr = base;
             destEnd = base + claim;
@@ -6963,6 +7010,7 @@ void LXRCollector::CopyYoungSurvivors()
                 return nullptr;
             size_t committed = CommitRange(base, claim);
             InterlockedExchangeAdd64(&g_committedInUse, (int64_t)committed);
+            LXRNoteCommitted();
             curDestIndex = RegisterChunk(base, claim, nullptr);
             // Promote: the destination hosts MATURE objects, not this window's
             // nursery. Override RegisterChunk's StampBornEpoch (which would leave
@@ -7749,6 +7797,44 @@ uint8_t* LXRGCHeap::ClaimBlocks(size_t bytes)
     return oldNext;
 }
 
+// Diagnostic (LXR_BP_DEBUG): walk the whole VA space with VirtualQuery and sum
+// actually-committed bytes, split into "inside the LXR heap reserve" vs "outside"
+// (side tables + runtime + everything else). Pinpoints whether the OS commit
+// charge is the heap or non-heap. Cheap enough to run once per stall burst.
+static void LXRDumpCommittedBreakdown(int64_t stallN)
+{
+    if (g_lxrGCHeap == nullptr) return;
+    uint8_t* hbase = g_lxrGCHeap->HeapBase();
+    uint8_t* hend  = hbase + HEAP_RESERVE_SIZE;
+    int64_t inHeap = 0, outHeap = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t* addr = nullptr;
+    while (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi))
+    {
+        if (mbi.State == MEM_COMMIT)
+        {
+            uint8_t* rb = (uint8_t*)mbi.BaseAddress;
+            if (rb >= hbase && rb < hend) inHeap += (int64_t)mbi.RegionSize;
+            else                          outHeap += (int64_t)mbi.RegionSize;
+        }
+        uint8_t* next = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+    }
+    static int64_t s_peakTotal = 0, s_peakInHeap = 0, s_peakOut = 0;
+    int64_t total = inHeap + outHeap;
+    bool newPeak = total > s_peakTotal;
+    if (newPeak) { s_peakTotal = total; s_peakInHeap = inHeap; s_peakOut = outHeap; }
+    fprintf(stderr, "LXRGC: [commit-breakdown] tag=%lld committedTotal=%lldMB inHeapReserve=%lldMB outside=%lldMB g_committedInUse=%lldMB hwm=%lldMB %s(peakTotal=%lldMB inHeap=%lldMB out=%lldMB)\n",
+            (long long)stallN, (long long)(total >> 20),
+            (long long)(inHeap >> 20), (long long)(outHeap >> 20),
+            (long long)(g_committedInUse >> 20),
+            (long long)((g_lxrGCHeap->HeapHighWater() - hbase) >> 20),
+            newPeak ? "*NEW* " : "", (long long)(s_peakTotal >> 20),
+            (long long)(s_peakInHeap >> 20), (long long)(s_peakOut >> 20));
+    fflush(stderr);
+}
+
 Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_t flags)
 {
     // Provision this thread's write-barrier buffers here (safe frame), so the
@@ -7783,8 +7869,11 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
         g_gcTriggerBytes = mb * (int64_t)1024 * 1024;
         const char* pctEnv = getenv("LXR_GC_GROWTH_PCT");
         g_gcGrowthPct = pctEnv ? _atoi64(pctEnv) : 50; // grow the heap by 50% before collecting
+        const char* bpEnv = getenv("LXR_GC_BACKPRESSURE_MB");
+        int64_t bpMb = bpEnv ? _atoi64(bpEnv) : 256; // hard-cap floor: block allocators once committed runs this far ahead
+        g_gcBackpressureBytes = bpMb * (int64_t)1024 * 1024;
     }
-    if (g_theGCToCLR != nullptr && g_gcTriggerBytes > 0 && g_inCollection == 0)
+    if (g_theGCToCLR != nullptr && g_gcTriggerBytes > 0 && g_inCollection == 0 && !g_forceSyncTrace)
     {
         int64_t live = g_lxrCounters.LastCollectCommitted;
         int64_t budget = g_gcTriggerBytes;
@@ -7821,6 +7910,86 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
     {
         FinalizeChunk(th.CurrentChunkIndex, acontext->alloc_ptr);
         th.CurrentChunkIndex = -1;
+    }
+
+    // Allocation backpressure: bound peak footprint under a pure-allocation storm.
+    // The async trigger above is fire-and-forget, so N zero-delay allocator threads
+    // can outrun the single collector without bound (heap grows to the full
+    // allocation). Here, once committed-in-use has run >= max(floor, live) ahead of
+    // the last full trace, BLOCK this thread on a synchronous forced trace,
+    // throttling mutators to the collector's reclamation rate. Baseline is
+    // g_lastTraceCommitted (post-trace / true-live proxy), NOT LastCollectCommitted
+    // (which the frequent async RC pauses reset to the current runaway committed).
+    // MUST run here, AFTER FinalizeChunk retired this thread's chunk (so a trace
+    // that runs while we're parked sees only parseable regions and no in-progress
+    // chunk). We transition to PREEMPTIVE GC mode for the wait so the collector's
+    // SuspendEE can suspend us -- a cooperative thread parked here never reaches a
+    // GC poll and would hang SuspendEE (deadlock). DisablePreemptiveGC on the way
+    // out safely re-traps if another collection started meanwhile. A no-op for
+    // well-behaved workloads (a single/low-rate allocator never outruns the
+    // collector by a whole live-heap's worth between traces).
+    if (g_theGCToCLR != nullptr && g_gcBackpressureBytes > 0 && g_collectorReady)
+    {
+        int64_t live = g_lastSyncTraceCommitted;
+        // Bound committed to true-live + max(floor, live/2) headroom (i.e. ~1.5x
+        // live once live exceeds 2x the floor), NOT the old 2x live (max(floor,
+        // live)). true-live here already includes the un-reclaimable current
+        // nursery (young objects still in their birth-epoch grace period). The
+        // proportional half-live slack keeps a legitimately large-live app (e.g.
+        // a growing cache) from being force-collected on every small spike while
+        // still clamping a pure-allocation storm far below the old 2x.
+        int64_t hardCap = live / 2 > g_gcBackpressureBytes ? live / 2 : g_gcBackpressureBytes;
+        if (g_committedInUse - live >= hardCap)
+        {
+            int64_t n = InterlockedIncrement64(&g_lxrCounters.AllocBackpressureStalls);
+            static int s_bpDebug = -1;
+            if (s_bpDebug < 0) s_bpDebug = getenv("LXR_BP_DEBUG") ? 1 : 0;
+            if (s_bpDebug && (n <= 8 || (n % 64) == 0))
+                fprintf(stderr, "LXRGC: [backpressure] stall #%lld committed=%lldMB peak=%lldMB live=%lldMB cap=%lldMB hwm=%lldMB\n",
+                        (long long)n, (long long)(g_committedInUse >> 20),
+                        (long long)(g_peakCommitted >> 20),
+                        (long long)(live >> 20), (long long)(hardCap >> 20),
+                        (long long)((g_lxrGCHeap ? (g_lxrGCHeap->HeapHighWater() - g_lxrGCHeap->HeapBase()) : 0) >> 20));
+            if (s_bpDebug && (n == 1 || (n % 128) == 0))
+                LXRDumpCommittedBreakdown(n);
+            // Park until a trace actually COMPLETES and reclaims, not merely until a
+            // collection is "requested". Under the unified concurrent/multi-epoch
+            // config a forced trace on an idle collector only takes an SATB SNAPSHOT
+            // (meStart) and launches the background marker, returning having freed
+            // nothing; a single wait=true request would unblock right after that
+            // snapshot pause, so committed would not drop and g_lastTraceCommitted
+            // (our baseline) would ratchet up with the runaway heap. Instead loop:
+            // each iteration drives one collection to completion; the tiny burst
+            // live-graph lets the background marker reach quiescence on its own (no
+            // mutator needed), so the NEXT request performs the multi-epoch FINISH
+            // pause (meFinish) -> mark-authoritative sweep -> dead young reclaimed ->
+            // g_committedInUse drops and g_traceEpoch advances. Break as soon as a
+            // full trace completed (epoch advanced) or committed fell under the cap.
+            // Bounded iterations cap worst-case block time; PREEMPTIVE mode around
+            // the whole park lets the collector's SuspendEE suspend us (a cooperative
+            // thread parked here never reaches a GC poll and would hang SuspendEE).
+            bool toggled = g_theGCToCLR->EnablePreemptiveGC(); // suspendable while parked
+            InterlockedIncrement(&g_forceSyncTrace);           // refcount: >0 while ANY thread parked
+            for (int iter = 0; iter < 16; iter++)
+            {
+                RequestLXRCollection(/*wait*/ true, /*forceTrace*/ true);
+                int64_t curLive = g_lastSyncTraceCommitted;
+                int64_t curCap = curLive / 2 > g_gcBackpressureBytes ? curLive / 2 : g_gcBackpressureBytes;
+                if (g_committedInUse - curLive < curCap)
+                    break;                       // reclaimed enough (committed fell under the cap)
+                // Else keep driving: the FIRST forced request only finishes any
+                // in-flight concurrent trace (meFinish, which allocate-black-retains
+                // its window's young); once that returns the collector is TRACE_IDLE,
+                // so the NEXT request runs the SYNCHRONOUS STW trace whose zero
+                // mutator window lets the mark-authoritative sweep free all dead
+                // young and drop committed back to true-live. Bounded iterations cap
+                // worst-case park time; for a genuinely live heap the first check
+                // exits immediately (committed can't exceed 2x live in one park).
+                Sleep(1);                        // let the background marker drain toward quiescence
+            }
+            InterlockedDecrement(&g_forceSyncTrace);
+            if (toggled) g_theGCToCLR->DisablePreemptiveGC();
+        }
     }
 
     uint8_t* chunkStart = nullptr;
@@ -7876,6 +8045,7 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
                 return nullptr;
             th.CommitEnd += commitSize;
             InterlockedExchangeAdd64(&g_committedInUse, (int64_t)commitSize);
+            LXRNoteCommitted();
             // Commit the covering unlogged-bit (logged-table) pages for the newly
             // committed heap here, off the barrier, so the cooperative-mode barrier
             // never faults on or has to commit a reserved bitmap page.
@@ -8269,6 +8439,27 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     bool useConcurrent = (phase == LXRPhase::TracePause) && doTrace &&
                          g_concurrentEnabled && g_theGCToCLR != nullptr &&
                          !meStart;
+
+    // Backpressure override: when a stalled allocator is driving forced traces to
+    // reclaim (g_forceSyncTrace) and no concurrent trace is in flight, take the
+    // SYNCHRONOUS STW trace path instead of starting a long concurrent multi-epoch
+    // window. The STW trace's zero mutator window means nothing is allocate-blacked,
+    // so the mark-authoritative sweep frees all dead young and committed drops back
+    // to true-live -- exactly what backpressure needs. If a concurrent trace is
+    // MARKING, leave it to finish (meFinish) this call; the next park iteration
+    // finds TRACE_IDLE and does the STW trace.
+    if (g_forceSyncTrace && g_traceState == TRACE_IDLE &&
+        phase == LXRPhase::TracePause && doTrace && g_theGCToCLR != nullptr)
+    {
+        meStart = false;
+        useConcurrent = false;
+    }
+
+    // A synchronous STW trace completes this call iff we take the suspend-trace
+    // path: a TracePause that is neither the multi-epoch snapshot (meStart) nor a
+    // concurrent trace (useConcurrent). Its zero mutator window makes post-trace
+    // committed a valid true-live baseline for backpressure.
+    bool syncStwTrace = (phase == LXRPhase::TracePause) && doTrace && !meStart && !useConcurrent;
 
     int64_t pauseMicros = 0;
 
@@ -8836,6 +9027,8 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             else                               g_lxrCounters.WastagePctEwma = (wastagePct + 3 * prevW) / 4;
         }
         g_lastTraceCommitted = g_committedInUse;
+        if (syncStwTrace)
+            g_lastSyncTraceCommitted = g_committedInUse; // true-live backpressure baseline
         g_epochsSinceTrace = 0;
         // #6: age the nursery. Regions born in the window just ended (their blocks
         // stamped with the pre-bump g_traceEpoch) are no longer young after this
@@ -9224,6 +9417,9 @@ static void LXRCollectorThreadProc(void*)
         InterlockedExchange(&g_collectPending, 0);
         bool forceTrace = InterlockedExchange(&g_requestTrace, 0) != 0;
         RunLXRCollection(-1, forceTrace);
+        static int s_bpDbg2 = -1;
+        if (s_bpDbg2 < 0) s_bpDbg2 = getenv("LXR_BP_DEBUG") ? 1 : 0;
+        if (s_bpDbg2) LXRDumpCommittedBreakdown(-1);
         InterlockedIncrement64(&g_collectCompletedSeq);
         SetEvent(g_collectDoneEvent);
     }
