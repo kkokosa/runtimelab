@@ -4090,9 +4090,37 @@ static void SelectEvacCandidates()
         const char* f = getenv("LXR_EVAC_FRAG_PCT");
         s_fragPct = f ? _atoi64(f) : 50;
     }
+    // Paper §"limited judicious stop-the-world copying": bound the volume of
+    // mature copying per trace-finish so no single STW pause pays for an
+    // unbounded evacuation set. Two caps, whichever binds first:
+    //   LXR_EVAC_BUDGET_MB   - estimated LIVE bytes to copy (default 8 MiB);
+    //                          directly bounds copy + intra-region rebasing (4bIntra).
+    //   LXR_EVAC_MAX_REGIONS - candidate region count (default 64); bounds the
+    //                          incoming-edge remset work (4bRS gather/replay) which
+    //                          scales with the number of candidate regions.
+    // Regions are taken emptiest-first (highest DeadPctEstimate) so each MiB of
+    // budget frees the most space and copies the least. Regions that don't fit
+    // this cycle keep their DeadPctEstimate and simply become candidates on a
+    // later trace, spreading defragmentation across collections as the paper
+    // intends. A cap of 0 means "unbounded" (the pre-cap heap-wide behaviour).
+    static int64_t s_budgetBytes = -1;
+    static int64_t s_maxRegions  = -1;
+    if (s_budgetBytes < 0)
+    {
+        const char* b = getenv("LXR_EVAC_BUDGET_MB");
+        s_budgetBytes = (b ? _atoi64(b) : 8) * (int64_t)(1024 * 1024);
+    }
+    if (s_maxRegions < 0)
+    {
+        const char* r = getenv("LXR_EVAC_MAX_REGIONS");
+        s_maxRegions = r ? _atoi64(r) : 64;
+    }
     memset(g_evacCandidate, 0, g_evacCandidateSlots);
     size_t nCand = 0;
     EnterCriticalSection(&g_chunkLock);
+    // Collect the qualifying regions, then order emptiest-first and apply the caps.
+    struct EvacPick { size_t idx; uint8_t deadPct; size_t estLive; };
+    std::vector<EvacPick> picks;
     for (size_t i = 0; i < g_chunkCount; i++)
     {
         ChunkRegion& c = g_chunks[i];
@@ -4100,7 +4128,24 @@ static void SelectEvacCandidates()
             continue;
         if ((int64_t)c.DeadPctEstimate < s_fragPct)
             continue;
+        size_t total   = (size_t)(c.UsedEnd - c.Start);
+        size_t estLive = (total * (size_t)(100 - c.DeadPctEstimate)) / 100;
+        picks.push_back(EvacPick{ i, c.DeadPctEstimate, estLive });
+    }
+    // Emptiest (most dead) first: cheapest to copy, best space reclaimed per byte.
+    std::sort(picks.begin(), picks.end(),
+              [](const EvacPick& a, const EvacPick& b) { return a.deadPct > b.deadPct; });
+    size_t budgetUsed = 0;
+    for (const EvacPick& p : picks)
+    {
+        if (s_maxRegions > 0 && (int64_t)nCand >= s_maxRegions)
+            break;
+        if (s_budgetBytes > 0 && budgetUsed > 0 &&
+            budgetUsed + p.estLive > (size_t)s_budgetBytes)
+            break; // always admit at least one region even if it alone exceeds budget
+        ChunkRegion& c = g_chunks[p.idx];
         SetEvacCandidateRange(c.Start, c.UsedEnd);
+        budgetUsed += p.estLive;
         nCand++;
     }
     LeaveCriticalSection(&g_chunkLock);
@@ -4112,8 +4157,10 @@ static void SelectEvacCandidates()
     InterlockedExchange(&g_evacCandidateScope, 1);
     if (getenv("LXR_VERBOSE") != nullptr)
     {
-        fprintf(stderr, "LXRGC: [evac-cand] selected %zu candidate regions (>=%lld%% dead est)\n",
-                nCand, (long long)s_fragPct);
+        fprintf(stderr, "LXRGC: [evac-cand] selected %zu candidate regions (>=%lld%% dead est,"
+                        " ~%zu KiB est copy; cap %lld regions / %lld MiB)\n",
+                nCand, (long long)s_fragPct, budgetUsed / 1024,
+                (long long)s_maxRegions, (long long)(s_budgetBytes / (1024 * 1024)));
         fflush(stderr);
     }
 }
