@@ -184,6 +184,32 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28r** — **Attacked the two remaining trace-finish STW dominators
+  after 4b-intra (allocate-black parse + sweep liveness): clean WebApi MaxPause
+  15.9 ms → 10.8 ms (all sound).** With 4b-intra fixed, clean profiling showed the
+  heavy-cycle finish split between allocate-black (~5.7 ms) and the sweep (~4.4 ms,
+  ~all in phase-1 liveness). Two fixes, both `LXR_VERIFY_TRACE` clean (Errors=0, no
+  reclaim-of-marked / red-handed offenders): **(1) allocate-black floor-start**
+  (`45349aa`, `LXR_ALLOCBLACK_FLOOR_START` default on) — the allocate-black parse
+  in `ConcurrentTraceFinish` walked every object from each region's `c.Start`, but
+  only objects at/above the region's snapshot high-water (`floor = g_snapUsedEnd[i]`)
+  can be window-born. `floor` is an object boundary (a bump-pointer alloc_ptr/UsedEnd
+  captured at the STW snapshot pause; block reuse is suppressed for the window and
+  regions only grow), so the parse starts there and skips the entire static
+  pre-snapshot heap below it (both the parallel `AllocBlackScanFn` and the serial
+  fallback). allocblk ~5.7 → ~2.6 ms on heavy cycles. **(2) sweep RC-scan
+  page-bitmap** (`cb0fae7`) — `SweepAndSelectDefrag` phase-1 liveness was the whole
+  sweep cost, and its per-dead-region `ClearRCRange` (+ `AnyRCNonZeroInRange` on
+  fast concurrent finishes) probed RC side-table page residency with a
+  `VirtualQuery` syscall PER PAGE across every swept region. Replaced with a read
+  of the existing `m_rcPageCommitted` per-page bitmap (new `RCPageCommitted`): the
+  bit is published only after a page's `MEM_COMMIT` in `EnsureRCPage` and RC pages
+  are never decommitted, so a non-zero RC byte always implies a bit-set page →
+  skipping bit-clear pages is sound (provably all-zero). Sweep phase-1 liveness
+  ~3.5 → ~1.4 ms (over even more, ~3200, regions). Combined: clean 120 s WebApi
+  MaxPause 15.9 → 10.8 ms, TotalPause 117.8 → 83 ms; the giant one-off RC pauses
+  seen mid-session were confirmed environmental (a shared-machine stall,
+  non-reproducible on clean re-run).
 - **2026-07-28q** — **Optimized the evac fix-up 4b-intra step: mega evac-cycle
   fix-up 34 ms → 3.1 ms; clean MaxPause on WebApi 15.9 ms (all sound).** Clean
   (verify-unset) production profiling isolated the residual trace-finish STW spike
