@@ -30,6 +30,8 @@
 param(
     [ValidateSet("console", "webapi")]
     [string]$Scenario = "console",
+    [ValidateSet("lxrgc", "workstation", "server")]
+    [string]$GcMode = "lxrgc",
     [int]$DurationSeconds = 20,
     [string]$OutDir = ".\results\trace",
     [int]$AttachDelayMs = 1000,
@@ -57,33 +59,52 @@ if (-not (Test-Path $analyzerExe)) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDirFull = Convert-Path $OutDir
 
-# Full paper-parity LXR configuration.
-$lxrEnv = @{
-    DOTNET_GCName        = "LXRGC.dll"
-    LXR_CONCURRENT       = "1"
-    LXR_EVAC             = "1"
-    LXR_REMSET           = "1"
-    LXR_LINE_REUSE       = "1"
-    LXR_CONC_DECREMENTS  = "1"
-    LXR_YOUNG_RC         = "1"
-    LXR_NURSERY          = "1"
-    LXR_NURSERY_COPY     = "1"
-    LXR_MULTIEPOCH       = "1"
-    LXR_GC_THREADS       = "$GcThreads"
-    DOTNET_ReadyToRun    = "0"
+# Environment for the selected GC mode. For lxrgc: full paper-parity LXR config.
+# For workstation/server: the built-in .NET GC (no LXR), whose pauses the
+# analyzer reconstructs from the standard GCSuspendEEStart->GCRestartEEStop
+# events in the very same trace (uniform, out-of-process cross-GC measurement).
+switch ($GcMode) {
+    "lxrgc" {
+        $lxrEnv = @{
+            DOTNET_GCName        = "LXRGC.dll"
+            LXR_CONCURRENT       = "1"
+            LXR_EVAC             = "1"
+            LXR_REMSET           = "1"
+            LXR_LINE_REUSE       = "1"
+            LXR_CONC_DECREMENTS  = "1"
+            LXR_YOUNG_RC         = "1"
+            LXR_NURSERY          = "1"
+            LXR_NURSERY_COPY     = "1"
+            LXR_MULTIEPOCH       = "1"
+            LXR_GC_THREADS       = "$GcThreads"
+            DOTNET_ReadyToRun    = "0"
+        }
+    }
+    "workstation" {
+        $lxrEnv = @{ DOTNET_gcServer = "0"; DOTNET_gcConcurrent = "1"; DOTNET_ReadyToRun = "0" }
+    }
+    "server" {
+        $lxrEnv = @{ DOTNET_gcServer = "1"; DOTNET_gcConcurrent = "1"; DOTNET_ReadyToRun = "0" }
+    }
 }
 
+# The app must OUTLIVE the trace so dotnet-trace can Stop the session cleanly
+# (clean stop => rundown => complete .nettrace). If the trace outlives the app,
+# dotnet-trace's Stop hits a dead target (ServerNotAvailableException) and the
+# .nettrace is truncated ("Read past end of stream"). We therefore run the app
+# for DurationSeconds + a margin, and trace for DurationSeconds.
+$appDuration = $DurationSeconds + 10
 switch ($Scenario) {
     "console" {
         $publishDir = Join-Path $root "samples\ConsoleApp\publish"
         $exe = Join-Path $publishDir "ConsoleApp.exe"
-        $arguments = "$DurationSeconds"
+        $arguments = "$appDuration"
     }
     "webapi" {
         $publishDir = Join-Path $root "samples\WebApi\publish"
         $exe = Join-Path $publishDir "WebApi.exe"
         $arguments = ""
-        $lxrEnv["LXRGC_BENCH_DURATION_SECONDS"] = "$DurationSeconds"
+        $lxrEnv["LXRGC_BENCH_DURATION_SECONDS"] = "$appDuration"
         $lxrEnv["LXRGC_BENCH_LABEL"] = "trace"
     }
 }
@@ -95,7 +116,7 @@ $statsOut = Join-Path $OutDirFull "$Scenario-phasestats.json"
 foreach ($f in @($pauseLog, $traceOut, $statsOut)) { if (Test-Path $f) { Remove-Item $f -Force } }
 $lxrEnv["LXR_PAUSE_LOG"] = $pauseLog
 
-Write-Host "Launching $Scenario ($DurationSeconds s) under full LXR config..."
+Write-Host "Launching $Scenario (app $appDuration s) under $GcMode GC config..."
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exe
 $psi.WorkingDirectory = $publishDir
@@ -110,9 +131,11 @@ $stderrTask = $proc.StandardError.ReadToEndAsync()
 
 Start-Sleep -Milliseconds $AttachDelayMs
 Write-Host "Attaching dotnet-trace to PID $($proc.Id) (GC keyword 0x1)..."
-# Trace slightly longer than the app to be safe; dotnet-trace stops when the
-# target exits.
-$traceDuration = [TimeSpan]::FromSeconds($DurationSeconds + 5).ToString("hh\:mm\:ss")
+# Trace for nearly the whole app lifetime but stop a few seconds before the app
+# exits (app runs $appDuration) so dotnet-trace performs a clean rundown and
+# writes a complete .nettrace covering essentially the entire steady-state run.
+$traceSeconds = $appDuration - 4
+$traceDuration = [TimeSpan]::FromSeconds($traceSeconds).ToString("hh\:mm\:ss")
 $dtArgs = @("collect", "--process-id", $proc.Id,
     "--providers", "Microsoft-Windows-DotNETRuntime:0x1:4",
     "--duration", $traceDuration, "--output", $traceOut)
