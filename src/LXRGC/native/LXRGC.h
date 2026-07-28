@@ -466,6 +466,11 @@ public:
     void ClearRCRange(uint8_t* start, uint8_t* end);
     void VerifyTraceComplete();         // diagnostic: LXR_VERIFY_TRACE=1
     int64_t CompleteClosureOverMarked(); // finish pause: close closure over all marked objects
+    // One lane of the parallel CompleteClosureOverMarked parse: scans its stripe
+    // of committed chunks, and for every currently-marked object collects its
+    // still-unmarked children into 'out' (and marks its lines when markLines).
+    // Marks nothing itself, so all lanes read a stable mark bitmap race-free.
+    void ClosureScanStripe(int lane, int lanes, std::vector<Object*>& out, bool markLines);
     int64_t MarkModifiedNewValues();     // finish pause: reconcile concurrent-marking race via modified set
     // Immix line marking (LXR_LINE_REUSE): record every 256 B line touched by a
     // live object [obj, obj+size) in the line-mark side table. Accumulated at the

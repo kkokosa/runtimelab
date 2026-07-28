@@ -698,6 +698,9 @@ static std::vector<std::vector<Object*>>* g_poolSlices = nullptr; // slice[w+1] 
 static class LXRCollector* g_poolCollector = nullptr;
 static void LXRMarkWorkerProc(void* idx);
 static void EnsureMarkWorkerPool();
+// Forward decl: RunOnPool is defined below (after the worker pool), but
+// CompleteClosureOverMarked (above it) dispatches a parallel parse through it.
+static void RunOnPool(int lanes, void (*fn)(int lane, int lanes, void* ctx), void* ctx);
 
 // Item G (§3.5): the same persistent pool also runs a generic parallel-for so
 // phases beyond marking (parallel reference-count apply) scale across the GC
@@ -2714,8 +2717,91 @@ static bool LXRBornInWindow(uint8_t* addr)
     return false;
 }
 
+// One lane of the parallel closure parse (see header). Reads the mark bitmap and
+// object shapes only; the sole write is per-object MarkLines (disjoint line-mark
+// bytes), so lanes never race. Collects still-unmarked children of marked objects
+// into 'out'; the caller serially PushMark's them (atomic-claim dedups) then drains.
+void LXRCollector::ClosureScanStripe(int lane, int lanes, std::vector<Object*>& out, bool markLines)
+{
+    for (size_t i = (size_t)lane; i < g_chunkCount; i += (size_t)lanes)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        if (!AnyMarkedInRange(c.Start, end)) continue;
+        uint8_t* p = c.Start;
+        while (p < end)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            if (IsMarked(o))
+            {
+                if (markLines) MarkLines(o, sz);
+                GCScanObjectRefs(o, sz, [this, &out](Object** ref)
+                {
+                    Object* child = *ref;
+                    if (child != nullptr && InHeap(child) && !IsMarked(child))
+                        out.push_back(child);
+                });
+            }
+            p += sz;
+        }
+    }
+}
+
+struct ClosureScanCtx { std::vector<Object*>* laneOut; bool markLines; };
+static void ClosureScanFn(int lane, int lanes, void* ctxp)
+{
+    ClosureScanCtx* ctx = (ClosureScanCtx*)ctxp;
+    g_poolCollector->ClosureScanStripe(lane, lanes, ctx->laneOut[lane], ctx->markLines);
+}
+
 int64_t LXRCollector::CompleteClosureOverMarked()
 {
+    // Fast, parallel path for the overflow fallback: the serial parse below is an
+    // O(live-heap) walk under g_chunkLock that dominated the finish pause on heavy
+    // (multi-epoch / modified-buffer-overflow) cycles. g_chunks is stable in the
+    // STW finish (mutators suspended, no alloc/registration), so the parse needs
+    // no g_chunkLock and each lane can take a disjoint chunk stripe. Every pass:
+    // parallel-collect unmarked children of currently-marked objects, then serially
+    // PushMark them (atomic-claim dedups across lanes) and parallel-drain their
+    // transitive closure; iterate to a fixpoint (a pass adding nothing proves
+    // completeness), identical semantics to the serial linear-parse fixpoint.
+    static int s_parClosure = -1;
+    if (s_parClosure < 0)
+    {
+        const char* e = getenv("LXR_PARALLEL_CLOSURE");
+        s_parClosure = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+    }
+    if (s_parClosure && g_poolWorkers > 0 && g_chunkCount >= 64)
+    {
+        int lanes = g_poolWorkers + 1;
+        int64_t newlyMarked = 0;
+        bool progress = true;
+        bool markLines = (g_lineMarksValid != 0);
+        std::vector<std::vector<Object*>> laneOut((size_t)lanes);
+        while (progress)
+        {
+            progress = false;
+            for (std::vector<Object*>& v : laneOut) v.clear();
+            ClosureScanCtx ctx{ laneOut.data(), markLines };
+            RunOnPool(lanes, &ClosureScanFn, &ctx);
+            for (std::vector<Object*>& v : laneOut)
+                for (Object* child : v)
+                    if (!IsMarked(child))
+                    {
+                        PushMark(child); // atomic-claim + enqueue; serial here, stack-safe
+                        newlyMarked++;
+                        progress = true;
+                    }
+            DrainClosure(); // parallel transitive drain of everything just pushed
+        }
+        if (newlyMarked != 0 && getenv("LXR_VERIFY_TRACE") != nullptr)
+            fprintf(stderr, "LXRGC: [closure] parallel gap closed: total=%lld\n", (long long)newlyMarked);
+        return newlyMarked;
+    }
+
     int64_t newlyMarked = 0;
     int64_t gapBornInWindow = 0, gapSnapshotEra = 0;
     int reported = 0;
@@ -4233,6 +4319,13 @@ static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
     }
 }
 
+// Sub-phase timers for ConcurrentTraceFinish (STW closure), populated when
+// LXR_FINISH_PROFILE is set and surfaced in the [finish-prof] line. Let us tell
+// apart the residual drain, the allocate-black parse+drain, the final root
+// rescan, and the modified-slot race reconciliation inside the "closure" bucket.
+int64_t g_cfResidualMicros = 0, g_cfAllocBlackMicros = 0;
+int64_t g_cfFinalRescanMicros = 0, g_cfRaceMicros = 0, g_cfFullClosureMicros = 0;
+
 // Called under the STW *finish* pause. Consumes residual SATB, finishes the
 // closure, then applies allocate-black: every object allocated since the
 // snapshot (at/above its region's snapshot high-water) is retained this cycle so
@@ -4240,9 +4333,19 @@ static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
 // SATB window.
 void LXRCollector::ConcurrentTraceFinish()
 {
+    static int s_cfProf = -1;
+    if (s_cfProf < 0) s_cfProf = (getenv("LXR_FINISH_PROFILE") != nullptr) ? 1 : 0;
+    LARGE_INTEGER cfFreq; if (s_cfProf) QueryPerformanceFrequency(&cfFreq);
+    auto cfNow = [&]() { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q; };
+    auto cfUs = [&](LARGE_INTEGER a, LARGE_INTEGER b) { return s_cfProf ? (int64_t)((b.QuadPart - a.QuadPart) * 1000000 / cfFreq.QuadPart) : 0; };
+    if (s_cfProf) { g_cfResidualMicros = g_cfAllocBlackMicros = g_cfFinalRescanMicros = g_cfRaceMicros = g_cfFullClosureMicros = 0; }
+    LARGE_INTEGER cf0 = cfNow();
+
     // Residual deletions logged between the last concurrent pass and the pause.
     DrainSatbBuffers();
     DrainClosure();
+    LARGE_INTEGER cfResidual = cfNow();
+    if (s_cfProf) g_cfResidualMicros = cfUs(cf0, cfResidual);
 
     // SATB overflow fallback: if any mutator dropped a snapshot entry during the
     // window (its pre-sized buffer filled), the off-pause closure may be
@@ -4339,6 +4442,8 @@ void LXRCollector::ConcurrentTraceFinish()
     // Trace the transitive closure of every allocate-black object just pushed, so
     // their referents (incl. snapshot-era objects they solely reference) are marked.
     DrainClosure();
+    LARGE_INTEGER cfAllocBlack = cfNow();
+    if (s_cfProf) g_cfAllocBlackMicros = cfUs(cfResidual, cfAllocBlack);
 
     // FINAL ROOT RESCAN (the concurrent-mark completion pause). A Yuasa SATB
     // deletion barrier keeps every object reachable *through the heap* at snapshot
@@ -4371,6 +4476,8 @@ void LXRCollector::ConcurrentTraceFinish()
                         (long long)rescanNew);
         }
     }
+    LARGE_INTEGER cfRescan = cfNow();
+    if (s_cfProf) g_cfFinalRescanMicros = cfUs(cfAllocBlack, cfRescan);
 
     // Concurrent-marking-race reconciliation (LXR difference #3). The off-pause
     // drain can scan an object before a mutator installs a new reference into it;
@@ -4389,20 +4496,28 @@ void LXRCollector::ConcurrentTraceFinish()
     // the trace complete (closureGap must be 0). In production with no overflow it
     // never runs.
     bool needFullClosure = g_satbOverflow || g_modifiedOverflow;
+    // Diagnostic A/B: force the O(live-heap) overflow-fallback closure every finish
+    // to measure it head-to-head (parallel default vs LXR_PARALLEL_CLOSURE=0) and
+    // stress its soundness. Off by default; never affects production paths.
+    static int s_forceClosure = -1;
+    if (s_forceClosure < 0) s_forceClosure = (getenv("LXR_FORCE_FULLCLOSURE") != nullptr) ? 1 : 0;
     int64_t raceMarked = 0;
     if (!needFullClosure)
     {
         raceMarked = MarkModifiedNewValues();
         DrainClosure();
     }
+    if (s_cfProf) g_cfRaceMicros = cfUs(cfRescan, cfNow());
     InterlockedExchange(&g_traceCompleteThisCycle, 1);
 
     static int s_verify = -1;
     if (s_verify < 0) s_verify = (getenv("LXR_VERIFY_TRACE") != nullptr) ? 1 : 0;
 
-    if (needFullClosure || s_verify)
+    if (needFullClosure || s_verify || s_forceClosure)
     {
+        LARGE_INTEGER fc0 = cfNow();
         int64_t closureGap = CompleteClosureOverMarked();
+        if (s_cfProf) g_cfFullClosureMicros = cfUs(fc0, cfNow());
         if (closureGap != 0)
         {
             InterlockedExchangeAdd64(&g_lxrCounters.ClosureGapMarked, closureGap);
@@ -7944,8 +8059,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 extern int64_t g_evac4aMicros, g_evac4bRemsetMicros;
                 extern int64_t g_evac4bReplayMicros, g_evac4bSlots;
                 extern int64_t g_evacPinMicros, g_evacSelMicros;
-                fprintf(stderr, "LXRGC: [finish-prof] me total=%lldus closure=%lldus buffers=%lldus evac=%lldus(pin=%lld sel=%lld copy=%lld fix=%lld[4a=%lld 4bRS=%lld{gather=%lld replay=%lld n=%lld} 4bIntra=%lld] free=%lld) sweep+compact=%lldus\n",
-                        (long long)pauseMicros, us(tf0,tf1), us(tf1,tf2), us(tf2,tfEvac),
+                extern int64_t g_cfResidualMicros, g_cfAllocBlackMicros, g_cfFinalRescanMicros, g_cfRaceMicros, g_cfFullClosureMicros;
+                fprintf(stderr, "LXRGC: [finish-prof] me total=%lldus closure=%lldus[resid=%lld allocblk=%lld rescan=%lld race=%lld fullclosure=%lld] buffers=%lldus evac=%lldus(pin=%lld sel=%lld copy=%lld fix=%lld[4a=%lld 4bRS=%lld{gather=%lld replay=%lld n=%lld} 4bIntra=%lld] free=%lld) sweep+compact=%lldus\n",
+                        (long long)pauseMicros, us(tf0,tf1),
+                        (long long)g_cfResidualMicros, (long long)g_cfAllocBlackMicros,
+                        (long long)g_cfFinalRescanMicros, (long long)g_cfRaceMicros, (long long)g_cfFullClosureMicros,
+                        us(tf1,tf2), us(tf2,tfEvac),
                         (long long)g_evacPinMicros, (long long)g_evacSelMicros,
                         (long long)g_evacCopyMicros, (long long)g_evacFixupMicros,
                         (long long)g_evac4aMicros, (long long)g_evac4bRemsetMicros,
