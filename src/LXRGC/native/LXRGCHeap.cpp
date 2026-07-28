@@ -4918,10 +4918,11 @@ static void Evac4bFn(int lane, int lanes, void* ctxp)
 // VirtualQuery cache) is DROPPED. Duplicate slots are harmless - rebase is
 // idempotent (a slot already pointing at an evac DEST is neither a forwarding-map
 // key nor inside any moved-source range, so a second visit is a no-op), which also
-// makes the optional parallel path race-free without dedup. Parallel replay is a
-// safety valve for a pathologically huge remset only: at typical counts (~10^4)
-// the 16-thread RunOnPool wakeup (~0.4ms) exceeds the whole serial rebase, so the
-// default threshold keeps it serial.
+// makes the optional parallel path race-free without dedup. At typical counts
+// (~10^4) the serial rebase is comparable to the ~0.4ms pool wakeup, so the default
+// threshold (LXR_EVAC_PARALLEL_4B_MIN=16384) keeps those serial and only
+// parallelizes the heavy multi-epoch spikes (n~40-50k) where serial replay was the
+// ~5.5ms trace-finish dominator.
 static void EvacReplayIncoming(std::vector<Object**>& slots,
                                std::unordered_map<Object*, Object*>& forwarding,
                                std::vector<EvacMovedRange>& movedRanges)
@@ -4957,7 +4958,11 @@ static void EvacReplayIncoming(std::vector<Object**>& slots,
         const char* e = getenv("LXR_EVAC_PARALLEL_4B");
         s_par = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON (but gated by s_parMin)
         const char* m = getenv("LXR_EVAC_PARALLEL_4B_MIN");
-        s_parMin = m ? (int)_atoi64(m) : 131072; // only parallelize a pathologically huge remset
+        // Break-even measured on WebApi multi-epoch spikes: serial replay ~110 ns/
+        // slot, pool wakeup ~0.4 ms, so parallel wins above ~5-6k slots. Typical
+        // finish cycles have n~7-10k and stay near serial; the heavy multi-epoch
+        // spikes (n~40-50k, formerly the ~5.5 ms trace-finish dominator) parallelize.
+        s_parMin = m ? (int)_atoi64(m) : 16384;
     }
     int lanes = (s_par && g_poolWorkers > 0 && slots.size() >= (size_t)s_parMin)
                     ? (g_poolWorkers + 1) : 1;
