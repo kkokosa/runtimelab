@@ -7687,6 +7687,52 @@ static void LXRRestartEE()
         SetEvent(g_gcCompleteEvent); // release threads parked in WaitUntilGCComplete
 }
 
+// --- LXR-specific EventPipe/ETW events (surfaced as GCDynamicEvent) ----------
+// LXR is a standalone GC. The runtime fires only ~1/3 of LXR's SuspendEE pauses
+// as implicit GCSuspendEEBegin/RestartEEEnd (it coalesces a standalone GC's
+// repeated concurrent suspensions), so an out-of-process trace of the built-in
+// suspend events undercounts LXR pauses ~3x and gives zero insight into LXR's
+// own phases. To let dotnet-trace / PerfView capture EVERY LXR pause AND surface
+// per-phase timings analogous to the built-in GC's mark/sweep events, LXR emits
+// its OWN dynamic GC events through the (unmodified) GC->EE event sink:
+// IGCToCLREventSink::FireDynamicEvent surfaces as a GCDynamicEvent (under the GC
+// keyword 0x1) whose Name is "LXRGCPause"/"LXRGCPhase" and whose payload is a
+// NUL-terminated ASCII "key=val;..." string. NO runtime change is required -
+// FireDynamicEvent is part of the standalone-GC contract, and the underlying
+// FireEtwGCDynamicEvent self-gates (no-op) when the provider is not enabled, so
+// this is free when nothing is tracing (pauses/phases are infrequent regardless).
+static void LXREmitDynamicEvent(const char* name, const char* payload)
+{
+    if (g_theGCToCLR == nullptr) return;
+    IGCToCLREventSink* sink = g_theGCToCLR->EventSink();
+    if (sink == nullptr) return;
+    sink->FireDynamicEvent(name, (void*)payload, (uint32_t)(strlen(payload) + 1));
+}
+static void LXREmitPauseEvent(const char* type, int64_t micros)
+{
+    if (micros <= 0) return;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "type=%s;micros=%lld;epoch=%lld",
+             type, (long long)micros, (long long)g_lxrCounters.Epochs);
+    LXREmitDynamicEvent("LXRGCPause", buf);
+}
+// concurrent=1 => ran off-pause (mutators live); 0 => inside an STW pause.
+static void LXREmitPhaseEvent(const char* phaseName, int64_t micros, int concurrent)
+{
+    if (micros <= 0) return;
+    char buf[160];
+    snprintf(buf, sizeof(buf), "phase=%s;micros=%lld;concurrent=%d",
+             phaseName, (long long)micros, concurrent);
+    LXREmitDynamicEvent("LXRGCPhase", buf);
+}
+static void LXREmitPhaseQpc(const char* phaseName, LARGE_INTEGER a, LARGE_INTEGER b,
+                            LARGE_INTEGER freq, int concurrent)
+{
+    if (freq.QuadPart == 0) return;
+    int64_t micros = (int64_t)((b.QuadPart - a.QuadPart) * 1000000 / freq.QuadPart);
+    LXREmitPhaseEvent(phaseName, micros, concurrent);
+}
+
 // Runs one LXR epoch. Every epoch replays the coalescing-RC modified buffers (a
 // cheap RC pause). Occasionally - as decided by DecidePhase - the epoch is a full
 // TracePause that additionally runs a stop-the-world backup trace + Immix sweep,
@@ -7820,6 +7866,9 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             if (s_sp < 0) s_sp = (getenv("LXR_FINISH_PROFILE") != nullptr) ? 1 : 0;
             if (s_sp) { fprintf(stderr, "LXRGC: [snap-prof] total=%lldus bufs=%lldus snap=%lldus\n", (long long)pauseMicros, (long long)((tb1.QuadPart-tb0.QuadPart)*1000000/freq.QuadPart), (long long)((tb2.QuadPart-tb1.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
         }
+        // LXR phase events (STW snapshot sub-phases): buffer detach + SATB snapshot.
+        LXREmitPhaseQpc("snapshot-buffers", tb0, tb1, freq, 0);
+        LXREmitPhaseQpc("snapshot-mark",    tb1, tb2, freq, 0);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] multi-epoch trace snapshot (pause=%lldus)\n", (long long)pauseMicros); fflush(stderr); }
     }
     else if (meFinish)
@@ -7868,6 +7917,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             g_lxrCollector.SweepAndSelectDefrag();
         QueryPerformanceCounter(&tf3);
         if (verbose) { fprintf(stderr, "LXRGC: [stage]   finish breakdown: finish=%lldus bufs=%lldus evac=%lldus sweep=%lldus\n", (long long)((tf1.QuadPart-tf0.QuadPart)*1000000/freq.QuadPart), (long long)((tf2.QuadPart-tf1.QuadPart)*1000000/freq.QuadPart), (long long)((tfEvac.QuadPart-tf2.QuadPart)*1000000/freq.QuadPart), (long long)((tf3.QuadPart-tfEvac.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
+        // LXR phase events (STW trace-finish sub-phases).
+        LXREmitPhaseQpc("trace-finish",  tf0,   tf1,   freq, 0);
+        LXREmitPhaseQpc("finish-buffers",tf1,   tf2,   freq, 0);
+        LXREmitPhaseQpc("evacuate",      tf2,   tfEvac,freq, 0);
+        LXREmitPhaseQpc("sweep",         tfEvac,tf3,   freq, 0);
         // Item F: PRUNE the persistent remembered set (drop stale/duplicate
         // entries; rebuild from marks on prior overflow) instead of clearing it -
         // clearing would drop the evac copies' just-recorded memcpy out-edges that
@@ -7914,6 +7968,8 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (doBuffers)
             g_lxrCollector.ProcessSnapshotDecrements();
         QueryPerformanceCounter(&td1);
+        // Off-pause phase event: the lazy RC decrement + recursive-free replay.
+        LXREmitPhaseQpc("concurrent-decrements", td0, td1, freq, 1);
         // Off-pause: physically decommit the regions the STW sweep deferred (the
         // dominant former in-pause cost). Mutators are live; limbo regions are not
         // yet on the free list so the allocator can't hand them out mid-drain.
@@ -7951,6 +8007,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         QueryPerformanceCounter(&a1);
         int64_t snapMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent snapshot done (pause=%lldus)\n", (long long)snapMicros); fflush(stderr); }
+        LXREmitPhaseEvent("snapshot", snapMicros, 0);
 
         // --- Concurrent drain (mutators running) ---
         QueryPerformanceCounter(&a0);
@@ -7969,6 +8026,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         QueryPerformanceCounter(&a1);
         int64_t drainMicros = (int64_t)((a1.QuadPart - a0.QuadPart) * 1000000 / freq.QuadPart);
         if (verbose) { fprintf(stderr, "LXRGC: [stage] concurrent drain done (%lldus off-pause)\n", (long long)drainMicros); fflush(stderr); }
+        LXREmitPhaseEvent("concurrent-mark-drain", drainMicros, 1);
 
         // --- Finish pause (STW): residual SATB, allocate-black, evac, sweep ---
         QueryPerformanceCounter(&a0);
@@ -8043,6 +8101,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                     (long long)finMicros, us(cf0,cf1), us(cf1,cf2), us(cf2,cf3), us(cf3,cf4));
             fflush(stderr);
         }
+        // LXR phase events (STW concurrent-finish sub-phases).
+        LXREmitPhaseQpc("trace-finish",  cf0, cf1, freq, 0);
+        LXREmitPhaseQpc("finish-buffers",cf1, cf2, freq, 0);
+        LXREmitPhaseQpc("evacuate",      cf2, cf3, freq, 0);
+        LXREmitPhaseQpc("sweep",         cf3, cf4, freq, 0);
 
         pauseMicros = snapMicros + finMicros;
         InterlockedExchangeAdd64(&g_lxrCounters.ConcSnapshotMicros, snapMicros);
@@ -8211,6 +8274,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             fflush(s_pauseLog);
         }
     }
+    // Per-pause dynamic event: fire "LXRGCPause" for EVERY LXR pause so an
+    // out-of-process dotnet-trace / PerfView captures the complete pause
+    // distribution (the built-in GCSuspendEEBegin/RestartEEEnd events undercount
+    // LXR ~3x). Same type taxonomy as the LXR_PAUSE_LOG line.
+    LXREmitPauseEvent(meStart ? "snapshot" : (meFinish ? "finish" :
+        (phase == LXRPhase::TracePause ? "tracepause" : "rcpause")), pauseMicros);
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     // Pause-time telemetry (feeds GetTotalPauseDuration / GetLastGCPercentTimeInGC,
     // consumed by the dotnet.gc.pause.time meter + "% Time in GC" EventCounter, and

@@ -184,6 +184,41 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28n** — **LXR emits its OWN EventPipe events (pauses + phases),
+  captured & analyzed out-of-process — no runtime change.** Earlier finding: the
+  runtime fires only ~1/3 of LXR's `SuspendEE` pauses as implicit
+  `GCSuspendEEBegin/RestartEEEnd` (it coalesces a standalone GC's repeated
+  concurrent suspensions), so an out-of-process trace of the built-in suspend
+  events undercounts LXR pauses ~3×. Fix: LXR now fires its own GC **dynamic**
+  events through the (unmodified) standalone-GC event sink —
+  `g_theGCToCLR->EventSink()->FireDynamicEvent(name, payload, size)` (reachable via
+  the existing `IGCToCLR::EventSink()` contract; surfaces as a `GCDynamicEvent`
+  under GC keyword 0x1, self-gated by `FireEtwGCDynamicEvent` so it is free when
+  nothing is tracing). **NO runtime change, no `FEATURE_EVENT_TRACE` dependency, no
+  gcevents.h registration.** Two event families (`LXRGCHeap.cpp`
+  `LXREmitDynamicEvent`/`LXREmitPauseEvent`/`LXREmitPhaseEvent`, NUL-terminated
+  ASCII `key=val;…` payloads): **(1)** `LXRGCPause` — one per pause at the unified
+  finalize site (`type=snapshot|finish|tracepause|rcpause;micros=…;epoch=…`), so a
+  trace captures EVERY LXR pause; **(2)** `LXRGCPhase` — per-phase timings
+  analogous to the built-in GC's mark/sweep events, emitted at the existing
+  sub-phase QPC boundaries in all pause branches (`snapshot-buffers`,
+  `snapshot-mark`, `trace-finish`, `finish-buffers`, `evacuate`, `sweep`,
+  `concurrent-mark-drain` + `concurrent-decrements` flagged `concurrent=1`
+  off-pause). New offline tooling: **`tools/TraceAnalyzer`** (TraceEvent) reads a
+  `.nettrace`, reconstructs the LXR pause distribution + per-phase breakdown from
+  the dynamic events AND the built-in-GC pauses from `GCSuspendEEStart→
+  GCRestartEEStop` (uniform cross-GC, all outside the app), emits stats JSON;
+  **`capture-lxr-trace.ps1`** launches a sample under full LXR config, attaches
+  `dotnet-trace` by PID (attach-by-PID avoids the EventPipe attach-during-startup
+  hang; `dotnet-trace -- <app>` was unusable — its child launcher drops our CWD so
+  the relative `DOTNET_GCName` can't resolve), runs the analyzer, and cross-checks
+  against the complete in-process `LXR_PAUSE_LOG`; **`generate-phase-report.ps1`**
+  renders a self-contained phase-insights HTML (inline SVG). Validated on ConsoleApp
+  under the full config: captured `LXRGCPause`/`LXRGCPhase` payloads exactly (e.g.
+  `phase=sweep;micros=3141;concurrent=0`, `type=finish;micros=6531;epoch=7`);
+  analyzer shows the STW cost profile sweep > evacuate > trace-finish with
+  `concurrent-decrements` off-pause — the expected paper shape. Caveat: attach-by-
+  PID misses the sub-second startup burst (still fully in `LXR_PAUSE_LOG`).
 - **2026-07-28m** — **Precise per-pause STW latency measurement (paper-grade tail
   latency), uniform across all three GCs.** The report's pause column was derived
   from the 1Hz `dotnet-counters` "% time in GC" series, whose sampling missed LXR's
