@@ -4338,11 +4338,12 @@ static void LXRPromoteRootFinal(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint3
 // O(live-heap) cost; the mark-claim + push is deferred to a small serial merge.
 // STW finish, pool idle, marker parked -> plain IsMarked reads are race-free (each
 // object lives in exactly one chunk owned by one lane).
-struct AllocBlackCtx { std::vector<Object*>* laneOut; };
+struct AllocBlackCtx { std::vector<Object*>* laneOut; bool floorStart; };
 static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
 {
     AllocBlackCtx* ctx = (AllocBlackCtx*)ctxp;
     std::vector<Object*>& out = ctx->laneOut[lane];
+    bool floorStart = ctx->floorStart;
     for (size_t i = (size_t)lane; i < g_chunkCount; i += (size_t)lanes)
     {
         ChunkRegion& c = g_chunks[i];
@@ -4352,7 +4353,13 @@ static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
         if (i < g_snapChunkCount && g_snapUsedEnd != nullptr && i < g_snapUsedEnd->size())
             floor = (*g_snapUsedEnd)[i];
         uint8_t* usedEnd = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-        uint8_t* p = c.Start;
+        // Only objects at/above the region's snapshot high-water can be window-born.
+        // floor is an object boundary (a bump-pointer alloc_ptr/UsedEnd captured at
+        // the STW snapshot pause; block reuse is suppressed for the window and
+        // regions only grow), so start the parse there and skip the entire static
+        // pre-snapshot heap below it - the dominant allocate-black parse cost on
+        // long multi-epoch cycles.
+        uint8_t* p = floorStart ? floor : c.Start;
         while (p < usedEnd)
         {
             Object* o = (Object*)p;
@@ -4431,10 +4438,17 @@ void LXRCollector::ConcurrentTraceFinish()
         s_parAB = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
     }
     int abLanes = (s_parAB && g_poolWorkers > 0 && g_chunkCount >= 64) ? (g_poolWorkers + 1) : 1;
+    static int s_abFloor = -1;
+    if (s_abFloor < 0)
+    {
+        const char* e = getenv("LXR_ALLOCBLACK_FLOOR_START");
+        s_abFloor = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+    }
+    bool abFloorStart = (s_abFloor != 0);
     if (abLanes > 1)
     {
         std::vector<std::vector<Object*>> laneOut((size_t)abLanes);
-        AllocBlackCtx ctx{ laneOut.data() };
+        AllocBlackCtx ctx{ laneOut.data(), abFloorStart };
         RunOnPool(abLanes, &AllocBlackScanFn, &ctx);
         for (std::vector<Object*>& v : laneOut)
             for (Object* o : v)
@@ -4455,7 +4469,10 @@ void LXRCollector::ConcurrentTraceFinish()
         if (i < g_snapChunkCount && g_snapUsedEnd != nullptr && i < g_snapUsedEnd->size())
             floor = (*g_snapUsedEnd)[i];
         uint8_t* usedEnd = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-        uint8_t* p = c.Start;
+        // floor is an object boundary captured at the STW snapshot; only objects
+        // at/above it can be window-born, so start the parse there (skip the static
+        // pre-snapshot heap below floor).
+        uint8_t* p = abFloorStart ? floor : c.Start;
         while (p < usedEnd)
         {
             Object* o = (Object*)p;
