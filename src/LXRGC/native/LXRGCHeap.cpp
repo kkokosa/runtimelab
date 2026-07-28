@@ -1454,6 +1454,25 @@ uint8_t* LXRCollector::RCSlot(Object* obj) const
     return &m_rcTable[idx];
 }
 
+// Read-only test of the per-page RC-table committed bitmap (see EnsureRCPage).
+// A set bit is published only AFTER the page's MEM_COMMIT and RC pages are never
+// decommitted, so a set bit always implies a committed, readable page and a clear
+// bit a never-touched (all-zero) page. Lets the sweep's RC scans/clears skip
+// uncommitted pages without a VirtualQuery syscall. If the bitmap failed to
+// allocate at Init (degenerate), fall back to the original VirtualQuery probe so
+// we never read/memset a reserved-only (uncommitted) page.
+bool LXRCollector::RCPageCommitted(uint8_t* slot) const
+{
+    if (m_rcPageCommitted == nullptr)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        return VirtualQuery(slot, &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT;
+    }
+    size_t pg = (size_t)((uintptr_t)slot - (uintptr_t)m_rcTable) / g_pageSize;
+    if (pg >= m_rcPageCount) return false;
+    return (m_rcPageCommitted[pg >> 3] & (uint8_t)(1u << (pg & 7))) != 0;
+}
+
 // Commit the RC-table page backing `slot` lazily, but only once per page (a
 // per-page committed bit avoids a VirtualAlloc syscall on every RC op). Safe
 // under the parallel free cascade: the bit is set only AFTER the commit, so a
@@ -2583,10 +2602,13 @@ bool LXRCollector::AnyRCNonZeroInRange(uint8_t* start, uint8_t* end) const
     while (p < rcEnd)
     {
         uint8_t* pageEnd = p + g_pageSize;
-        MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
+        // A committed RC page is tracked by the per-page bitmap (bit set AFTER the
+        // MEM_COMMIT in EnsureRCPage; RC pages are never decommitted), so an unset
+        // bit provably means the page was never touched -> all RC zero. Replaces a
+        // per-page VirtualQuery syscall (kernel VAD-lock) on every sweep region.
+        if (!RCPageCommitted(p))
         {
-            p = pageEnd; // reserved/uncommitted -> all RC zero here
+            p = pageEnd; // uncommitted -> all RC zero here
             continue;
         }
         uint8_t* scanFrom = (p < rcStart) ? rcStart : p;
@@ -2617,8 +2639,9 @@ void LXRCollector::ClearRCRange(uint8_t* start, uint8_t* end)
     while (p < rcEnd)
     {
         uint8_t* pageEnd = p + g_pageSize;
-        MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
+        // Skip uncommitted RC pages via the per-page committed bitmap (already
+        // all-zero, never touched) instead of a per-page VirtualQuery syscall.
+        if (!RCPageCommitted(p))
         {
             p = pageEnd; // reserved/uncommitted -> RC already all-zero here
             continue;
@@ -4694,7 +4717,7 @@ void LXRCollector::SweepAndSelectDefrag()
                       (g_lineMarksValid != 0) && (g_evacActive == 0) &&
                       (g_conservativeKeepAliveThisCycle == 0);
     size_t sweepCount = g_chunkCount;
-    bool sweepVerbose = getenv("LXR_VERBOSE") != nullptr;
+    bool sweepVerbose = getenv("LXR_VERBOSE") != nullptr || getenv("LXR_FINISH_PROFILE") != nullptr;
     LARGE_INTEGER swFreq, swClk0; QueryPerformanceFrequency(&swFreq); QueryPerformanceCounter(&swClk0);
     int64_t swLivenessTicks = 0, swCarveTicks = 0, swDecommitTicks = 0;
     int64_t swLiveRegions = 0, swCarvedRegions = 0, swFreedRegions = 0;

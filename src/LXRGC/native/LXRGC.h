@@ -232,6 +232,7 @@ public:
     // --- RC side table (1 byte of saturating count per 8-byte granule) ---
     uint8_t* RCSlot(Object* obj) const;
     void EnsureRCPage(uint8_t* slot); // lazily commit the RC-table page backing slot (per-page bit cache)
+    bool RCPageCommitted(uint8_t* slot) const; // syscall-free committed-page test via the per-page bitmap
     void RCIncrement(Object* obj);
     bool RCDecrement(Object* obj); // returns true if the count reached zero
     // Item G (§3.5): thread-safe variants for parallel RC apply. Use a CAS loop on
