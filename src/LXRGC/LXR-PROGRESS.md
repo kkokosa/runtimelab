@@ -184,6 +184,33 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-28p** — **Bounded evacuation + parallelized the trace-finish STW
+  dominators: worst multi-epoch finish pause 82 ms → 21 ms (all sound).** After
+  the profiling passes below showed the trace-finish STW cost migrating between
+  phases as multi-epoch cycles grew, three fixes landed (each `LXR_VERIFY_TRACE`
+  clean — Errors=0, no reclaim-of-marked / unforwarded refs / verify-evac misses):
+  **(1) Evac 4bRS-replay threshold** (`4188b33`) — lowered
+  `LXR_EVAC_PARALLEL_4B_MIN` 131072 → 16384 so the incoming-edge remset replay
+  parallelizes on the multi-epoch spikes (n~40-80k) where it was the ~5.5 ms
+  serial dominator (~110 → ~22 ns/slot), while typical n~7-10k cycles stay serial.
+  **(2) Bounded mature evacuation set** (`3a80222`, paper's "limited judicious
+  stop-the-world copying") — `SelectEvacCandidates` now caps the candidate set
+  (`LXR_EVAC_BUDGET_MB`=8 est. live-copy, `LXR_EVAC_MAX_REGIONS`=64), admitting
+  regions emptiest-first (cheapest copy / best space reclaimed); deferred regions
+  keep their `DeadPctEstimate` and become candidates on a later trace, spreading
+  defrag across collections. Evac 15.1 → 9.5 ms. **(3) Parallelized sweep + evac
+  intra-block fixup** (`739ddbd`) — `SweepAndSelectDefrag` phase 1 (liveness scan,
+  DeadPctEstimate stamp, dead-region side-table clears; `LXR_PARALLEL_SWEEP`) and
+  `Evacuate` step 4b-intra (the whole-touched-region object-field rebase;
+  `LXR_EVAC_PARALLEL_INTRA`) now stripe across the mark pool with disjoint writes,
+  serial only for the small g_chunks-mutating tail. On the worst n=82719 cycle:
+  4bIntra 53976 → 547 us (~100×), sweep+compact ~9-14 → ~3 ms. Remaining
+  finish-pause contributors on the (now 21 ms) mega-cycle: allocblk closure drain
+  (~5.6 ms), evac-select (~3 ms), 4bRS incoming-edge gather (~2.8 ms, still
+  serial), sweep (~3 ms). Root cause of the mega-cycles themselves — the
+  multi-epoch window growing until the concurrent marker reaches quiescence —
+  cannot be force-shortened without unsoundness (finish must not precede marker
+  quiescence), so the strategy is bounding + parallelizing per-finish work.
 - **2026-07-28n** — **LXR emits its OWN EventPipe events (pauses + phases),
   captured & analyzed out-of-process — no runtime change.** Earlier finding: the
   runtime fires only ~1/3 of LXR's `SuspendEE` pauses as implicit
