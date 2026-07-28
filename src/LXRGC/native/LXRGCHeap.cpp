@@ -4585,6 +4585,77 @@ void LXRCollector::ConcurrentTraceFinish()
     ResetSatbBuffers();
 }
 
+// Parallel sweep liveness pass. The per-region liveness scan (AnyMarkedInRange),
+// DeadPctEstimate line-mark stamp, and dead-region side-table clears
+// (ClearRCRange/ClearLoggedRange) are O(heap) and the dominant trace-finish sweep
+// cost on heavy multi-epoch cycles; they are independent per region and touch
+// only disjoint side-table ranges, so they parallelize across the mark pool. The
+// small O(freed+carved) mutation tail (ReclaimRegionMemory/CarveFreeRuns, which
+// realloc g_chunks and push shared free lists) stays serial.
+struct SweepScanCtx
+{
+    size_t sweepCount;
+    bool   traceComplete;   // g_traceCompleteThisCycle
+    bool   stampDeadPct;    // CandidateScopeEnabled && g_lineMarksValid && m_lineMarkTable
+    bool   carveLines;
+    std::vector<size_t>* laneDead;   // per-lane: dead region indices to reclaim
+    std::vector<size_t>* laneCarve;  // per-lane: live region indices to carve
+    volatile LONG64* liveRegions;
+    volatile LONG64* freedRegions;
+};
+static void SweepScanFn(int lane, int lanes, void* ctxp)
+{
+    g_poolCollector->SweepScanStripe(lane, lanes, ctxp);
+}
+void LXRCollector::SweepScanStripe(int lane, int lanes, void* ctxp)
+{
+    SweepScanCtx* ctx = (SweepScanCtx*)ctxp;
+    std::vector<size_t>& deadOut  = ctx->laneDead[lane];
+    std::vector<size_t>& carveOut = ctx->laneCarve[lane];
+    int64_t nLive = 0, nDead = 0;
+    for (size_t i = (size_t)lane; i < ctx->sweepCount; i += (size_t)lanes)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed || c.Owner != nullptr || c.FreeRun)
+            continue;
+        bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd) ||
+                       (!ctx->traceComplete &&
+                        (AnyRCNonZeroInRange(c.Start, c.UsedEnd) ||
+                         IsYoung((Object*)c.Start)));
+        if (anyLive)
+        {
+            nLive++;
+            if (ctx->stampDeadPct)
+            {
+                size_t firstLine = (size_t)(c.Start - m_heapBase) / lxr::kLineSize;
+                size_t lastLine  = (size_t)((c.UsedEnd - 1) - m_heapBase) / lxr::kLineSize;
+                size_t totalLines = lastLine - firstLine + 1, liveLines = 0;
+                for (size_t line = firstLine; line <= lastLine; line++)
+                {
+                    size_t byteIdx = line >> 3;
+                    if (byteIdx >= m_lineMarkCommittedBytes) break;
+                    if (m_lineMarkTable[byteIdx] & (uint8_t)(1u << (line & 7))) liveLines++;
+                }
+                int64_t deadPct = totalLines ? (int64_t)((totalLines - liveLines) * 100 / totalLines) : 0;
+                c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct);
+            }
+            if (ctx->carveLines)
+                carveOut.push_back(i);
+        }
+        else
+        {
+            nDead++;
+            // Dead: clear this region's RC + logged side tables now (disjoint
+            // per-region ranges), defer the g_chunks-mutating reclaim to serial.
+            ClearRCRange(c.Start, c.UsedEnd);
+            ClearLoggedRange(c.Start, c.UsedEnd);
+            deadOut.push_back(i);
+        }
+    }
+    if (nLive) InterlockedExchangeAdd64(ctx->liveRegions, nLive);
+    if (nDead) InterlockedExchangeAdd64(ctx->freedRegions, nDead);
+}
+
 void LXRCollector::SweepAndSelectDefrag()
 {
     // Immix-style reclamation: any retired allocation region containing no
@@ -4610,116 +4681,100 @@ void LXRCollector::SweepAndSelectDefrag()
     LARGE_INTEGER swFreq, swClk0; QueryPerformanceFrequency(&swFreq); QueryPerformanceCounter(&swClk0);
     int64_t swLivenessTicks = 0, swCarveTicks = 0, swDecommitTicks = 0;
     int64_t swLiveRegions = 0, swCarvedRegions = 0, swFreedRegions = 0;
-    for (size_t i = 0; i < sweepCount; i++)
+
+    // Phase 1 (parallelizable): classify every region's liveness, stamp
+    // DeadPctEstimate on live regions, and clear the RC + logged side tables of
+    // dead regions. This is the O(heap) bulk of the sweep and each region's work
+    // is independent and touches only disjoint side-table ranges, so it runs
+    // across the mark pool. g_chunks is stable in the STW finish (mutators
+    // suspended, no alloc/registration). Dead/to-carve region indices are
+    // collected into lane-local lists for the small serial mutation tail.
+    //
+    // Region liveness is tested from the mark bits directly (parse-independent).
+    // A linear object walk depended on LXRObjectSize parsing EVERY object from
+    // the region start; one misparse desynced the cursor and could step over a
+    // marked (live) object, wrongly reclaiming a live region (a later AV on
+    // multi-GB continuously-mutating graphs). Mark bits are set only at
+    // granule-aligned live-object starts, so "any mark bit set in [Start,UsedEnd)"
+    // is an exact liveness test with no parsing. RC-authoritative liveness (LXR
+    // difference #2): a region is reclaimable only if it holds NO kept object; on
+    // a complete-trace cycle "kept" = marked (unmarked dead cycles reclaimed),
+    // and on a fast concurrent finish "kept" also includes RC>=1 / young so an
+    // object the SATB trace missed is still retained. Both are parse-free
+    // side-table scans, so a misparse can never wrongly reclaim a live region.
+    static int s_parSweep = -1;
+    if (s_parSweep < 0)
     {
-        ChunkRegion& c = g_chunks[i];
-        if (!c.Committed || c.Owner != nullptr || c.FreeRun)
-            continue; // uncommitted, active, or an already-carved free run
+        const char* e = getenv("LXR_PARALLEL_SWEEP");
+        s_parSweep = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
+    }
+    int swLanes = (s_parSweep && g_poolWorkers > 0 && sweepCount >= 64) ? (g_poolWorkers + 1) : 1;
+    std::vector<std::vector<size_t>> laneDead((size_t)swLanes), laneCarve((size_t)swLanes);
+    volatile LONG64 pLive = 0, pFreed = 0;
+    SweepScanCtx sctx{ sweepCount, g_traceCompleteThisCycle != 0,
+                       CandidateScopeEnabled() && g_lineMarksValid && m_lineMarkTable != nullptr,
+                       carveLines, laneDead.data(), laneCarve.data(), &pLive, &pFreed };
+    LARGE_INTEGER swP0; QueryPerformanceCounter(&swP0);
+    if (swLanes > 1)
+        RunOnPool(swLanes, &SweepScanFn, &sctx);
+    else
+        SweepScanStripe(0, 1, &sctx);
+    { LARGE_INTEGER swP1; QueryPerformanceCounter(&swP1); swLivenessTicks += swP1.QuadPart - swP0.QuadPart; }
+    swLiveRegions = pLive; swFreedRegions = pFreed;
 
-        // Region liveness via the mark bits directly (parse-independent). The
-        // old linear object walk depended on LXRObjectSize correctly parsing
-        // EVERY object from the region start; one misparse desynced the cursor
-        // and could step over a marked (live) object, wrongly reclaiming and
-        // reusing a live region - producing a dangling reference and a later
-        // access violation in the next trace (seen on multi-GB continuously-
-        // mutating graphs, e.g. the growing-cache workload). Mark bits are set
-        // only at granule-aligned live-object starts, so "any mark bit set in
-        // [Start,UsedEnd)" is an exact liveness test with no parsing.
-        // RC-authoritative liveness (LXR difference #2). A region is reclaimable
-        // only if it holds NO kept object. On a COMPLETE-trace cycle
-        // (g_traceCompleteThisCycle: STW backup trace, or a concurrent finish
-        // that ran CompleteClosureOverMarked) "kept" = marked, so unmarked dead
-        // cycles - RC>=1 but unreachable - are reclaimed (mark-authoritative).
-        // On a fast concurrent finish that skipped the closure, "kept" also
-        // includes RC>=1: an object the concurrent SATB trace missed is still
-        // referenced (RC>=1, e.g. a Kestrel MemoryPoolBlock held in a
-        // ConcurrentQueue slot), so its region is kept without relying on the
-        // (possibly incomplete) trace. Both tests are parse-free side-table
-        // scans, so a misparse can never wrongly reclaim a live region.
-        LARGE_INTEGER swL0; QueryPerformanceCounter(&swL0);
-        bool anyLive = AnyMarkedInRange(c.Start, c.UsedEnd) ||
-                       (!g_traceCompleteThisCycle &&
-                        (AnyRCNonZeroInRange(c.Start, c.UsedEnd) ||
-                         IsYoung((Object*)c.Start)));
-        { LARGE_INTEGER swL1; QueryPerformanceCounter(&swL1); swLivenessTicks += swL1.QuadPart - swL0.QuadPart; }
-        if (anyLive)
+    // Phase 2 (serial): the g_chunks-mutating tail, O(freed+carved). CarveFreeRuns
+    // and ReclaimRegionMemory may realloc g_chunks and push the shared free lists,
+    // so they cannot run concurrently; but they visit only the (few) live-carve /
+    // dead regions phase 1 selected, not the whole heap.
+    bool verifyTrace = getenv("LXR_VERIFY_TRACE") != nullptr;
+    for (int lane = 0; lane < swLanes; lane++)
+    {
+        for (size_t idx : laneDead[(size_t)lane])
         {
-            // Retained region: recover its dead line runs for reuse (Immix line
-            // recycling). CarveFreeRuns may realloc g_chunks, so do not touch 'c'
-            // afterwards - continue to the next index.
-            swLiveRegions++;
-            // Item F: stamp the occupancy predictor for next trace's candidate
-            // selection from the line marks (cheap: O(lines/8), a side-table read).
-            // Must precede CarveFreeRuns (it may realloc g_chunks, invalidating c).
-            if (CandidateScopeEnabled() && g_lineMarksValid && m_lineMarkTable != nullptr)
+            // Red-handed check (LXR_VERIFY_TRACE): phase 1 flagged this region
+            // dead. Linearly parse it and confirm no object carries a mark bit;
+            // one that does would mean the sweep is about to reclaim a live region
+            // (addressing/boundary bug). Mark bits are untouched by phase 1's
+            // side-table clears, so this stays valid here.
+            if (verifyTrace)
             {
-                size_t firstLine = (size_t)(c.Start - m_heapBase) / lxr::kLineSize;
-                size_t lastLine  = (size_t)((c.UsedEnd - 1) - m_heapBase) / lxr::kLineSize;
-                size_t totalLines = lastLine - firstLine + 1, liveLines = 0;
-                for (size_t line = firstLine; line <= lastLine; line++)
+                ChunkRegion& c = g_chunks[idx];
+                uint8_t* p = c.Start; uint8_t* end = c.UsedEnd;
+                int parsedMarked = 0, parsedTotal = 0;
+                while (p < end && parsedTotal < 1000000)
                 {
-                    size_t byteIdx = line >> 3;
-                    if (byteIdx >= m_lineMarkCommittedBytes) break;
-                    if (m_lineMarkTable[byteIdx] & (uint8_t)(1u << (line & 7))) liveLines++;
+                    Object* o = (Object*)p;
+                    size_t sz = LXRObjectSize(o);
+                    if (sz == 0) break;
+                    parsedTotal++;
+                    if (IsMarked(o))
+                    {
+                        parsedMarked++;
+                        if (parsedMarked <= 4)
+                            fprintf(stderr, "LXRGC: [sweep] RECLAIM chunk %p-%p size=%llu BUT marked obj at %p sz=%llu mt=%p\n",
+                                    (void*)c.Start, (void*)c.UsedEnd, (unsigned long long)c.Size,
+                                    (void*)o, (unsigned long long)sz, (void*)o->GetGCSafeMethodTable());
+                    }
+                    p += sz;
                 }
-                int64_t deadPct = totalLines ? (int64_t)((totalLines - liveLines) * 100 / totalLines) : 0;
-                c.DeadPctEstimate = (uint8_t)(deadPct > 100 ? 100 : deadPct);
+                if (parsedMarked > 0)
+                    fprintf(stderr, "LXRGC: [sweep] *** reclaiming chunk with %d/%d MARKED objects (AnyMarkedInRange=false) ***\n",
+                            parsedMarked, parsedTotal);
             }
-            if (carveLines)
-            {
-                LARGE_INTEGER swC0; QueryPerformanceCounter(&swC0);
-                CarveFreeRuns(i);
-                LARGE_INTEGER swC1; QueryPerformanceCounter(&swC1);
-                swCarveTicks += swC1.QuadPart - swC0.QuadPart; swCarvedRegions++;
-            }
-            continue;
+            LARGE_INTEGER swD0; QueryPerformanceCounter(&swD0);
+            ReclaimRegionMemory(idx);
+            { LARGE_INTEGER swD1; QueryPerformanceCounter(&swD1); swDecommitTicks += swD1.QuadPart - swD0.QuadPart; }
         }
-
-        // Red-handed check (LXR_VERIFY_TRACE): AnyMarkedInRange says this chunk
-        // is dead. Linearly parse it and confirm no object carries a mark bit.
-        // If one does, the sweep is about to reclaim a live region (addressing
-        // or boundary bug); log it. If none does, the objects here are genuinely
-        // unmarked (a missed-root / trace-completeness gap upstream).
-        if (getenv("LXR_VERIFY_TRACE") != nullptr)
+    }
+    for (int lane = 0; lane < swLanes; lane++)
+    {
+        for (size_t idx : laneCarve[(size_t)lane])
         {
-            uint8_t* p = c.Start;
-            uint8_t* end = c.UsedEnd;
-            int parsedMarked = 0, parsedTotal = 0;
-            while (p < end && parsedTotal < 1000000)
-            {
-                Object* o = (Object*)p;
-                size_t sz = LXRObjectSize(o);
-                if (sz == 0) break;
-                parsedTotal++;
-                if (IsMarked(o))
-                {
-                    parsedMarked++;
-                    if (parsedMarked <= 4)
-                        fprintf(stderr, "LXRGC: [sweep] RECLAIM chunk %p-%p size=%llu BUT marked obj at %p sz=%llu mt=%p\n",
-                                (void*)c.Start, (void*)c.UsedEnd, (unsigned long long)c.Size,
-                                (void*)o, (unsigned long long)sz, (void*)o->GetGCSafeMethodTable());
-                }
-                p += sz;
-            }
-            if (parsedMarked > 0)
-                fprintf(stderr, "LXRGC: [sweep] *** reclaiming chunk with %d/%d MARKED objects (AnyMarkedInRange=false) ***\n",
-                        parsedMarked, parsedTotal);
+            LARGE_INTEGER swC0; QueryPerformanceCounter(&swC0);
+            CarveFreeRuns(idx); // may realloc g_chunks; index stays valid
+            LARGE_INTEGER swC1; QueryPerformanceCounter(&swC1);
+            swCarveTicks += swC1.QuadPart - swC0.QuadPart; swCarvedRegions++;
         }
-
-        // Decommit the page-aligned interior of the dead region (deferred off-pause
-        // by ReclaimRegionMemory; the <=1 page fringe at each end may hold a
-        // neighbor's object header, so it leaves that in place).
-        LARGE_INTEGER swD0; QueryPerformanceCounter(&swD0);
-        swFreedRegions++;
-        // Reclaimed => RC 0. Clear this region's RC bytes so no stale count
-        // survives into the decommitted range (a later decrement of a
-        // pre-sweep-logged old value would otherwise resurrect a dangling
-        // pointer and fault in DrainZeroCountWorkList). Only [Start,UsedEnd)
-        // ever held objects/RC; beyond UsedEnd the RC table is already zero.
-        ClearRCRange(c.Start, c.UsedEnd);
-        ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
-        ReclaimRegionMemory(i);
-        { LARGE_INTEGER swD1; QueryPerformanceCounter(&swD1); swDecommitTicks += swD1.QuadPart - swD0.QuadPart; }
     }
     LeaveCriticalSection(&g_chunkLock);
     if (sweepVerbose)
@@ -4953,6 +5008,76 @@ static void Evac4bFn(int lane, int lanes, void* ctxp)
         }
     }
     ctx->laneForwarded[lane] = forwarded;
+}
+// Parallel evac intra-block fix-up (step 4b-intra). Intra-block edges (a referrer
+// in a DIFFERENT region of the SAME block as a moved object) are excluded from the
+// inter-block remembered set, so they are found by walking every live object in
+// every block touched by the evac set. On heavy multi-epoch cycles this whole-
+// touched-region object walk became the trace-finish STW dominator (~50 ms). It is
+// independent per region (read-only forwarding/movedRanges/touchedBlocks, writes
+// disjoint object fields), so it stripes across the mark pool like the 4b replay.
+struct EvacIntraCtx
+{
+    const std::unordered_set<uintptr_t>*  touchedBlocks;
+    std::unordered_map<Object*, Object*>* forwarding;
+    std::vector<EvacMovedRange>*          movedRanges;  // sorted by oldStart
+    size_t                                chunkCount;
+};
+static void EvacIntraFn(int lane, int lanes, void* ctxp)
+{
+    g_poolCollector->EvacIntraScanStripe(lane, lanes, ctxp);
+}
+void LXRCollector::EvacIntraScanStripe(int lane, int lanes, void* ctxp)
+{
+    EvacIntraCtx* ctx = (EvacIntraCtx*)ctxp;
+    const std::unordered_set<uintptr_t>& touchedBlocks = *ctx->touchedBlocks;
+    std::unordered_map<Object*, Object*>& forwarding = *ctx->forwarding;
+    std::vector<EvacMovedRange>& movedRanges = *ctx->movedRanges;
+    auto rebaseField = [&forwarding, &movedRanges](Object** f)
+    {
+        uint8_t* v = (uint8_t*)*f;
+        if (v == nullptr) return;
+        auto it = forwarding.find((Object*)v);
+        if (it != forwarding.end())
+        {
+            *f = it->second;
+            InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
+            return;
+        }
+        if (movedRanges.empty()) return;
+        size_t lo = 0, hi = movedRanges.size();
+        while (lo < hi) { size_t mid = (lo + hi) >> 1; if (movedRanges[mid].oldStart <= v) lo = mid + 1; else hi = mid; }
+        if (lo == 0) return;
+        const EvacMovedRange& r = movedRanges[lo - 1];
+        if (v > r.oldStart && v < r.oldEnd)
+        {
+            *f = (Object*)(r.newStart + (v - r.oldStart));
+            InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
+        }
+    };
+    for (size_t i = (size_t)lane; i < ctx->chunkCount; i += (size_t)lanes)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed) continue;
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        if (end <= c.Start) continue;
+        bool overlaps = false;
+        for (uint8_t* b = (uint8_t*)((uintptr_t)c.Start & ~(lxr::kBlockSize - 1));
+             b < end; b += lxr::kBlockSize)
+            if (touchedBlocks.count((uintptr_t)b)) { overlaps = true; break; }
+        if (!overlaps) continue;
+        uint8_t* p = c.Start;
+        while (p < end)
+        {
+            Object* o = (Object*)p;
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0) break;
+            p += sz;
+            if (forwarding.find(o) != forwarding.end()) continue; // moved source
+            if (!IsMarked(o)) continue;                            // dead
+            GCScanObjectRefs(o, sz, rebaseField);
+        }
+    }
 }
 // Snapshot the committed regions, then replay the incoming-edge rebase. Shared by
 // the persistent and legacy remembered-set paths.
@@ -5578,35 +5703,23 @@ void LXRCollector::Evacuate()
             for (uint8_t* b = (uint8_t*)((uintptr_t)er.start & ~(lxr::kBlockSize - 1));
                  b < er.usedEnd; b += lxr::kBlockSize)
                 touchedBlocks.insert((uintptr_t)b);
-        for (size_t i = 0; i < g_chunkCount; i++)
+        // Parallelize the per-region intra-block scan across the mark pool: it is
+        // O(live objects in touched blocks) and was the trace-finish STW dominant
+        // (~50 ms) on heavy multi-epoch cycles. g_chunks is stable in the STW
+        // finish; each lane rebases disjoint object fields with a read-only
+        // forwarding map / moved-range list / touched-block set.
+        static int s_parIntra = -1;
+        if (s_parIntra < 0)
         {
-            ChunkRegion& c = g_chunks[i];
-            if (!c.Committed)
-                continue;
-            uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
-            if (end <= c.Start)
-                continue;
-            bool overlaps = false;
-            for (uint8_t* b = (uint8_t*)((uintptr_t)c.Start & ~(lxr::kBlockSize - 1));
-                 b < end; b += lxr::kBlockSize)
-                if (touchedBlocks.count((uintptr_t)b)) { overlaps = true; break; }
-            if (!overlaps)
-                continue;
-            uint8_t* p = c.Start;
-            while (p < end)
-            {
-                Object* o = (Object*)p;
-                size_t sz = LXRObjectSize(o);
-                if (sz == 0)
-                    break;
-                p += sz;
-                if (forwarding.find(o) != forwarding.end())
-                    continue; // moved source (its copy is scanned in (a))
-                if (!IsMarked(o))
-                    continue; // dead: freed with the region
-                GCScanObjectRefs(o, sz, rebaseField);
-            }
+            const char* e = getenv("LXR_EVAC_PARALLEL_INTRA");
+            s_parIntra = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON
         }
+        int intraLanes = (s_parIntra && g_poolWorkers > 0 && g_chunkCount >= 64) ? (g_poolWorkers + 1) : 1;
+        EvacIntraCtx ictx{ &touchedBlocks, &forwarding, &movedRanges, g_chunkCount };
+        if (intraLanes > 1)
+            RunOnPool(intraLanes, &EvacIntraFn, &ictx);
+        else
+            EvacIntraScanStripe(0, 1, &ictx);
     }
     else
     {

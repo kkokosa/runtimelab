@@ -471,6 +471,21 @@ public:
     // still-unmarked children into 'out' (and marks its lines when markLines).
     // Marks nothing itself, so all lanes read a stable mark bitmap race-free.
     void ClosureScanStripe(int lane, int lanes, std::vector<Object*>& out, bool markLines);
+    // One lane of the parallel SweepAndSelectDefrag liveness pass: scans its
+    // stripe of committed regions, classifies each as live or dead (mark bits +,
+    // on an incomplete-trace cycle, RC/young), stamps DeadPctEstimate on live
+    // regions, clears the RC + logged side tables of dead regions (disjoint
+    // per-region ranges, so lanes never share a side-table byte), and records the
+    // dead / to-carve region indices into lane-local lists for a small serial
+    // mutation pass. Clears nothing else and never mutates g_chunks, so the
+    // stable-in-STW region array is read race-free.
+    void SweepScanStripe(int lane, int lanes, void* ctxp);
+    // One lane of the parallel evacuation intra-block fix-up: scans its stripe of
+    // committed regions, and for every region that overlaps a block touched by the
+    // evacuation set rebases the fields of its live, non-moved objects. Reads only
+    // the (post-copy, immutable) forwarding map / moved-range list / touched-block
+    // set and writes disjoint object fields, so lanes never conflict.
+    void EvacIntraScanStripe(int lane, int lanes, void* ctxp);
     int64_t MarkModifiedNewValues();     // finish pause: reconcile concurrent-marking race via modified set
     // Immix line marking (LXR_LINE_REUSE): record every 256 B line touched by a
     // live object [obj, obj+size) in the line-mark side table. Accumulated at the
