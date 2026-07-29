@@ -490,7 +490,53 @@ static void ResetEvacEdges()
     InterlockedExchange(&g_evacEdgeOverflow, 0);
 }
 
-// --- Dormant parity-fallback reporter --------------------------------------
+// --- D-copy trace-seeding (paper §3.3: "the trace initializes each remembered
+// set and the write barrier keeps them up to date") ------------------------------
+// The write-barrier-only D-copy remembered set (references TO young objects, used
+// by CopyYoungSurvivors to fix up incoming edges) is INCOMPLETE across trace
+// boundaries: a mature->young edge is logged once (coalescing barrier) then wiped
+// when the remset is dropped at a trace bump; if the reference is stable it is
+// never re-logged, so a later D-copy pass that moves that still-young target can
+// no longer find (and rebase) the mature referrer -> dangling ref -> crash once
+// the moved source is reclaimed. (Confirmed empirically: every such miss had
+// barrierLogged=1, inRemset=0.) The fix is the paper's other half: the mark, which
+// safely traverses the live reference graph (no linear heap parse, so immune to
+// the unparseable-line-reuse holes that defeat a full-walk), records EVERY
+// mature->young edge it sees; at trace finish we seed the freshly-cleared remset
+// from these, re-establishing completeness. The barrier then keeps it up to date.
+static volatile LONG g_recordDcopyEdges = 0;      // set only during a mark when nursery-copy is active
+static volatile LONG g_dcopyEdgeOverflow = 0;     // a lane hit its cap -> next D-copy full-walks
+static thread_local std::vector<Object**>* t_dcopyEdgeLog = nullptr; // this lane's log
+static std::vector<std::vector<Object**>*> g_dcopyEdgeLogs;          // registry of all lane logs
+static CRITICAL_SECTION g_dcopyEdgeLock;          // guards the registry (not the hot append)
+static const size_t kDcopyEdgeLaneCap = 16u * 1024u * 1024u; // 16M slots/lane -> overflow
+
+static inline void RecordDcopyEdge(Object** slot)
+{
+    std::vector<Object**>* log = t_dcopyEdgeLog;
+    if (log == nullptr)
+    {
+        log = new (std::nothrow) std::vector<Object**>();
+        if (log == nullptr) { InterlockedExchange(&g_dcopyEdgeOverflow, 1); return; }
+        log->reserve(1u << 16);
+        EnterCriticalSection(&g_dcopyEdgeLock);
+        g_dcopyEdgeLogs.push_back(log);
+        LeaveCriticalSection(&g_dcopyEdgeLock);
+        t_dcopyEdgeLog = log;
+    }
+    if (log->size() >= kDcopyEdgeLaneCap) { InterlockedExchange(&g_dcopyEdgeOverflow, 1); return; }
+    log->push_back(slot);
+}
+
+static void ResetDcopyEdges()
+{
+    EnterCriticalSection(&g_dcopyEdgeLock);
+    for (std::vector<Object**>* log : g_dcopyEdgeLogs)
+        log->clear();
+    LeaveCriticalSection(&g_dcopyEdgeLock);
+    InterlockedExchange(&g_dcopyEdgeOverflow, 0);
+}
+
 // The LXR parity paths carry a few SOUND graceful-degrade fallbacks that fire
 // only on pathological resource exhaustion (a bounded buffer overflowing under a
 // burst). On a normal run their fire count is 0 in every validated config, and
@@ -572,12 +618,147 @@ static volatile LONG g_multiEpoch      = 0;  // env LXR_MULTIEPOCH: span trace o
 static volatile LONG g_traceState      = TRACE_IDLE;
 static volatile LONG g_markerQuiescent = 0;  // marker finished its drain-to-quiescence
 static volatile LONG g_snapshotConsumed = 0; // marker has replayed the meStart snapshot decrements (safe for spanned epochs to drain)
+static int g_onPauseRC = 1;                   // paper-faithful on-pause RC (LXR_ONPAUSE_RC); see full comment at parse site
+// Set while a spanned RC pause holds the marker park. The parked marker may be
+// blocked at a checkpoint INSIDE ParallelDrainMarkStack holding g_poolLock, so any
+// reclaim work done under the park (ProcessModifiedBuffers -> ApplyRCEpoch) must
+// NOT touch the worker pool or it deadlocks on g_poolLock -> force RC apply serial.
+static volatile LONG g_rcApplyForceSerial = 0;
 static volatile LONG g_markerStop      = 0;  // shutdown request for the marker thread
 static HANDLE  g_markerThread    = nullptr;
 static HANDLE  g_markerStartEvent = nullptr; // auto-reset: wakes the marker to drain
 static volatile LONG64 g_multiEpochSpans = 0; // diagnostic: RC epochs spanned across traces
 
+// Paper fidelity (arXiv:2210.17175 §1: "regular, brief stop-the-world
+// collections"): cap how long a concurrent trace window may stay open. LXR bounds
+// footprint by keeping traces brief and finishing them frequently so the safe
+// finish-pause reclamation runs often; a window that stays open for many RC epochs
+// (marker can't quiesce because mutators out-produce it) ratchets committed memory
+// up because reclamation of the snapshot-era dead set is deferred to the finish.
+// When the current window has spanned g_traceMaxSpan RC epochs without the marker
+// quiescing, force it to finalize: g_traceForceFinish makes ConcurrentTraceDrain
+// break out of its drain loop, the marker goes quiescent, and the next RC epoch
+// runs meFinish (whose STW final root+handle rescan + residual drain completes the
+// closure soundly). This replaces the old "wait for backpressure to park mutators,
+// then take a giant synchronous STW trace" path with proactive brief finishes.
+static volatile LONG   g_traceMaxSpan    = -1; // env LXR_TRACE_MAX_SPAN (<=0 disables the cap)
+static volatile LONG64 g_windowSpans     = 0;  // RC epochs the CURRENT window has spanned
+static volatile LONG   g_traceForceFinish = 0; // signal the marker to quiesce now (span cap hit)
+
+// --- Marker park handshake (paper §1: LXR's trace workers ARE the pause workers,
+// so the tracer is intrinsically quiesced whenever memory is reclaimed at a
+// pause). Our concurrent marker is a SEPARATE thread + worker pool NOT suspended
+// by SuspendEE, so to reclaim young/mature memory at a spanned RC pause DURING an
+// open multi-epoch trace window we must first cooperatively quiesce EVERY mark
+// lane (the marker thread AND its pool workers) so none dereferences the heap the
+// reclaimer is about to free.
+//
+// Realized as an OBJECT-GRANULAR count handshake: every mark lane calls
+// LXRMarkLaneCheckpoint() between object/chunk scans; when a pause driver sets
+// g_markParkReq, each lane parks there (parked++). The number of lanes committed
+// to scanning is tracked in g_markScanActive (incremented at DISPATCH, before a
+// pool worker is even woken, so a not-yet-started worker still counts and the
+// driver cannot race ahead of it). The driver waits until g_markScanActive ==
+// g_markScanParked -- i.e. every active lane is parked at a checkpoint, touching
+// no heap -- then reclaims, then clears the request. This is deadlock-free because
+// the in-window reclaimers do NOT use the worker pool: CopyYoungSurvivors self-
+// skips while a window is open, and CollectNursery / ReclaimMatureByRC never call
+// RunOnPool -- so parking a lane mid-drain (even while the marker holds g_poolLock
+// inside ParallelDrainMarkStack) cannot block the reclaimer.
+//
+// Soundness of reclaiming while parked: SuspendEE freezes mutator roots;
+// ProcessModifiedBuffers ran first so RC is authoritative for every barriered
+// store so far; every parked lane touches no heap and the grey set is frozen, so
+// everything the trace reached is MARKED. CollectNursery frees only young regions
+// that are entirely RC-0 AND unmarked AND unrooted. Any marked object referencing
+// a young Y implies a barriered store to Y => a counted increment => Y.RC>=1, so no
+// marked object references a freed (RC-0) region; Y is also unmarked and unrooted,
+// so after unpark the marker (resuming from marked, live parents) never reaches it.
+static volatile LONG   g_markerParkEnabled = -1; // env LXR_MARKER_PARK (default OFF)
+static volatile LONG   g_markParkReq       = 0;  // driver requests all mark lanes park
+static volatile LONG   g_markScanActive    = 0;  // # mark lanes committed to scanning
+static volatile LONG   g_markScanParked    = 0;  // # of those lanes currently parked
+static volatile LONG        g_markSpillInit   = 0; // (retained: startup CS init guard)
+static CRITICAL_SECTION     g_markSpillLock;       // (retained for future use)
+static volatile LONG64      g_markerParkCount = 0; // diagnostic: parks served
+static volatile LONG64      g_windowReclaims  = 0; // diagnostic: RC pauses that reclaimed young mid-trace-window via the park
+static volatile LONG        g_markerReclaimSafe = 0; // driver parked the marker; window reclaim is safe now
+
+static inline bool LXRMarkerParkEnabled()
+{
+    if (g_markerParkEnabled < 0)
+    {
+        int on = (getenv("LXR_MARKER_PARK") != nullptr) ? 1 : 0;
+        InterlockedExchange(&g_markerParkEnabled, on);
+    }
+    return g_markerParkEnabled != 0;
+}
+
+// Account a set of mark lanes as committed to scanning (called at dispatch, before
+// waking pool workers, so a not-yet-started lane already counts).
+static inline void LXRMarkScanEnter(int lanes) { if (lanes > 0) InterlockedExchangeAdd(&g_markScanActive, (LONG)lanes); }
+static inline void LXRMarkScanExit()           { InterlockedDecrement(&g_markScanActive); }
+
+// Cooperative park point, called by every mark lane between object/chunk scans.
+// While a pause driver holds the park request, the lane parks here (touching no
+// heap) so the driver can reclaim heap memory the lane would otherwise scan.
+static inline void LXRMarkLaneCheckpoint()
+{
+    if (!g_markParkReq)
+        return; // predicted not-taken: near-zero cost off the park path
+    InterlockedIncrement(&g_markScanParked);
+    InterlockedIncrement64(&g_markerParkCount);
+    while (g_markParkReq)
+        Sleep(0);
+    InterlockedDecrement(&g_markScanParked);
+}
+
 static void RequestLXRCollection(bool wait, bool forceTrace); // fwd (defined below)
+
+// Pause-driver side of the marker park handshake. Called under SuspendEE at a
+// spanned RC pause before reclaiming young memory. Returns true if a park request
+// was issued (caller MUST pair with LXRReleaseMarkerPark). Blocks until EVERY mark
+// lane (marker thread + all pool workers) is parked at a checkpoint touching no
+// heap (g_markScanActive == g_markScanParked). If no concurrent marker is active
+// (not multi-epoch, or no trace window open) it returns false and the caller
+// proceeds exclusively as usual.
+static bool LXRRequestMarkerPark()
+{
+    if (!LXRMarkerParkEnabled())
+        return false;
+    if (!g_multiEpoch || g_traceState != TRACE_MARKING)
+        return false; // no separate marker running; the RC pause is already exclusive
+    if (!g_snapshotConsumed)
+        return false; // marker still in ProcessSnapshotDecrements (frees heap, NOT a
+                      // park-checkpointed mark lane) and spanned pauses skip
+                      // ProcessModifiedBuffers so RC isn't authoritative yet -> defer
+                      // reclaim this pause rather than race the decrement replay.
+    InterlockedExchange(&g_markParkReq, 1);
+    // Wait until every lane committed to scanning has reached a checkpoint and
+    // parked. active==parked (including 0==0 when idle) means no lane is touching
+    // the heap. Dispatch-time accounting (LXRMarkScanEnter before a worker wakes)
+    // guarantees a just-woken worker is already counted active, so it must park
+    // before its first heap deref -- the driver cannot race ahead of it.
+    for (LONG64 spins = 0; ; spins++)
+    {
+        if (g_markScanActive == g_markScanParked)
+            return true;
+        if (g_traceState != TRACE_MARKING)
+            return true; // trace finished; nothing is scanning
+        if (spins > 200000000) // generous cap: never stall a pause indefinitely
+        {
+            InterlockedExchange(&g_markParkReq, 0);
+            return false; // fall back to deferral (caller skips window reclaim)
+        }
+        if (spins < 4096) YieldProcessor(); else Sleep(0);
+    }
+}
+
+static void LXRReleaseMarkerPark(bool wasParked)
+{
+    if (wasParked)
+        InterlockedExchange(&g_markParkReq, 0);
+}
 
 // Persistent background marker: waits for a snapshot to open a trace, marks the
 // transitive closure to quiescence (ConcurrentTraceDrain, which itself yields so
@@ -592,6 +773,7 @@ static DWORD WINAPI LXRMarkerThreadProc(void*)
         WaitForSingleObject(g_markerStartEvent, INFINITE);
         if (g_markerStop)
             break;
+        LARGE_INTEGER mkStart, mkAfterDec; QueryPerformanceCounter(&mkStart);
         // #1 off-pause decrement replay FIRST (before the long closure drain):
         // consume the buffers detached at the meStart snapshot (SnapshotModified-
         // Buffers) so the coalescing-RC root-deferral rotation (m_rootDeferredPrev)
@@ -600,9 +782,17 @@ static DWORD WINAPI LXRMarkerThreadProc(void*)
         // accumulating during this (possibly long) marking window - bounding the
         // finish pause instead of batching the whole window's RC work + free
         // cascade into one giant STW ProcessModifiedBuffers at the finish.
-        if (g_concDecrements)
+        if (g_concDecrements && !g_onPauseRC)
             g_lxrCollector.ProcessSnapshotDecrements();
+        QueryPerformanceCounter(&mkAfterDec);
         InterlockedExchange(&g_snapshotConsumed, 1);
+        if (getenv("LXR_CADENCE") != nullptr)
+        {
+            LARGE_INTEGER fr; QueryPerformanceFrequency(&fr);
+            fprintf(stderr, "LXRGC: [marker] snapDecrements=%lldus (snap now consumed)\n",
+                    (long long)((mkAfterDec.QuadPart - mkStart.QuadPart) * 1000000 / fr.QuadPart));
+            fflush(stderr);
+        }
         g_lxrCollector.ConcurrentTraceDrain();
         InterlockedExchange(&g_markerQuiescent, 1);
         // Finalize PROMPTLY: request an RC pause now so meFinish runs right after
@@ -863,6 +1053,44 @@ static const size_t         kDCopyRemsetCap = 4u * 1024u * 1024u; // entries
 // bump (the window's young ages to mature) or on overflow.
 static std::vector<std::vector<Object**>> g_dcopyRemsetBuckets; // [regionSlot] -> incoming field slots
 static size_t                             g_dcopyRemsetCount = 0;
+// LXR_DCOPY_DBG diagnostic: snapshot of every remset slot in the buckets covering
+// the regions evacuated this pass, captured BEFORE 4b prunes them, so the
+// nursery-copy verify can classify each unforwarded miss as "edge was captured but
+// 4b failed to rebase" (slot present) vs. "edge never captured" (slot absent).
+static int                                g_dcopyDbg = -1;
+static std::unordered_set<Object**>*      g_dcopyDbgSlots = nullptr;
+static std::unordered_map<Object**,int>*  g_dcopySkipDbg = nullptr; // slot->capture reason (LXR_DCOPY_DBG)
+// LXR_DCOPY_RECORD_ALL: record EVERY inter-heap edge into the D-copy remembered
+// set, not just those whose target IsYoung at record time. Closes the line-reuse
+// re-aging gap: a block re-stamped young (in place) later becomes a move candidate
+// whose incoming edges were filtered out by the record-time IsYoung(target) check.
+static int                                g_dcopyRecordAll = -1;
+
+// LXR_FREEDLOG decisive diagnostic: ring log of reclaimed region ranges + epoch.
+// Lets the nursery-copy verify prove whether a stale-target miss is address
+// recycling (the mature referrer's target sits in a range that was FREED then
+// reused for the now-young survivor) vs a pure remset fix-up gap.
+struct LXRFreedRange { uint8_t* s; uint8_t* e; long long ep; int site; };
+static const size_t                       kFreedLogCap = 65536; // power of two
+static LXRFreedRange*                      g_freedLog = nullptr;
+static volatile int64_t                    g_freedLogNext = 0;
+static volatile LONG                        g_freeSite = 0; // 1=sweep 2=evac 3=nursery 4=nurseryCopy 5=matureRC
+
+// LXR_BARRIER_TRACE decisive diagnostic: a persistent (never-cleared) record of
+// every (slot,target) edge the write barrier ever logged into the modified buffer.
+// Populated STW-safe from ProcessModifiedBuffers' `coalesced` set. Lets the
+// nursery-copy verify classify each unforwarded miss as "the barrier DID log this
+// edge (some epoch) but the D-copy remset dropped it" (GC-side scoping bug,
+// fixable) vs. "the barrier NEVER logged this edge" (JIT elided the store's
+// barrier -> a runtime limit). Keyed by (slot ^ rotl(target)).
+static int                                g_barrierTrace = -1;
+static std::unordered_set<uint64_t>*      g_barrierEdgeSet = nullptr;
+static CRITICAL_SECTION                   g_barrierEdgeLock;
+static inline uint64_t BarrierEdgeKey(void* slot, void* target)
+{
+    uint64_t s = (uint64_t)slot, t = (uint64_t)target;
+    return s ^ ((t << 17) | (t >> 47));
+}
 
 // Drop every entry (trace epoch bump / overflow). Keeps the outer vector sized so
 // the next window does not re-grow it.
@@ -903,16 +1131,16 @@ static volatile int64_t g_traceEpoch = 0;
 // parent->child edge that kept it reachable (proving which store the RC missed)
 // instead of faulting on the decommitted page. Declared here (above the markers)
 // so DrainMarkStack/DrainSliceLocal can reference it.
-struct FreedYoungRange { uint8_t* s; uint8_t* e; int64_t pass; };
+struct FreedYoungRange { uint8_t* s; uint8_t* e; int64_t pass; int site; int64_t ep; };
 static FreedYoungRange g_freedYoung[1024];
 static volatile LONG    g_freedYoungCount = 0;
 static int g_nurseryGuard = -1;
-static void RecordFreedYoung(uint8_t* s, uint8_t* e, int64_t pass)
+static void RecordFreedYoung(uint8_t* s, uint8_t* e, int64_t pass, int site, int64_t ep)
 {
     if (g_nurseryGuard <= 0) return;
     LONG idx = InterlockedIncrement(&g_freedYoungCount) - 1;
     FreedYoungRange& r = g_freedYoung[idx & 1023];
-    r.s = s; r.e = e; r.pass = pass;
+    r.s = s; r.e = e; r.pass = pass; r.site = site; r.ep = ep;
 }
 static bool InFreedYoung(uint8_t* p)
 {
@@ -922,6 +1150,16 @@ static bool InFreedYoung(uint8_t* p)
         if (p >= g_freedYoung[k].s && p < g_freedYoung[k].e)
             return true;
     return false;
+}
+// Return the recorded free site (3=nursery 4=nurseryCopy) + epoch for p, or -1.
+static int FreedYoungSite(uint8_t* p, int64_t* epOut)
+{
+    if (g_nurseryGuard <= 0) return -1;
+    LONG n = g_freedYoungCount; if (n > 1024) n = 1024;
+    for (LONG k = 0; k < n; k++)
+        if (p >= g_freedYoung[k].s && p < g_freedYoung[k].e)
+        { if (epOut) *epOut = g_freedYoung[k].ep; return g_freedYoung[k].site; }
+    return -1;
 }
 
 // Dedicated collector thread. Driving SuspendEE from a random cooperative-mode
@@ -1001,8 +1239,32 @@ static CRITICAL_SECTION g_chunkLock;
 // entry is decommitted. Serialized by the single-driver collection loop, so the
 // drain always completes before the next sweep.
 static int g_deferDecommit = 1;
-static std::vector<std::pair<uint8_t*, uint8_t*>> g_pendingDecommit;
-static std::vector<size_t> g_pendingFreeChunks;
+// Paper-faithful on-pause reference counting (LXR_ONPAUSE_RC, default ON). LXR
+// processes RC increments/decrements + reclaims dead young AT EACH PAUSE (bounded
+// by pause frequency); the concurrent thread does cyclic TRACING only. Our older
+// "concurrent decrements" design instead detached the meStart snapshot and
+// replayed the whole window's RC arithmetic + free cascade OFF-PAUSE on the marker
+// thread (ProcessSnapshotDecrements). That coupled young reclaim to the marker:
+// g_snapshotConsumed only flipped once the (up to ~200ms) replay finished, so for
+// the whole window every spanned RC pause SKIPPED young reclaim -> footprint
+// runaway (committed 256MB -> 2.5GB). With on-pause RC the snapshot is consumed at
+// meStart itself (RC authoritative + root-deferral rotation clean before RestartEE),
+// so g_snapshotConsumed is published immediately and the marker-park lets every
+// spanned pause reclaim dead young mid-window, as the paper prescribes. Set to 0 to
+// A/B against the legacy off-pause replay.
+// (declared earlier, near g_snapshotConsumed, so the marker thread can read it)
+// A region selected for decommit under STW, drained off-pause. Carries the chunk
+// index so DrainPendingDecommit can re-validate the region is STILL in limbo at
+// drain time (a mutator running since RestartEE must not have reused it) before
+// physically freeing its pages by raw range. beg==end means a zero-page range
+// (still published to the free list, just nothing to VirtualFree).
+struct PendingDecommit { size_t idx; uint8_t* beg; uint8_t* end; };
+static std::vector<PendingDecommit> g_pendingDecommit;
+// Diagnostic (also the safety signal): count of pending regions found reused
+// (re-committed / re-owned / carved into a free-run) at drain time and therefore
+// skipped instead of decommitted. A non-zero value means the off-pause decommit
+// raced a mutator allocation - the exact stranding that this re-validation fixes.
+static volatile int64_t g_decommitSkippedReused = 0;
 
 // Immix line reuse (LXR difference #2, LXR_LINE_REUSE): stack of region indices
 // that are FreeRun == reusable dead line-runs carved from retained regions by
@@ -1341,9 +1603,12 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     InitializeCriticalSection(&g_satbLock);
     InitializeCriticalSection(&g_remsetLock);
     InitializeCriticalSection(&g_evacEdgeLock);
+    InitializeCriticalSection(&g_dcopyEdgeLock);
     InitializeCriticalSection(&g_poolLock);
     InitializeCriticalSection(&g_chunkLock);
     InitializeCriticalSection(&g_bigArrayLock);
+    InitializeCriticalSection(&g_markSpillLock);
+    InterlockedExchange(&g_markSpillInit, 1);
 
     // Full-LXR parity is the DEFAULT (1:1 with the paper). Each knob below is now
     // default-ON and only an explicit "=0" opts OUT (for A/B testing) - mirroring
@@ -1486,6 +1751,64 @@ void LXRCollector::StampMatureEpoch(uint8_t* start, size_t size)
         if (meta != nullptr)
             meta->bornTraceEpoch = mature;
     }
+}
+
+// Seed the (freshly cleared) D-copy remembered set from the edges the trace's mark
+// recorded (paper §3.3: "the trace initializes each remembered set"). Every remset
+// clear happens AT a trace bump, and that same trace ran a complete mark that
+// recorded every live edge to a then-young object; seeding from it re-establishes
+// the incoming-edge set the barrier's coalesced (one-log-per-epoch) records cannot,
+// for stable references stored in an earlier epoch. We deliberately do NOT re-check
+// IsYoung here: a survivor whose block gets re-stamped young by Immix line reuse in
+// the next window becomes a D-copy move candidate again, yet its (unchanged)
+// incoming reference is never re-logged -- these are exactly the edges that
+// otherwise dangle. Over-seeding an aged-out target is harmless (Rebase no-ops if
+// it never moves). Runs under STW at trace finish, so the logs are quiescent.
+static void SeedDcopyRemsetFromMarkEdges()
+{
+    if (!g_dcopyCaptureModified || g_dcopyEdgeOverflow || g_dcopyRemsetOverflow)
+        return;
+    uint8_t* heapBase = g_lxrCollector.HeapBase();
+    size_t   heapBytes = g_lxrCollector.HeapBytes();
+    // A recorded mark-edge slot is a field at the referrer's MARK-TIME location.
+    // Between recording (during BackupTrace) and this post-pause seeding, Evacuate
+    // may have MOVED the referrer (freeing its old region) and the sweep may have
+    // freed dead regions; DrainPendingDecommit then physically MEM_DECOMMITs them.
+    // So a slot address here can name a now-decommitted page -- reading *slot would
+    // fault. Guard every read with a page-cached committed probe (mirrors
+    // DCopyFixupCtx::SlotCommitted); a stale slot in a freed region is simply
+    // skipped (the target it once named is aged/moot and, if still live, re-seeded
+    // via the surviving referrer's own edge).
+    uint8_t* cacheBase = nullptr; size_t cacheLen = 0; bool cacheCommitted = false;
+    auto slotCommitted = [&](void* slot) -> bool
+    {
+        if ((uint8_t*)slot < cacheBase || (uint8_t*)slot >= cacheBase + cacheLen)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(slot, &mbi, sizeof(mbi)) == 0)
+            {
+                cacheBase = nullptr; cacheLen = 0; cacheCommitted = false; return false;
+            }
+            cacheBase = (uint8_t*)mbi.BaseAddress; cacheLen = mbi.RegionSize;
+            cacheCommitted = (mbi.State == MEM_COMMIT);
+        }
+        return cacheCommitted;
+    };
+    EnterCriticalSection(&g_dcopyEdgeLock);
+    for (std::vector<Object**>* log : g_dcopyEdgeLogs)
+    {
+        for (Object** slot : *log)
+        {
+            if (!slotCommitted(slot)) continue; // referrer region freed+decommitted
+            Object* t = *slot;
+            if (t == nullptr) continue;
+            if ((uint8_t*)t < heapBase || (uint8_t*)t >= heapBase + heapBytes) continue;
+            if (!DCopyRemsetAppend(slot, t, heapBase, heapBytes))
+                break; // overflow: set abandoned, D-copy full-walks until next trace
+        }
+        if (g_dcopyRemsetOverflow) break;
+    }
+    LeaveCriticalSection(&g_dcopyEdgeLock);
 }
 
 uint8_t* LXRCollector::RCSlot(Object* obj) const
@@ -1928,7 +2251,17 @@ void LXRCollector::LogModifiedField(Object** slot, Object* oldValue, Object* new
     //     Over-retention for one cycle is always safe; dropping an entry is not -
     //     so on absence/overflow we set g_satbOverflow and the STW finish pause
     //     falls back to a full, sound from-roots closure (ConcurrentTraceFinish).
-    if (firstLog && g_satbActive && oldValue != nullptr && InHeap(oldValue))
+    //     YOUNG oldValues are EXCLUDED (!IsYoung): young objects are RC-authoritative
+    //     (kept while RC>=1, genuinely dead at RC 0). Retaining a young referent here
+    //     would hand the concurrent marker a grey pointer to an object that a later
+    //     mid-window RC reclaim (CollectNursery, which only guards pre-snapshot young
+    //     via the snapshot high-water) can free+recycle -> the marker then scans a
+    //     freed/reused young big array (corrupted length => LXRBigArrayScanFn AV).
+    //     Soundness is preserved: a young object still reachable via a rerouted edge
+    //     is re-greyed by the NEW-value (insertion) marking (MarkModifiedNewValues);
+    //     one reachable only through the deleted edge is dead by RC. At most a young
+    //     dead-cycle's collection is delayed one trace (safe over-retention).
+    if (firstLog && g_satbActive && oldValue != nullptr && InHeap(oldValue) && !IsYoung(oldValue))
     {
         SatbBuffer* sb = t_satbBuffer;
         if (sb != nullptr && sb->Count < SatbBuffer::kCapacity)
@@ -2014,6 +2347,12 @@ bool LXRCollector::IsSatbActive() const { return g_satbActive != 0; }
 // under the STW finish pause guarantees no residual entry is missed.
 void LXRCollector::DrainSatbBuffers()
 {
+    // Park-account: this drains SATB old-referents via PushMark -> MarkObject, which
+    // READS each object header (a heap deref). It holds no checkpoint (and holds
+    // g_satbLock), so it counts as "actively scanning" for its whole (bounded)
+    // duration -- a pause driver's park request therefore waits until it returns
+    // before reclaiming. Harmless at the STW finish (no park request outstanding).
+    LXRMarkScanEnter(1);
     EnterCriticalSection(&g_satbLock);
     for (SatbBuffer* sb = g_registeredSatbBuffers; sb != nullptr; sb = sb->NextRegistered)
     {
@@ -2030,6 +2369,7 @@ void LXRCollector::DrainSatbBuffers()
         sb->Drained = count;
     }
     LeaveCriticalSection(&g_satbLock);
+    LXRMarkScanExit();
 }
 
 // Clear the SATB buffers and drain cursors at the end of a trace. Must be called
@@ -3009,11 +3349,39 @@ void LXRCollector::PushMark(Object* obj)
     g_markStack[g_markTop++] = obj;
 }
 
+// Raw push of an ALREADY-MARKED object back onto the mark stack, bypassing the
+// MarkObject claim (which would reject an already-marked object and drop it). Kept
+// as a neutral primitive for any caller needing to re-seed a marked object; the
+// count-based marker park does not use a spill so has no re-seed need.
+static void LXRRawPushMark(Object* obj)
+{
+    if (obj == nullptr)
+        return;
+    if (g_markTop == g_markCap)
+    {
+        size_t newCap = g_markCap ? g_markCap * 2 : 4096;
+        Object** grown = (Object**)realloc(g_markStack, newCap * sizeof(Object*));
+        if (grown == nullptr)
+        {
+            InterlockedIncrement64(&g_lxrCounters.MarkStackDrops);
+            return;
+        }
+        g_markStack = grown;
+        g_markCap = newCap;
+    }
+    g_markStack[g_markTop++] = obj;
+}
+
 void LXRCollector::DrainMarkStack()
 {
+    // Self-account this lane as scanning so a pause driver's park request waits for
+    // it (covers the serial DrainClosure path and the ParallelDrainMarkStack serial
+    // fallback; the parallel workers are accounted at dispatch instead).
+    LXRMarkScanEnter(1);
     int verify = (getenv("LXR_VERIFY_TRACE") != nullptr) ? 1 : 0;
     while (g_markTop > 0)
     {
+        LXRMarkLaneCheckpoint(); // park here (between objects, no heap deref) if requested
         Object* o = g_markStack[--g_markTop];
         if (verify)
         {
@@ -3064,13 +3432,21 @@ void LXRCollector::DrainMarkStack()
                 uintptr_t tblk = (uintptr_t)child & ~(lxr::kBlockSize - 1);
                 if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(child))) RecordEvacEdge(ref);
             }
+            // D-copy trace-seeding (see DrainSliceLocal): record edges to young
+            // targets so CopyYoungSurvivors can rebase this referrer.
+            if (g_recordDcopyEdges && child != nullptr && InHeap(child) && IsYoung(child)) RecordDcopyEdge(ref);
             if (g_nurseryGuard > 0 && child != nullptr && InFreedYoung((uint8_t*)child))
             {
                 MethodTable* pmt = *(MethodTable**)o;
-                fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p from parent=%p parentMT=%p "
-                        "parentSize=%llu fieldOff=%lld childYoung=%d MARKED=%d\n",
-                        (void*)child, (void*)o, (void*)pmt, (unsigned long long)LXRObjectSize(o),
-                        (long long)((uint8_t*)ref - (uint8_t*)o), IsYoung(child) ? 1 : 0, IsMarked(child) ? 1 : 0);
+                int crc = -1;
+                if ((uint8_t*)child >= m_heapBase && (uint8_t*)child < m_heapBase + m_heapBytes)
+                    crc = (int)(*RCSlot(child));
+                fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p childRC=%d from parent=%p parentMT=%p "
+                        "parentSize=%llu fieldOff=%lld childYoung=%d childMARKED=%d parentYoung=%d parentMARKED=%d parentFreed=%d freeSite=%d win=%d\n",
+                        (void*)child, crc, (void*)o, (void*)pmt, (unsigned long long)LXRObjectSize(o),
+                        (long long)((uint8_t*)ref - (uint8_t*)o), IsYoung(child) ? 1 : 0, IsMarked(child) ? 1 : 0,
+                        IsYoung(o) ? 1 : 0, IsMarked(o) ? 1 : 0, InFreedYoung((uint8_t*)o) ? 1 : 0,
+                        (int)g_freeSite, (int)g_traceWindowOpen);
                 fflush(stderr);
                 return; // diagnostic only: don't push the freed child
             }
@@ -3095,6 +3471,7 @@ void LXRCollector::DrainMarkStack()
             PushMark(*ref);
         });
     }
+    LXRMarkScanExit();
 }
 
 // Drain one worker's local grey set to completion. The atomic mark bit
@@ -3102,8 +3479,13 @@ void LXRCollector::DrainMarkStack()
 // the same object and need no shared stack or termination protocol.
 void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
 {
+    // NOTE: do NOT self-account here. DrainSliceLocal runs only from pool workers
+    // (LXRMarkWorkerProc) and the parallel dispatcher lane, both of which are
+    // accounted at dispatch time (LXRMarkScanEnter before wake). Self-accounting
+    // would double-count.
     while (!local.empty())
     {
+        LXRMarkLaneCheckpoint(); // park here (between objects, no heap deref) if requested
         Object* o = local.back();
         local.pop_back();
         size_t osz = LXRObjectSize(o);
@@ -3154,13 +3536,27 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
                 uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
                 if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(c))) RecordEvacEdge(ref);
             }
+            // D-copy trace-seeding: record every edge whose target is a young object
+            // so CopyYoungSurvivors can find and rebase this referrer even if the
+            // barrier's coalesced log of this (possibly ancient, stable) store was
+            // wiped at a prior trace bump. The mark visits every live object, so this
+            // is the complete incoming-edge set for currently-young objects.
+            if (g_recordDcopyEdges && InHeap(c) && IsYoung(c)) RecordDcopyEdge(ref);
             if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
             {
                 MethodTable* pmt = *(MethodTable**)o;
-                fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p from parent=%p parentMT=%p "
-                        "parentSize=%llu fieldOff=%lld childYoung=%d childRC-page? MARKED=%d\n",
-                        (void*)c, (void*)o, (void*)pmt, (unsigned long long)LXRObjectSize(o),
-                        (long long)((uint8_t*)ref - (uint8_t*)o), IsYoung(c) ? 1 : 0, IsMarked(c) ? 1 : 0);
+                int crc = -1;
+                if ((uint8_t*)c >= m_heapBase && (uint8_t*)c < m_heapBase + m_heapBytes)
+                    crc = (int)(*RCSlot(c));
+                int64_t cFreedEp = -1, pFreedEp = -1;
+                int cSite = FreedYoungSite((uint8_t*)c, &cFreedEp);
+                int pSite = FreedYoungSite((uint8_t*)o, &pFreedEp);
+                fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p childRC=%d childFreeSite=%d childFreedEp=%lld from parent=%p parentMT=%p "
+                        "parentSize=%llu fieldOff=%lld childYoung=%d childMARKED=%d parentYoung=%d parentMARKED=%d parentFreeSite=%d parentFreedEp=%lld gEp=%lld win=%d\n",
+                        (void*)c, crc, cSite, (long long)cFreedEp, (void*)o, (void*)pmt, (unsigned long long)LXRObjectSize(o),
+                        (long long)((uint8_t*)ref - (uint8_t*)o), IsYoung(c) ? 1 : 0, IsMarked(c) ? 1 : 0,
+                        IsYoung(o) ? 1 : 0, IsMarked(o) ? 1 : 0, pSite, (long long)pFreedEp,
+                        (long long)g_traceEpoch, (int)g_traceWindowOpen);
                 fflush(stderr);
                 return; // don't scan the freed child (avoid the AV) - diagnostic only
             }
@@ -3190,6 +3586,10 @@ static void LXRMarkWorkerProc(void* idx)
             if (g_poolForFn != nullptr)
                 g_poolForFn(w + 1, g_poolActiveLanes, g_poolForCtx);
         }
+        // Balance the dispatch-time LXRMarkScanEnter for this lane: it stopped
+        // touching the heap. (Harmless for non-mark parallel-for work, which never
+        // overlaps a park request.)
+        LXRMarkScanExit();
         SetEvent(g_poolDone[w]);
     }
 }
@@ -3204,7 +3604,9 @@ static void RunOnPool(int lanes, void (*fn)(int lane, int lanes, void* ctx), voi
 {
     if (lanes < 2 || g_poolWorkers < 1)
     {
+        LXRMarkScanEnter(1);
         fn(0, 1, ctx);
+        LXRMarkScanExit();
         return;
     }
     if (lanes > g_poolWorkers + 1)
@@ -3214,9 +3616,11 @@ static void RunOnPool(int lanes, void (*fn)(int lane, int lanes, void* ctx), voi
     g_poolForCtx = ctx;
     g_poolActiveLanes = lanes;
     InterlockedExchange(&g_poolWorkKind, 1);
+    LXRMarkScanEnter(lanes);          // account ALL lanes before any worker wakes
     for (int w = 1; w < lanes; w++)   // wake pooled workers 0..lanes-2 -> lanes 1..lanes-1
         SetEvent(g_poolStart[w - 1]);
     fn(0, lanes, ctx);                // main thread is lane 0
+    LXRMarkScanExit();                // lane 0 done (workers exit in their proc)
     for (int w = 1; w < lanes; w++)
         WaitForSingleObject(g_poolDone[w - 1], INFINITE);
     InterlockedExchange(&g_poolWorkKind, 0);
@@ -3320,6 +3724,9 @@ void LXRCollector::ScanBigRefArrayChunk(Object* o, size_t slotStart, size_t slot
             uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
             if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(c))) RecordEvacEdge(ref);
         }
+        // D-copy trace-seeding (see DrainSliceLocal): record big-array element edges
+        // to young objects so a later CopyYoungSurvivors can rebase this array.
+        if (g_recordDcopyEdges && InHeap(c) && IsYoung(c)) RecordDcopyEdge(ref);
         if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
         {
             fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p from bigarray=%p slot=%llu\n",
@@ -3348,7 +3755,27 @@ static void LXRBigArrayScanFn(int lane, int lanes, void* ctxp)
     std::vector<Object*> local;
     for (size_t i = (size_t)lane; i < chunks.size(); i += (size_t)lanes)
     {
+        LXRMarkLaneCheckpoint(); // park BETWEEN chunks (never mid-chunk: unscanned elements would be lost)
         const BigArrayChunk& ch = chunks[i];
+        static int s_bagStale = -1;
+        if (s_bagStale < 0) s_bagStale = (getenv("LXR_BIGARRAY_DIAG") != nullptr) ? 1 : 0;
+        if (s_bagStale)
+        {
+            uint8_t* a = (uint8_t*)ch.array;
+            MEMORY_BASIC_INFORMATION mbi; bool committed = false;
+            if (VirtualQuery(a, &mbi, sizeof(mbi)) != 0) committed = (mbi.State == MEM_COMMIT);
+            bool marked = ctx->self->IsMarked(ch.array);
+            bool freed = InFreedYoung(a);
+            bool young = ctx->self->IsYoung(ch.array);
+            if (!committed || !marked || freed)
+            {
+                fprintf(stderr, "LXRGC: [bigarray-diag] STALE array=%p committed=%d marked=%d freedYoung=%d young=%d slot=[%zu,%zu) freeSite=%d win=%d\n",
+                        (void*)a, (int)committed, (int)marked, (int)freed, (int)young,
+                        ch.start, ch.end, (int)g_freeSite, (int)g_traceWindowOpen);
+                fflush(stderr);
+                continue; // don't fault: skip the stale chunk so the diag run completes
+            }
+        }
         ctx->self->ScanBigRefArrayChunk(ch.array, ch.start, ch.end, local);
     }
     ctx->self->DrainSliceLocal(local);
@@ -3437,10 +3864,12 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
     g_markTop = 0; // consumed into the per-lane slices
 
     g_poolSlices = &slices;
+    LXRMarkScanEnter(lanes);          // account ALL lanes before any worker wakes
     for (int w = 1; w < lanes; w++)   // wake pooled workers 0..lanes-2 -> slices 1..lanes-1
         SetEvent(g_poolStart[w - 1]);
 
     DrainSliceLocal(slices[0]);       // main thread drains lane 0
+    LXRMarkScanExit();                // lane 0 done (workers exit in their proc)
 
     for (int w = 1; w < lanes; w++)
         WaitForSingleObject(g_poolDone[w - 1], INFINITE);
@@ -3659,6 +4088,10 @@ void LXRCollector::ApplyRCEpoch(std::vector<Object*>& incs, std::vector<Object*>
     int lanes = g_gcThreads;
     bool parallel = s_parRC && lanes > 1 && g_poolWorkers > 0 &&
                     (incs.size() + decs.size()) >= kParThreshold;
+    // Under a held marker park the pool is unavailable (parked marker may own
+    // g_poolLock); run serial to avoid a self-deadlock.
+    if (g_rcApplyForceSerial)
+        parallel = false;
 
     if (!parallel)
     {
@@ -3766,15 +4199,67 @@ void LXRCollector::ProcessModifiedBuffers()
     // inter-trace window that D-copy actually consumes.
     if (g_dcopyCaptureModified && !g_dcopyRemsetOverflow && !g_traceWindowOpen)
     {
+        if (g_dcopyRecordAll < 0) { const char* e = getenv("LXR_DCOPY_RECORD_ALL"); g_dcopyRecordAll = (e != nullptr && e[0] == '1') ? 1 : 0; } // experimental (unsafe: retains stale mature->young slots that rebase into reused memory); default OFF
         for (const auto& kv : coalesced)
         {
             Object* cur = *(kv.first);
             if (cur == nullptr) continue;
             if ((uint8_t*)cur < m_heapBase || (uint8_t*)cur >= m_heapBase + m_heapBytes) continue;
-            if (!IsYoung(cur)) continue;
+            if (!g_dcopyRecordAll && !IsYoung(cur)) continue;
             if (!DCopyRemsetAppend(kv.first, cur, m_heapBase, m_heapBytes))
                 break; // overflow: set abandoned, D-copy full-walks until next trace
         }
+    }
+    // LXR_DCOPY_DBG: record, per modified slot, WHY it did/didn't enter the remset
+    // this pass (last reason wins across pauses), so the nursery-copy verify can
+    // pinpoint the capture gap for each unforwarded miss.
+    //   0=appended(young)  1=skip !IsYoung  2=skip trace-window-open
+    //   3=skip overflow    4=skip null/off-heap
+    {
+        static int s_skipDbg = -1;
+        if (s_skipDbg < 0) s_skipDbg = (getenv("LXR_DCOPY_DBG") != nullptr) ? 1 : 0;
+        if (s_skipDbg)
+        {
+            if (g_dcopySkipDbg == nullptr) { g_dcopySkipDbg = new std::unordered_map<Object**,int>(); }
+            for (const auto& kv : coalesced)
+            {
+                Object* cur = *(kv.first);
+                int reason;
+                if (cur == nullptr || (uint8_t*)cur < m_heapBase || (uint8_t*)cur >= m_heapBase + m_heapBytes)
+                    reason = 4;
+                else if (g_traceWindowOpen)
+                    reason = 2;
+                else if (g_dcopyRemsetOverflow)
+                    reason = 3;
+                else if (!IsYoung(cur))
+                    reason = 1;
+                else
+                    reason = 0;
+                (*g_dcopySkipDbg)[kv.first] = reason;
+            }
+        }
+    }
+    // LXR_BARRIER_TRACE: record EVERY barrier-logged edge (independent of young/
+    // trace-window gating above) into the persistent set for the elision-vs-drop
+    // classification at nursery-copy verify time.
+    if (g_barrierTrace < 0)
+    {
+        g_barrierTrace = getenv("LXR_BARRIER_TRACE") ? 1 : 0;
+        if (g_barrierTrace)
+        {
+            InitializeCriticalSection(&g_barrierEdgeLock);
+            g_barrierEdgeSet = new std::unordered_set<uint64_t>();
+        }
+    }
+    if (g_barrierTrace && g_barrierEdgeSet != nullptr)
+    {
+        EnterCriticalSection(&g_barrierEdgeLock);
+        for (const auto& kv : coalesced)
+        {
+            Object* cur = *(kv.first);
+            g_barrierEdgeSet->insert(BarrierEdgeKey(kv.first, cur));
+        }
+        LeaveCriticalSection(&g_barrierEdgeLock);
     }
     QueryPerformanceCounter(&pt15); // dcopy-capture done
     // Deferred-RC root capture (paper §3.2.1): scan the roots at this STW pause so
@@ -4344,8 +4829,20 @@ void LXRCollector::ConcurrentTraceDrain()
     // Interleave marking the grey set with consuming freshly-logged SATB
     // deletions, until a full pass adds no new work or the iteration budget is
     // hit. Only this (single) collector thread touches the mark stack.
+    //
+    // Marker-park path (LXR_MARKER_PARK): the drain itself is unchanged, but every
+    // mark lane now honors an OBJECT-GRANULAR park checkpoint (inside DrainClosure/
+    // DrainSliceLocal/DrainMarkStack and between big-array chunks). A spanned RC
+    // pause can therefore quiesce ALL mark lanes between object scans -- touching no
+    // heap -- and reclaim young memory safely, without any work budget or spill
+    // (greys stay on the mark stack while parked and resume in place on unpark).
+    // Raise the round cap when parking so the marker keeps re-consuming SATB and
+    // stays alive across the interleaved RC pauses that do the reclamation.
+    bool park = LXRMarkerParkEnabled();
     const int kMaxRounds = 64;
-    for (int round = 0; round < kMaxRounds; round++)
+    const long kParkMaxRounds = 4000000; // safety cap only; force-finish normally ends it
+    long roundCap = park ? kParkMaxRounds : kMaxRounds;
+    for (long round = 0; round < roundCap; round++)
     {
         size_t before = g_lxrCounters.SatbMarks;
         DrainClosure();         // scan everything currently grey (parallel if enabled)
@@ -4360,6 +4857,11 @@ void LXRCollector::ConcurrentTraceDrain()
                                 // the next request. Sound: the STW finish pause re-scans
                                 // all roots+handles and completes the closure, so any
                                 // residual grey/SATB is mopped up there (no missed live).
+        if (g_traceForceFinish > 0)
+            break;              // span cap hit (see g_traceMaxSpan): finalize the window
+                                // now so the safe finish-pause reclamation runs promptly
+                                // and footprint stays bounded. Same soundness as above:
+                                // the STW finish completes the closure from roots.
         Sleep(0);               // yield so mutators make progress / accrue SATB work
     }
 }
@@ -4744,6 +5246,7 @@ void LXRCollector::SweepScanStripe(int lane, int lanes, void* ctxp)
 
 void LXRCollector::SweepAndSelectDefrag()
 {
+    InterlockedExchange(&g_freeSite, 1);
     // Immix-style reclamation: any retired allocation region containing no
     // marked (reachable) object is fully dead; decommit its pages so committed
     // memory actually drops, and recycle it for future allocation. Regions with
@@ -4890,29 +5393,36 @@ void LXRCollector::SweepAndSelectDefrag()
 // sweep, so the pending vectors are drained before they can be re-populated.
 void LXRCollector::DrainPendingDecommit()
 {
-    if (g_pendingDecommit.empty() && g_pendingFreeChunks.empty())
+    if (g_pendingDecommit.empty())
         return;
     int64_t freedBytes = 0;
-    for (auto& r : g_pendingDecommit)
-    {
-        uint8_t* dbeg = r.first;
-        uint8_t* dend = r.second;
-        if (dend > dbeg)
-        {
-            VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
-            freedBytes += (int64_t)(dend - dbeg);
-        }
-    }
-    if (freedBytes != 0)
-    {
-        InterlockedExchangeAdd64(&m_reclaimedBytes, freedBytes);
-        InterlockedExchangeAdd64(&g_committedInUse, -freedBytes);
-    }
-    g_pendingDecommit.clear();
-
     EnterCriticalSection(&g_chunkLock);
-    for (size_t idx : g_pendingFreeChunks)
+    for (auto& p : g_pendingDecommit)
     {
+        ChunkRegion& c = g_chunks[p.idx];
+        // Re-validate under the chunk lock: a region selected for decommit under
+        // STW must still be in limbo (dead, ownerless, not carved into a reusable
+        // free-run) at drain time. Mutators have been live since RestartEE; if one
+        // caused this region to be re-committed / re-owned / line-carved, freeing
+        // its pages here by raw range would strand a still-live object (the storm
+        // crash: a young root allocated into a region whose page we then decommit).
+        // Skip it entirely -- neither decommit nor publish to the free list.
+        if (c.Committed || c.Owner != nullptr || c.FreeRun)
+        {
+            InterlockedIncrement64(&g_decommitSkippedReused);
+            static int s_diag = -1;
+            if (s_diag < 0) s_diag = (getenv("LXR_DECOMMIT_DIAG") != nullptr) ? 1 : 0;
+            if (s_diag)
+                fprintf(stderr, "[decommit-skip] idx=%zu reused (Committed=%d Owner=%p FreeRun=%d) range=[%p,%p) total=%lld\n",
+                        p.idx, (int)c.Committed, (void*)c.Owner, (int)c.FreeRun, (void*)p.beg, (void*)p.end,
+                        (long long)g_decommitSkippedReused);
+            continue;
+        }
+        if (p.end > p.beg)
+        {
+            VirtualFree(p.beg, p.end - p.beg, MEM_DECOMMIT);
+            freedBytes += (int64_t)(p.end - p.beg);
+        }
         if (g_freeChunkTop == g_freeChunkCap)
         {
             size_t nc = g_freeChunkCap ? g_freeChunkCap * 2 : 256;
@@ -4920,10 +5430,15 @@ void LXRCollector::DrainPendingDecommit()
             if (grown != nullptr) { g_freeChunks = grown; g_freeChunkCap = nc; }
         }
         if (g_freeChunkTop < g_freeChunkCap)
-            g_freeChunks[g_freeChunkTop++] = idx;
+            g_freeChunks[g_freeChunkTop++] = p.idx;
     }
     LeaveCriticalSection(&g_chunkLock);
-    g_pendingFreeChunks.clear();
+    if (freedBytes != 0)
+    {
+        InterlockedExchangeAdd64(&m_reclaimedBytes, freedBytes);
+        InterlockedExchangeAdd64(&g_committedInUse, -freedBytes);
+    }
+    g_pendingDecommit.clear();
 }
 
 int64_t LXRCollector::ReclaimRegionMemory(size_t chunkIndex)
@@ -4933,6 +5448,20 @@ int64_t LXRCollector::ReclaimRegionMemory(size_t chunkIndex)
     uint8_t* dend = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~((uintptr_t)g_pageSize - 1));
     int64_t bytes = (dend > dbeg) ? (int64_t)(dend - dbeg) : 0;
     c.Committed = false;
+    // LXR_FREEDLOG diagnostic: ring-record every reclaimed region range + epoch so
+    // the nursery-copy verify can classify a stale-target miss as address-recycling
+    // (target sits in a range freed then reused) vs a pure remset fix-up gap.
+    static int s_freedLogInit = -1;
+    if (s_freedLogInit < 0)
+    {
+        s_freedLogInit = (getenv("LXR_FREEDLOG") != nullptr) ? 1 : 0;
+        if (s_freedLogInit) g_freedLog = new LXRFreedRange[kFreedLogCap]();
+    }
+    if (g_freedLog != nullptr)
+    {
+        size_t idx = (size_t)(InterlockedIncrement64(&g_freedLogNext) - 1) & (kFreedLogCap - 1);
+        g_freedLog[idx].s = c.Start; g_freedLog[idx].e = c.Start + c.Size; g_freedLog[idx].ep = g_traceEpoch; g_freedLog[idx].site = g_freeSite;
+    }
     if (g_deferDecommit)
     {
         // Off-pause: record the range + chunk index; DrainPendingDecommit (after
@@ -4940,8 +5469,8 @@ int64_t LXRCollector::ReclaimRegionMemory(size_t chunkIndex)
         // reusable free list. The region is in limbo until then (pages committed,
         // RC/log to be cleared by the caller, unreachable by the allocator), so a
         // deferred RC decrement into it finds RC 0 and its page never faults.
-        if (dend > dbeg) g_pendingDecommit.push_back({ dbeg, dend });
-        g_pendingFreeChunks.push_back(chunkIndex);
+        if (dend > dbeg) g_pendingDecommit.push_back({ chunkIndex, dbeg, dend });
+        else             g_pendingDecommit.push_back({ chunkIndex, dbeg, dbeg });
         return bytes;
     }
     if (dend > dbeg)
@@ -5406,6 +5935,7 @@ static void EvacSelFn(int lane, int lanes, void* ctxp)
 }
 void LXRCollector::Evacuate()
 {
+    InterlockedExchange(&g_freeSite, 2);
     if (g_lxrGCHeap == nullptr || g_theGCToCLR == nullptr)
         return;
     InterlockedIncrement64(&g_lxrCounters.EvacPasses);
@@ -5989,7 +6519,7 @@ void LXRCollector::Evacuate()
                     Object* t = *f;
                     if (t == nullptr) return;
                     if ((uint8_t*)t < m_heapBase || (uint8_t*)t >= m_heapBase + m_heapBytes) return;
-                    if (!IsYoung(t)) return;
+                    if (!g_dcopyRecordAll && !IsYoung(t)) return;
                     DCopyRemsetAppend(f, t, m_heapBase, m_heapBytes);
                 });
     }
@@ -6363,6 +6893,7 @@ static void LXRNurseryCollectRootAddr(PTR_PTR_Object ppObj, ScanContext* /*sc*/,
 // remembered set, no closure walk, no O(heap) scan of live young.
 void LXRCollector::CollectNursery()
 {
+    InterlockedExchange(&g_freeSite, 3);
     if (!g_youngRC || !g_nurseryActive || g_theGCToCLR == nullptr)
         return;
     if (g_nurseryGuard < 0)
@@ -6378,11 +6909,51 @@ void LXRCollector::CollectNursery()
         return;
     }
 
-    // Coordinate with the concurrent backup trace: while a trace window is open the
-    // marker may be walking young regions and its marks / allocate-black keep young
-    // objects alive independently of RC, so freeing young underneath it is unsafe.
-    // Defer to the trace, which reclaims dead young at its next cycle.
-    if (g_traceWindowOpen)
+    // Paper §2.1/§3.2: reference counting OWNS young reclamation at EVERY pause;
+    // the backup trace is a backstop for OLD objects + cycles, not the young
+    // reclaimer. So run young reclamation even while a concurrent trace window is
+    // open. Soundness against the concurrent marker (a non-suspended GC thread that
+    // marks by FOLLOWING references from already-marked objects): a young object at
+    // RC 0 has no heap referrer (the coalescing barrier counts every heap store to
+    // it), so NO marked object can point to it and the marker can neither reach nor
+    // dereference into it -- reclaiming an all-RC-0 young region is therefore
+    // race-free against an in-flight trace. The per-region reclaim loop below only
+    // frees a region when EVERY young object in it is RC 0 AND unmarked AND unrooted
+    // (AnyMarkedInRange + rootInRange + the all-RC-0 scan), so a marked/referenced
+    // young survivor (RC>0, or on the marker's work list => referenced => RC>0) can
+    // never be underneath a freed region. Previously this returned unconditionally
+    // while g_traceWindowOpen, which - because the sweep also retains young regions
+    // via IsYoung and the window is ~continuously open under an allocation storm -
+    // suppressed young reclamation entirely and ran committed away to the
+    // backpressure cap. LXR_NURSERY_DURING_TRACE re-enables it for A/B validation.
+    // Still bail if young RC is known-incomplete below.
+    //
+    // PAPER FIDELITY (arXiv:2210.17175 §1): LXR frees memory ONLY at STW pauses and
+    // never while the tracer may read it -- its trace workers ARE the pause workers,
+    // so the tracer is quiesced whenever reclamation runs. Our concurrent marker is
+    // a SEPARATE thread+pool NOT suspended by SuspendEE, and our trace is not pure
+    // SATB (it marks new-values / re-scans roots to cover .NET root movement), so it
+    // CAN dereference post-snapshot young. Freeing young during an open window then
+    // races the marker (confirmed AV: a mark-pool worker read a region CollectNursery
+    // freed+recycled -- a stale mark-stack pointer into recycled memory). So DEFER
+    // young reclamation to a marker-quiescent pause (window closed): the finish pause
+    // and RC pauses between windows reclaim young safely. Footprint is bounded by
+    // keeping trace windows brief (frequent finishes), matching the paper's "regular,
+    // brief stop-the-world collections", NOT by racing the tracer.
+    //
+    // MARKER-PARK PATH (LXR_MARKER_PARK): the driver quiesces the concurrent marker
+    // + its pool at an object-granular park BEFORE calling this (g_markerReclaimSafe),
+    // so no mark lane is dereferencing the heap. That reproduces the paper's
+    // invariant (tracer quiesced while memory is freed) WITHOUT deferring, letting
+    // us reclaim implicitly-dead young at every spanned RC pause and bound footprint.
+    // Sound: SuspendEE freezes roots, the marker is parked after a settled grey set
+    // (everything it reached is MARKED), and we only free regions that are entirely
+    // RC-0 AND unmarked AND unrooted -- so nothing the trace reached is under a
+    // freed region, and on unpark the marker resumes from marked (live) parents.
+    static int s_nurseryDuringTrace = -1;
+    if (s_nurseryDuringTrace < 0)
+        s_nurseryDuringTrace = (getenv("LXR_NURSERY_DURING_TRACE") != nullptr) ? 1 : 0;
+    if (g_traceWindowOpen && !s_nurseryDuringTrace && !g_markerReclaimSafe)
     {
         InterlockedIncrement64(&g_lxrCounters.NurserySkipped);
         return;
@@ -6610,6 +7181,30 @@ void LXRCollector::CollectNursery()
         if (!IsYoung((Object*)c.Start))
             continue;                       // mature region: handled by the trace, not here
 
+        // SATB-safety when reclaiming DURING an open trace window (Option B): a
+        // young object that existed at the snapshot can be SATB-live yet have RC 0
+        // (it was reachable at snapshot, and its last incoming ref was deleted AFTER
+        // the snapshot -> RC dropped to 0, but the SATB deletion buffer still keeps
+        // it grey and the marker will scan it). Freeing it would strand the marker.
+        // Post-snapshot objects are NOT in the snapshot graph, so RC is fully
+        // authoritative for them and the marker can only reach one via a marked
+        // object's CURRENT field (which makes its RC >= 1). So while the window is
+        // open, only reclaim regions that lie ENTIRELY above the snapshot high-water
+        // (nothing in them predates the snapshot). Fully-closed-window reclaim keeps
+        // its original all-young semantics.
+        if (g_traceWindowOpen)
+        {
+            uint8_t* snapHW;
+            if (i >= g_snapChunkCount)
+                snapHW = c.Start;           // region registered after the snapshot
+            else if (g_snapUsedEnd != nullptr && i < g_snapUsedEnd->size())
+                snapHW = (*g_snapUsedEnd)[i];
+            else
+                snapHW = c.UsedEnd;         // unknown => treat as all pre-snapshot (keep)
+            if (snapHW > c.Start)
+                continue;                   // contains snapshot-era objects: defer to finish
+        }
+
         // Mark-authoritative safety net (mirrors SweepAndSelectDefrag): the backup
         // trace is LXR's liveness backstop, so NEVER free a region the trace marked
         // - RC may transiently undercount an object the trace has proven reachable
@@ -6642,7 +7237,7 @@ void LXRCollector::CollectNursery()
 
         // Dead young region: reclaim its memory (decommit deferred off-pause by
         // ReclaimRegionMemory) and recycle it. RC/log cleared in-pause.
-        RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryPasses);
+        RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryPasses, 3, g_traceEpoch);
         // Reclaimed => RC 0. Young objects are now reference-counted, so clear
         // their RC bytes as the region is decommitted (mirrors the sweep decommit
         // site) so no stale count survives into the decommitted range and a later
@@ -6900,11 +7495,26 @@ static void DCopy4bFn(int lane, int lanes, void* ctxp)
 
 void LXRCollector::CopyYoungSurvivors()
 {
+    InterlockedExchange(&g_freeSite, 4);
     static int s_enabled = -1;
     if (s_enabled < 0)
     {
+        // PAPER FIDELITY (arXiv:2210.17175 §3.3): LXR does NOT copy at RC pauses.
+        // RC pauses only reclaim dead young lines/blocks (CollectNursery); all
+        // copying/defragmentation is the occasional STW TRACE's job (Evacuate),
+        // where mark authority forwards EVERY marked referrer completely. This
+        // RC-pause "D-copy" was a non-paper extension whose fix-up relies on the
+        // SCOPED remembered set (g_dcopyModifiedSlots), which is provably
+        // INCOMPLETE for stable mature->young edges (a big-array element stored in
+        // an earlier epoch, barrier-log long cleared -> inRemset=0, never
+        // forwarded). Moving/freeing a young survivor under such an unforwarded
+        // straggler dangles the referrer and the concurrent marker AVs (~10-50% of
+        // storm runs; verified via [verify-nursery-copy] UNFORWARDED ref
+        // referrer=<big array> marked=1 inRemset=0). Default OFF for soundness;
+        // Evacuate (trace) handles young defrag with complete fix-up.
+        // LXR_NURSERY_COPY=1 re-enables the experimental RC-pause copy for A/B.
         const char* e = getenv("LXR_NURSERY_COPY");
-        s_enabled = (e != nullptr && e[0] == '0') ? 0 : 1; // default ON (full parity)
+        s_enabled = (e != nullptr && e[0] == '1') ? 1 : 0; // default OFF (unsound: incomplete RC-pause remset)
     }
     if (!s_enabled)
         return;
@@ -7072,7 +7682,8 @@ void LXRCollector::CopyYoungSurvivors()
             EnsureRCPage(RCSlot((Object*)d));
             EnsureRCPage(RCSlot(o));
             *RCSlot((Object*)d) = *RCSlot(o); // preserve the survivor's reference count
-            *RCSlot(o) = 0;                   // source granule retired
+            if (getenv("LXR_NURSERY_COPY_NO_FREE") == nullptr)
+                *RCSlot(o) = 0;               // source granule retired
             // The promoted copy is now MATURE but may hold young->young field
             // edges the JIT never barriered (elided intra-nursery init stores).
             // Such an edge would become an invisible mature->young reference:
@@ -7089,7 +7700,7 @@ void LXRCollector::CopyYoungSurvivors()
                     Object* t = *f;
                     if (t == nullptr) return;
                     if ((uint8_t*)t < m_heapBase || (uint8_t*)t >= m_heapBase + m_heapBytes) return;
-                    if (!IsYoung(t)) return;
+                    if (!g_dcopyRecordAll && !IsYoung(t)) return;
                     DCopyRemsetAppend(f, t, m_heapBase, m_heapBytes);
                 });
             }
@@ -7253,11 +7864,22 @@ void LXRCollector::CopyYoungSurvivors()
         //     region-slot so no two lanes touch the same bucket/slot; SlotCommitted
         //     VirtualQuery latency (the dominant cost on scattered stale entries)
         //     overlaps across threads.
+        if (g_dcopyDbg < 0) g_dcopyDbg = (getenv("LXR_DCOPY_DBG") != nullptr) ? 1 : 0;
+        g_dcopyDbgSlots = nullptr;
         if (!g_dcopyRemsetBuckets.empty())
         {
             size_t nbuckets = g_dcopyRemsetBuckets.size();
             std::vector<size_t> bucketIdx;
             bucketIdx.reserve(evacuatedSrcs.size());
+            static int s_allBuckets = -1;
+            if (s_allBuckets < 0) s_allBuckets = (getenv("LXR_DCOPY_4B_ALLBUCKETS") != nullptr) ? 1 : 0; // experimental (unsafe: stale-slot rebase); default OFF
+            if (s_allBuckets)
+            {
+                for (size_t rs = 0; rs < nbuckets; rs++)
+                    if (!g_dcopyRemsetBuckets[rs].empty())
+                        bucketIdx.push_back(rs);
+            }
+            else
             for (const SrcRegion& sr : evacuatedSrcs)
             {
                 size_t rs0 = (size_t)(sr.start - m_heapBase) / CONTEXT_ALLOC_QUANTUM;
@@ -7271,6 +7893,19 @@ void LXRCollector::CopyYoungSurvivors()
             // bucket must be processed by exactly one lane (else double prune/rebase).
             std::sort(bucketIdx.begin(), bucketIdx.end());
             bucketIdx.erase(std::unique(bucketIdx.begin(), bucketIdx.end()), bucketIdx.end());
+
+            // LXR_DCOPY_DBG: snapshot every remset slot in the evacuated regions'
+            // buckets BEFORE 4b prunes/rebases, so the verify can tell whether a
+            // missed edge was ever captured.
+            if (g_dcopyDbg)
+            {
+                static std::unordered_set<Object**> s_dbg;
+                s_dbg.clear();
+                for (size_t rs : bucketIdx)
+                    for (Object** s : g_dcopyRemsetBuckets[rs])
+                        s_dbg.insert(s);
+                g_dcopyDbgSlots = &s_dbg;
+            }
 
             // Committed-region snapshot for the in-memory referrer-committed check
             // (step (ii) in DCopy4bFn), replacing a per-slot VirtualQuery syscall.
@@ -7318,6 +7953,7 @@ void LXRCollector::CopyYoungSurvivors()
     else
     {
         InterlockedIncrement64(&g_lxrCounters.NurseryCopyFullWalks);
+        int64_t midBreaks = 0, midBreakBytes = 0;
         for (size_t i = 0; i < g_chunkCount; i++)
         {
             ChunkRegion& c = g_chunks[i];
@@ -7329,14 +7965,29 @@ void LXRCollector::CopyYoungSurvivors()
             {
                 Object* o = (Object*)p;
                 size_t sz = LXRObjectSize(o);
-                if (sz == 0)
-                    break;
+                if (sz == 0 || p + sz > end)
+                {
+                    // Unparseable hole (e.g. a decommitted/reused Immix line gap or
+                    // an alignment pad). A plain break here would skip EVERY referrer
+                    // past the hole and leave their edges to moved young survivors
+                    // un-rebased -> dangling once the source is reclaimed. Instead,
+                    // resync: step one pointer-granule at a time looking for the next
+                    // parseable object header (valid MT that yields a size fitting
+                    // within the region frontier). This keeps the walk complete.
+                    if (p + sizeof(void*) <= end)
+                        { midBreaks++; midBreakBytes += sizeof(void*); }
+                    p += sizeof(void*);
+                    continue;
+                }
                 p += sz;
                 if (fx.IsMovedSource(o))
                     continue; // dead source
                 GCScanObjectRefs(o, sz, rebaseField);
             }
         }
+        if (g_dcopyDbg && midBreaks > 0)
+            fprintf(stderr, "LXRGC: [dcopy-fullwalk] MID-REGION parse breaks=%lld unscannedBytes=%lld (region tail after a null MT left UNFIXED)\n",
+                    (long long)midBreaks, (long long)midBreakBytes);
     }
     LARGE_INTEGER clkAfterFixup; QueryPerformanceCounter(&clkAfterFixup);
     if (verbose)
@@ -7387,10 +8038,42 @@ void LXRCollector::CopyYoungSurvivors()
                     if (forwarding.find(*f) != forwarding.end())
                     {
                         if (misses < 20)
-                            fprintf(stderr, "LXRGC: [verify-nursery-copy] UNFORWARDED ref: referrer=%p mt=%p region=%zu owner=%d young=%d off=%lld -> stale %p\n",
-                                    (void*)o, (void*)o->GetGCSafeMethodTable(), i,
+                        {
+                            bool inRemset = (g_dcopyDbgSlots != nullptr && g_dcopyDbgSlots->count(f) != 0);
+                            int barrierLogged = -1;
+                            if (g_barrierTrace && g_barrierEdgeSet != nullptr)
+                            {
+                                EnterCriticalSection(&g_barrierEdgeLock);
+                                barrierLogged = g_barrierEdgeSet->count(BarrierEdgeKey(f, *f)) != 0 ? 1 : 0;
+                                LeaveCriticalSection(&g_barrierEdgeLock);
+                            }
+                            lxr::BlockMeta* rm = MetaForBlock((uint8_t*)o);
+                            int skipReason = -1;
+                            if (g_dcopySkipDbg != nullptr)
+                            {
+                                auto it = g_dcopySkipDbg->find(f);
+                                if (it != g_dcopySkipDbg->end()) skipReason = it->second;
+                            }
+                            // LXR_FREEDLOG: was the stale target's address ever reclaimed?
+                            long long freedEp = -1; int freedSite = -1;
+                            if (g_freedLog != nullptr)
+                            {
+                                uint8_t* tgt = (uint8_t*)*f;
+                                int64_t cnt = g_freedLogNext; if (cnt > (int64_t)kFreedLogCap) cnt = (int64_t)kFreedLogCap;
+                                for (int64_t k = 0; k < cnt; k++)
+                                    if (tgt >= g_freedLog[k].s && tgt < g_freedLog[k].e) { freedEp = g_freedLog[k].ep; freedSite = g_freedLog[k].site; break; }
+                            }
+                            int rMarked = IsMarked(o) ? 1 : 0;
+                            int rRooted = rootInRange(op, p) ? 1 : 0;
+                            int rRC = (int)rcValue(o);
+                            fprintf(stderr, "LXRGC: [verify-nursery-copy] UNFORWARDED ref: referrer=%p mt=%p sz=%zu marked=%d rooted=%d rc=%d region=%zu owner=%d young=%d bornEp=%lld gEp=%lld inRemset=%d barrierLogged=%d skip=%d off=%lld freedEp=%lld freedSite=%d -> stale %p\n",
+                                    (void*)o, (void*)o->GetGCSafeMethodTable(), sz,
+                                    rMarked, rRooted, rRC, i,
                                     (int)(c.Owner != nullptr), (int)IsYoung(o),
-                                    (long long)((uint8_t*)f - op), (void*)*f);
+                                    (long long)(rm ? rm->bornTraceEpoch : -1), (long long)g_traceEpoch,
+                                    (int)inRemset, barrierLogged, skipReason,
+                                    (long long)((uint8_t*)f - op), freedEp, freedSite, (void*)*f);
+                        }
                         misses++;
                     }
                 });
@@ -7404,15 +8087,47 @@ void LXRCollector::CopyYoungSurvivors()
         }
     }
 
-    // 5. Free the fully-evacuated young source regions (all survivors relocated).
+    // 5. Source-region reclamation.
+    //
+    // SOUNDNESS (root-caused 2026-07-24): eager free here is UNSOUND. This D-copy
+    // pass runs at an RC pause and fixes up referrers via the SCOPED remembered
+    // set (g_dcopyModifiedSlots). That set is provably INCOMPLETE: a STABLE
+    // mature->young edge (e.g. a big reference array element stored in an earlier
+    // epoch, whose coalescing-barrier log was long since cleared) is never
+    // re-captured, so inRemset=0 and the referrer is NOT forwarded (verified:
+    // [verify-nursery-copy] UNFORWARDED ref referrer=<big array> marked=1 rc=1
+    // bornEp<<gEp inRemset=0). Freeing the source under such a straggler leaves the
+    // referrer dangling; the concurrent marker later follows it into the freed
+    // (decommitted/reused) region and access-violates (~50% of storm runs).
+    //
+    // The paper (arXiv:2210.17175 §3.3) does NOT copy at RC pauses; copying/defrag
+    // is the occasional STW TRACE's job (Evacuate), where mark authority fixes up
+    // EVERY marked referrer completely. Our RC-pause D-copy cannot achieve that
+    // completeness, so it must not free sources. Instead we KEEP the source regions
+    // and let the authoritative reclaimers take them when they are provably dead:
+    //   * CollectNursery (this same pause / later RC pauses) reclaims a source
+    //     region once every young object in it is RC 0 (survivors moved out; the
+    //     few objects kept alive by an unforwarded straggler stay, correctly).
+    //   * the mark-authoritative trace sweep reclaims it once unmarked (all
+    //     referrers, incl. the stragglers, updated or dead).
+    // A stale referrer thus points at a VALID (still-committed, still-marked) old
+    // object -> no dangling, no AV; the straggler's region is retained until the
+    // referrer is overwritten or dies. Verified: 0 AV over storm runs; footprint
+    // stays bounded (CollectNursery/sweep drain the emptied sources within the run).
+    //
+    // LXR_NURSERY_COPY_EAGER_FREE=1 restores the old (unsound) eager free for A/B.
     int64_t regionsFreed = 0, bytesFreed = 0;
+    static int s_eagerFree = (getenv("LXR_NURSERY_COPY_EAGER_FREE") != nullptr) ? 1 : 0;
+    static int s_noFreeForce = (getenv("LXR_NURSERY_COPY_NO_FREE") != nullptr) ? 1 : 0;
+    bool doFree = s_eagerFree && !s_noFreeForce;
     EnterCriticalSection(&g_chunkLock);
+    if (doFree)
     for (size_t idx : freeableSrcIndices)
     {
         ChunkRegion& c = g_chunks[idx];
         if (!c.Committed)
             continue;
-        RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryCopyPasses);
+        RecordFreedYoung(c.Start, c.Start + c.Size, g_lxrCounters.NurseryCopyPasses, 4, g_traceEpoch);
         ClearRCRange(c.Start, c.UsedEnd);   // reclaimed => RC 0 (mirror the sweep decommit site)
         ClearLoggedRange(c.Start, c.UsedEnd); // reused range must start unlogged
         bytesFreed += ReclaimRegionMemory(idx); // decommit deferred off-pause
@@ -7472,6 +8187,7 @@ void LXRCollector::CopyYoungSurvivors()
 // ===========================================================================
 void LXRCollector::ReclaimMatureByRC()
 {
+    InterlockedExchange(&g_freeSite, 5);
     static int s_rcReclaim = -1;
     if (s_rcReclaim < 0)
     {
@@ -7708,6 +8424,10 @@ HRESULT LXRGCHeap::Initialize()
     {
         const char* e = getenv("LXR_DEFER_DECOMMIT");
         g_deferDecommit = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON
+    }
+    {
+        const char* e = getenv("LXR_ONPAUSE_RC");
+        g_onPauseRC = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON (paper-faithful)
     }
     if (g_lineReuseMinBytes == 0)
     {
@@ -8238,6 +8958,15 @@ static void EnsureTracePolicy()
         const char* e = getenv("LXR_SURVIVAL_TRIGGER");
         g_survivalTrigger = (e && _atoi64(e) == 0) ? 0 : 1;
     }
+    if (g_traceMaxSpan < 0)
+    {
+        // Max RC epochs a concurrent trace window may span before we force it to
+        // finalize (see g_traceMaxSpan decl). Bounds footprint by finishing traces
+        // promptly so the safe finish-pause reclamation runs frequently. Default 3
+        // keeps windows brief without over-eager finish pauses; <=0 disables.
+        const char* e = getenv("LXR_TRACE_MAX_SPAN");
+        g_traceMaxSpan = e ? (LONG)_atoi64(e) : 3;
+    }
 }
 
 // Decide whether this epoch is a light RC pause or a full backup-trace pause.
@@ -8411,7 +9140,15 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (g_markerQuiescent)
             meFinish = true;                       // marker parked -> finalize now
         else
+        {
             InterlockedIncrement64(&g_multiEpochSpans);
+            // Paper fidelity: bound the window length. Once it has spanned the cap,
+            // signal the marker to quiesce now (ConcurrentTraceDrain breaks); the
+            // next RC epoch then runs meFinish and reclaims at that safe pause.
+            int64_t ws = InterlockedIncrement64(&g_windowSpans);
+            if (g_traceMaxSpan > 0 && ws >= (int64_t)g_traceMaxSpan)
+                InterlockedExchange(&g_traceForceFinish, 1);
+        }
         phase = LXRPhase::RCPause;
     }
 
@@ -8444,10 +9181,13 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     // reclaim (g_forceSyncTrace) and no concurrent trace is in flight, take the
     // SYNCHRONOUS STW trace path instead of starting a long concurrent multi-epoch
     // window. The STW trace's zero mutator window means nothing is allocate-blacked,
-    // so the mark-authoritative sweep frees all dead young and committed drops back
-    // to true-live -- exactly what backpressure needs. If a concurrent trace is
-    // MARKING, leave it to finish (meFinish) this call; the next park iteration
-    // finds TRACE_IDLE and does the STW trace.
+    // so the mark-authoritative sweep can free dead objects at a marker-quiescent
+    // pause. NOTE (2026-07-28): this alone does NOT bound footprint on a sustained
+    // alloc storm -- once objects age to mature across repeated forced traces, the
+    // sweep's freed blocks are not effectively reused, so committed ratchets up
+    // (true-live estimate grows -> backpressure threshold grows -> allocators park
+    // later -> committed balloons; a positive-feedback cadence/reuse runaway,
+    // separate from marker safety). Tracked as the open footprint wall.
     if (g_forceSyncTrace && g_traceState == TRACE_IDLE &&
         phase == LXRPhase::TracePause && doTrace && g_theGCToCLR != nullptr)
     {
@@ -8481,7 +9221,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // to full STW processing only when concurrent decrements are disabled.
         if (doBuffers)
         {
-            if (g_concDecrements)
+            if (g_concDecrements && !g_onPauseRC)
                 g_lxrCollector.SnapshotModifiedBuffers();
             else
                 g_lxrCollector.ProcessModifiedBuffers();
@@ -8496,11 +9236,22 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // the pre-existing candidate incoming edges the (candidate-scoped) barrier
         // no longer records heap-wide. Reset + arm recording before the marker runs.
         if (doEvac && g_evacCandidateScope) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
+        if (g_dcopyCaptureModified) { ResetDcopyEdges(); InterlockedExchange(&g_recordDcopyEdges, 1); }
         if (verbose) { fprintf(stderr, "LXRGC: [stage]   snapshot breakdown: bufs=%lldus snap=%lldus\n", (long long)((tb1.QuadPart-tb0.QuadPart)*1000000/freq.QuadPart), (long long)((tb2.QuadPart-tb1.QuadPart)*1000000/freq.QuadPart)); fflush(stderr); }
         LXREnsureMarkerThread();
         InterlockedExchange(&g_traceCompleteThisCycle, 0);
         InterlockedExchange(&g_markerQuiescent, 0);
-        InterlockedExchange(&g_snapshotConsumed, 0);
+        InterlockedExchange64(&g_windowSpans, 0);       // new window: reset span cap
+        InterlockedExchange(&g_traceForceFinish, 0);
+        // On-pause RC (paper-faithful): meStart processed the buffers ON THIS PAUSE
+        // (ProcessModifiedBuffers above), so RC is already authoritative and the
+        // root-deferral rotation is clean BEFORE we restart the mutators. Publish
+        // g_snapshotConsumed now so every spanned RC pause in the coming window can
+        // immediately park the (trace-only) marker and reclaim dead young -- instead
+        // of waiting up to ~200ms for the marker's off-pause decrement replay. In
+        // the legacy off-pause mode the marker publishes it after ProcessSnapshot-
+        // Decrements.
+        InterlockedExchange(&g_snapshotConsumed, g_onPauseRC ? 1 : 0);
         InterlockedExchange(&g_traceState, TRACE_MARKING);
         SetEvent(g_markerStartEvent);
         LXRSetPhase("me:restart-snapshot");
@@ -8545,7 +9296,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // the concurrent snapshot path uses, applied to the finish pause.
         LXRSetPhase("me:finish-buffers");
         if (doBuffers)
-            g_lxrCollector.SnapshotModifiedBuffers();
+        {
+            if (g_onPauseRC)
+                g_lxrCollector.ProcessModifiedBuffers();   // paper-faithful: RC on-pause
+            else
+                g_lxrCollector.SnapshotModifiedBuffers();  // legacy: detach + off-pause replay
+        }
         QueryPerformanceCounter(&tf2);
         // Item F: evacuate in this concurrent-trace finish pause (marks are
         // complete; EE is suspended and the marker is parked). The persistent
@@ -8559,6 +9315,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // Item F: recording window closes once Evacuate has consumed the scoped
         // remembered set (ConcurrentTraceFinish above recorded the final-drain edges).
         if (doEvac && g_evacCandidateScope) InterlockedExchange(&g_recordEvacEdges, 0);
+        if (g_dcopyCaptureModified) InterlockedExchange(&g_recordDcopyEdges, 0);
         LARGE_INTEGER tfEvac; QueryPerformanceCounter(&tfEvac);
         LXRSetPhase("me:finish-sweep");
         if (doSweep)
@@ -8617,7 +9374,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("me:finish-decrements");
         LARGE_INTEGER td0, td1;
         QueryPerformanceCounter(&td0);
-        if (doBuffers)
+        if (doBuffers && !g_onPauseRC)
             g_lxrCollector.ProcessSnapshotDecrements();
         QueryPerformanceCounter(&td1);
         // Off-pause phase event: the lazy RC decrement + recursive-free replay.
@@ -8654,6 +9411,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // Item F: arm candidate-scoped evac-remset repopulation for the concurrent
         // mark (see the multi-epoch snapshot path for rationale).
         if (doEvac && g_evacCandidateScope) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
+        if (g_dcopyCaptureModified) { ResetDcopyEdges(); InterlockedExchange(&g_recordDcopyEdges, 1); }
         LXRSetPhase("conc:restart-snapshot");
         LXRRestartEE();
         QueryPerformanceCounter(&a1);
@@ -8725,6 +9483,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             g_lxrCollector.Evacuate();
         }
         if (doEvac && g_evacCandidateScope) InterlockedExchange(&g_recordEvacEdges, 0);
+        if (g_dcopyCaptureModified) InterlockedExchange(&g_recordDcopyEdges, 0);
         QueryPerformanceCounter(&cf3); // evac done
         LXRSetPhase("conc:finish-sweep");
         if (doSweep)
@@ -8782,15 +9541,33 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         LXRSetPhase("stw:buffers");
         // Multi-epoch spanned RC epoch: DRAIN the modified buffers accumulated so
         // far in the marking window (paper: RC pauses continue during a spanning
-        // trace). Safe to run a full ProcessModifiedBuffers once the marker has
-        // consumed the meStart snapshot (g_snapshotConsumed) - the root-deferral
-        // rotation is then clean, ProcessModifiedBuffers takes m_collectLock while
-        // ConcurrentTraceDrain takes none (no contention), and DrainZeroCountWork-
-        // List never decommits inside the trace window (g_traceWindowOpen), so the
-        // concurrent marker never races a free. Incremental draining bounds the
-        // finish pause. Only in the tiny window BEFORE the snapshot is consumed do
-        // we defer (skip) to avoid corrupting the outstanding snapshot's rotation.
-        bool skipBuffersForSpan = g_multiEpoch && g_traceState == TRACE_MARKING && !g_snapshotConsumed;
+        // trace) AND reclaim dead young/mature. With on-pause RC the concurrent
+        // marker is still TRACING (reading the heap) during the window, so EVERY
+        // free below -- ProcessModifiedBuffers' zero-count cascade, CopyYoung-
+        // Survivors, CollectNursery, ReclaimMatureByRC -- must run with the mark
+        // lanes quiesced. Acquire the object-granular marker park ONCE here and
+        // hold it across the whole reclaim (released just before RestartEE). If no
+        // marker is active (not a spanned window) the park returns false and the
+        // pause proceeds exclusively as usual.
+        bool spannedRC = g_multiEpoch && g_traceState == TRACE_MARKING &&
+                         phase == LXRPhase::RCPause;
+        bool spanMarkerParked = false;
+        if (spannedRC)
+        {
+            spanMarkerParked = LXRRequestMarkerPark();
+            if (spanMarkerParked)
+            {
+                InterlockedExchange(&g_markerReclaimSafe, 1);
+                InterlockedExchange(&g_rcApplyForceSerial, 1);
+                InterlockedIncrement64(&g_windowReclaims);
+            }
+        }
+        // Free this pause iff either we are not inside a marking window (no
+        // concurrent marker to race) or we successfully parked it. If the park
+        // could not be obtained (still consuming the snapshot in legacy mode, or
+        // the spin cap tripped) we DEFER: skip freeing this pause; the buffers
+        // accumulate and the next pause (or the finish) drains them.
+        bool skipBuffersForSpan = spannedRC && !spanMarkerParked;
         if (doBuffers && !skipBuffersForSpan)
         {
             LARGE_INTEGER tpb0; QueryPerformanceCounter(&tpb0);
@@ -8814,8 +9591,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 // The default path uses the PERSISTENT barrier-maintained remset and
                 // ignores these logs. Reset+record inter-block edges during closure.
                 if (doEvac) { ResetEvacEdges(); InterlockedExchange(&g_recordEvacEdges, 1); }
+                if (g_dcopyCaptureModified) { ResetDcopyEdges(); InterlockedExchange(&g_recordDcopyEdges, 1); }
                 g_lxrCollector.BackupTrace();
                 if (doEvac) InterlockedExchange(&g_recordEvacEdges, 0);
+                if (g_dcopyCaptureModified) InterlockedExchange(&g_recordDcopyEdges, 0);
                 if (verbose) { fprintf(stderr, "LXRGC: [stage] BackupTrace done\n"); fflush(stderr); }
             }
             if (doEvac)
@@ -8830,6 +9609,28 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 g_lxrCollector.SweepAndSelectDefrag();
                 if (verbose) { fprintf(stderr, "LXRGC: [stage] SweepAndSelectDefrag done\n"); fflush(stderr); }
             }
+            // PAPER FIDELITY (arXiv:2210.17175 §1: "at each pause ... reclaims free
+            // blocks and lines with dead young objects"). The sweep RETAINS young
+            // regions (they are RC-, not trace-governed), so young is reclaimed
+            // ONLY by the RC nursery path. Without this, a synchronous STW trace
+            // pause -- which the backpressure/wastage triggers can fire back-to-back
+            // -- never frees dead young, and committed runs away (observed 255MB ->
+            // 2.5GB across ~12 forced-sync traces, since the sweep alone cannot
+            // reclaim young). Reclaim dead young here too, exactly as the RC pause
+            // does. Sound at a synchronous STW trace: SuspendEE froze the roots,
+            // ProcessModifiedBuffers above made RC authoritative, and there is NO
+            // concurrent marker running (this branch is the non-useConcurrent path),
+            // so CollectNursery frees only RC-0 + unmarked + unrooted young with no
+            // lane able to race the free. CollectNursery self-skips if a trace
+            // window is somehow open or young RC is incomplete, so it is safe to
+            // call unconditionally. CopyYoungSurvivors likewise self-skips an open
+            // window; it defragments survivors so more regions become fully dead and
+            // reclaimable (the paper's nursery IS a copying collector).
+            if (g_youngRC && g_nurseryActive && !g_traceWindowOpen)
+            {
+                LXRSetPhase("stw:trace-nursery");
+                g_lxrCollector.CollectNursery();
+            }
             // Clear SATB buffers accumulated by a STW SATB exercise (LXR_SATB),
             // safe here under the pause.
             if (g_lxrCollector.IsSatbActive())
@@ -8840,7 +9641,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             if (g_remsetActive)
                 g_lxrCollector.CompactRemsets();
         }
-        else
+        else if (!skipBuffersForSpan)
         {
             // Item D: young/nursery collection at the RC pause (paper §3.3). Young
             // objects are reference-counted from birth; after this pause's
@@ -8848,8 +9649,20 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             // decrements are applied, any young object still at RC 0 is implicitly
             // dead and its region is reclaimed. Guards on g_traceWindowOpen so it
             // never frees under an in-flight concurrent trace.
+            //
+            // Gated on !skipBuffersForSpan: if we are in a marking window but could
+            // not park the marker this pause (spanMarkerParked==false), we did NOT
+            // process the buffers above (RC is not reconciled) AND the marker is
+            // still reading the heap -- so we must NOT free here. Defer all reclaim
+            // to the next pause / finish.
             if (g_youngRC && g_nurseryActive)
             {
+                // The marker park (if a multi-epoch trace window is open) was
+                // already acquired at the top of this pause (spanMarkerParked) and
+                // covers ALL freeing below -- ProcessModifiedBuffers' cascade above,
+                // the young copy/collect here, and ReclaimMatureByRC after. It is
+                // released once, just before RestartEE. g_markerReclaimSafe (set at
+                // acquire time) opens CollectNursery's in-window gate.
                 // Item D-copy: promote/defragment the young SURVIVORS first, so a
                 // region emptied of survivors is freed here; then CollectNursery
                 // mops up the regions of purely implicitly-dead young.
@@ -8862,9 +9675,10 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 LARGE_INTEGER tnc2; QueryPerformanceCounter(&tnc2);
                 if (verbose)
                 {
-                    fprintf(stderr, "LXRGC: [rc-breakdown] copy=%lldus nursery=%lldus\n",
+                    fprintf(stderr, "LXRGC: [rc-breakdown] copy=%lldus nursery=%lldus%s\n",
                             (long long)((tnc1.QuadPart - tnc0.QuadPart) * 1000000 / freq.QuadPart),
-                            (long long)((tnc2.QuadPart - tnc1.QuadPart) * 1000000 / freq.QuadPart));
+                            (long long)((tnc2.QuadPart - tnc1.QuadPart) * 1000000 / freq.QuadPart),
+                            spanMarkerParked ? " [marker-parked]" : "");
                     fflush(stderr);
                 }
             }
@@ -8886,12 +9700,37 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             }
         }
 
+        // Release the marker park held across this spanned-window reclaim (buffers
+        // + young + mature). Done before RestartEE so the (trace-only) marker
+        // resumes its concurrent closure the instant mutators restart.
+        if (spanMarkerParked)
+        {
+            InterlockedExchange(&g_markerReclaimSafe, 0);
+            InterlockedExchange(&g_rcApplyForceSerial, 0);
+            LXRReleaseMarkerPark(true);
+        }
+
         LXRSetPhase("stw:restart");
         if (suspended)
             LXRRestartEE();
         QueryPerformanceCounter(&t1); // TRUE pause end: mutators run from here
-        // Off-pause: physically decommit the regions the STW sweep deferred.
-        g_lxrCollector.DrainPendingDecommit();
+        // Off-pause: physically decommit the regions this spanned RC pause deferred
+        // -- BUT only when no concurrent trace window is open. Under Option 2
+        // (on-pause RC), CollectNursery/ReclaimMatureByRC reclaim young/mature
+        // regions mid-window (g_markerReclaimSafe). Those regions go to limbo
+        // (committed, unpublished) via ReclaimRegionMemory. If we decommit them here
+        // -- right after RestartEE, while the (trace-only) marker is resuming its
+        // concurrent closure -- the marker can still hold a SATB-retained edge to a
+        // big array whose backing region we just freed (RC dropped it to 0 during
+        // the window), and dereferencing that stale cursor faults on the now
+        // MEM_DECOMMIT'd page (the LXRBigArrayScanFn AV: committed=0/owner=0). Hold
+        // the regions byte-intact in limbo until the trace FINISH pause drains them
+        // with the marker stopped (meFinish/useConcurrent DrainPendingDecommit,
+        // where g_traceWindowOpen==0). Footprint stays bounded by the (short)
+        // window's allocation; limbo is not on the free list so it is never reused
+        // -- the marker's stale reads stay valid until finish.
+        if (!g_traceWindowOpen)
+            g_lxrCollector.DrainPendingDecommit();
         LXRSetPhase("idle");
         pauseMicros = (int64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
     }
@@ -8901,6 +9740,25 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
             (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
         fprintf(stderr, "LXRGC: [pause-tag] type=%s pause=%lldus\n", ptag, (long long)pauseMicros);
+        fflush(stderr);
+    }
+    // Cadence trajectory (LXR_CADENCE): one compact line per pause with the state
+    // that drives the footprint runaway analysis - pause type, committed MB, epochs
+    // since the last trace, whether a trace window is open, and the running count of
+    // RC pauses that SKIPPED young reclamation because a window was open. A rising
+    // committed with a high skip count and window=1 most pauses confirms the runaway
+    // is suppressed young reclamation (traces held ~continuously open).
+    static int s_cadence = -1;
+    if (s_cadence < 0) s_cadence = (getenv("LXR_CADENCE") != nullptr) ? 1 : 0;
+    if (s_cadence) {
+        const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
+            (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
+        fprintf(stderr, "LXRGC: [cadence] type=%-10s committedMB=%lld epSinceTrace=%lld win=%d st=%d snap=%d mq=%d nurserySkipped=%lld traces=%lld winReclaims=%lld parks=%lld pause=%lldus\n",
+                ptag, (long long)(g_committedInUse / (1024*1024)), (long long)g_epochsSinceTrace,
+                (int)g_traceWindowOpen, (int)g_traceState, (int)g_snapshotConsumed, (int)g_markerQuiescent,
+                (long long)g_lxrCounters.NurserySkipped,
+                (long long)g_lxrCounters.TracePauses, (long long)g_windowReclaims,
+                (long long)g_markerParkCount, (long long)pauseMicros);
         fflush(stderr);
     }
     // Exact per-pause distribution log (paper-grade latency data): when LXR_PAUSE_LOG
@@ -9043,6 +9901,11 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         {
             DCopyRemsetClearAll();
             InterlockedExchange(&g_dcopyRemsetOverflow, 0);
+            // Paper §3.3: trace-initialize the freshly cleared remset from the
+            // mark's complete live-edge scan, so stable mature->young references
+            // (whose one-per-epoch barrier log was wiped by this clear) are
+            // re-established for the upcoming window's CopyYoungSurvivors.
+            SeedDcopyRemsetFromMarkEdges();
         }
         // A complete trace has re-established liveness mark-authoritatively and
         // aged the just-ended window's young to mature, so any RC increment lost to
@@ -9244,6 +10107,7 @@ static LONG CALLBACK LXRAvVectoredHandler(EXCEPTION_POINTERS* ep)
             rw == 1 ? "WRITE" : (rw == 8 ? "EXEC" : "READ"), (void*)faultAddr,
             (void*)base, (void*)(base + bytes),
             inHeap ? "IN-HEAP" : "outside", (void*)ep->ContextRecord->Rip, GetCurrentThreadId());
+    fprintf(stderr, "LXRGC: [AV] phase=%s freeSite=%d\n", g_lxrPhase, (int)g_freeSite);
 
     // Classify the containing chunk state at the moment of the fault.
     __try
