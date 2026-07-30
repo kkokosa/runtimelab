@@ -1220,6 +1220,9 @@ struct ChunkRegion
                                   // sub-run carved from a retained region, available to
                                   // hand back to an allocator context. Parseable as
                                   // [Start,UsedEnd); never decommitted while listed.
+    bool              FreeRunDecommitted; // LXR_FREERUN_CAP: this FreeRun's page-aligned
+                                  // interior has been MEM_DECOMMIT'd to shrink the idle
+                                  // reuse pool; ReuseFreeRun re-commits it before use.
     uint8_t           DeadPctEstimate; // Item F: last Evacuate's occupancy scan result
                                   // (dead bytes / total, 0-100); predicts evac candidacy
                                   // at the next trace's snapshot (0 => not a candidate).
@@ -1336,6 +1339,13 @@ static int     g_lineReuse = -1; // env LXR_LINE_REUSE (-1 = not yet resolved)
 static size_t  g_lineReuseMinBytes = 0; // env LXR_LINE_MIN (min carve/reuse size)
 static volatile int64_t g_carveRunsTotal = 0;  // FreeRun segments carved (observability)
 static volatile int64_t g_carveBytesTotal = 0; // bytes carved into FreeRun segments
+// LXR_FREERUN_CAP_MB: bound the committed idle line-reuse pool. Carved free-runs are
+// already-committed dead space re-labelled for reuse; left uncapped they ratchet the
+// storm footprint (measured ~370 MB pooled, never decommitted). At each trace finish
+// (STW) DecommitIdleFreeRuns MEM_DECOMMITs the page-aligned interior of idle free-runs
+// beyond this cap; ReuseFreeRun re-commits on pop. 0 disables (uncapped). Default 64.
+static int64_t g_freeRunCapBytes = -1;
+static volatile int64_t g_freeRunDecommittedBytes = 0; // observability: pool bytes decommitted
 
 // The runtime's free-object MethodTable (component size 1). Writing it over a
 // byte range with NumComponents == size-baseSize makes that range parse as a
@@ -1433,6 +1443,7 @@ static int RegisterChunk(uint8_t* start, size_t size, gc_alloc_context* owner)
     g_chunks[idx].Owner = owner;
     g_chunks[idx].Committed = true;
     g_chunks[idx].FreeRun = false;
+    g_chunks[idx].FreeRunDecommitted = false;
     LeaveCriticalSection(&g_chunkLock);
     g_lxrCollector.StampBornEpoch(start, size); // #6: mark blocks as this window's nursery
     return idx;
@@ -1514,6 +1525,21 @@ static uint8_t* ReuseFreeRun(gc_alloc_context* owner, size_t needBytes, size_t h
             continue;
         // Take it: remove from the free-run stack (swap with top).
         g_freeRuns[k] = g_freeRuns[--g_freeRunTop];
+        if (c.FreeRunDecommitted)
+        {
+            // LXR_FREERUN_CAP: this run's page-aligned interior was decommitted to
+            // shrink the idle pool; re-commit it before handing back committed memory.
+            uintptr_t ps = 4096;
+            uint8_t* ib = (uint8_t*)(((uintptr_t)c.Start + ps - 1) & ~(ps - 1));
+            uint8_t* ie = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~(ps - 1));
+            if (ie > ib)
+            {
+                VirtualAlloc(ib, (size_t)(ie - ib), MEM_COMMIT, PAGE_READWRITE);
+                InterlockedExchangeAdd64(&g_committedInUse, (int64_t)(ie - ib));
+                InterlockedExchangeAdd64(&g_freeRunDecommittedBytes, -(int64_t)(ie - ib));
+            }
+            c.FreeRunDecommitted = false;
+        }
         memset(c.Start, 0, c.Size); // hand back zeroed memory like a fresh commit
         // Reserve headerPad before the first object (its sync-block/-8 header),
         // exactly like a fresh chunk (RegisterChunk registers the object start,
@@ -1552,6 +1578,7 @@ static int AppendRegionLocked(uint8_t* start, uint8_t* usedEnd, size_t size, boo
     g_chunks[idx].Committed = true;
     g_chunks[idx].FreeRun = freeRun;
     g_chunks[idx].DeadPctEstimate = 0;
+    g_chunks[idx].FreeRunDecommitted = false;
     return idx;
 }
 
@@ -1566,6 +1593,58 @@ static void PushFreeRunLocked(size_t idx)
         g_freeRuns = grown; g_freeRunCap = nc;
     }
     g_freeRuns[g_freeRunTop++] = idx;
+}
+
+// LXR_FREERUN_CAP: MEM_DECOMMIT the page-aligned interior of idle carved free-runs so
+// the committed reuse pool does not exceed capBytes. Called at each trace finish under
+// STW (mutators suspended) with g_chunkLock held. Only whole pages fully inside a run
+// are decommitted (a run's [Start,Start+Size) is object- not page-aligned; its boundary
+// pages may be shared with the adjacent live prefix/suffix), so live data is never
+// touched. The run stays on the reuse stack; ReuseFreeRun re-commits before use. Every
+// carved run is dead space (CarveFreeRuns carves only no-mark ranges), so nothing traces
+// or writes it while pooled. Returns bytes decommitted this call.
+static int64_t DecommitIdleFreeRuns(int64_t capBytes)
+{
+    if (capBytes <= 0 || g_freeRunTop == 0) return 0;
+    const uintptr_t ps = 4096;
+    // Sum currently-committed pooled bytes (exclude already-decommitted interior).
+    int64_t committedPool = 0;
+    for (size_t k = 0; k < g_freeRunTop; k++)
+    {
+        size_t idx = g_freeRuns[k];
+        if (idx >= g_chunkCount) continue;
+        ChunkRegion& c = g_chunks[idx];
+        if (!c.FreeRun || !c.Committed) continue;
+        committedPool += (int64_t)c.Size;
+        if (c.FreeRunDecommitted)
+        {
+            uint8_t* ib = (uint8_t*)(((uintptr_t)c.Start + ps - 1) & ~(ps - 1));
+            uint8_t* ie = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~(ps - 1));
+            if (ie > ib) committedPool -= (int64_t)(ie - ib); // interior already returned
+        }
+    }
+    int64_t decommitted = 0;
+    for (size_t k = 0; k < g_freeRunTop && committedPool - decommitted > capBytes; k++)
+    {
+        size_t idx = g_freeRuns[k];
+        if (idx >= g_chunkCount) continue;
+        ChunkRegion& c = g_chunks[idx];
+        if (!c.FreeRun || !c.Committed || c.FreeRunDecommitted) continue;
+        uint8_t* ib = (uint8_t*)(((uintptr_t)c.Start + ps - 1) & ~(ps - 1));
+        uint8_t* ie = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~(ps - 1));
+        if (ie <= ib) continue; // < 1 whole interior page: nothing to reclaim
+        VirtualFree(ib, (size_t)(ie - ib), MEM_DECOMMIT);
+        c.FreeRunDecommitted = true;
+        // Make the region parse as empty so any linear [Start,UsedEnd) heap walker
+        // skips it (the interior pages are gone). Size is untouched, so ReuseFreeRun
+        // still re-commits + hands back the full run and resets UsedEnd on pop.
+        c.UsedEnd = c.Start;
+        int64_t got = (int64_t)(ie - ib);
+        decommitted += got;
+        InterlockedExchangeAdd64(&g_committedInUse, -got);
+        InterlockedExchangeAdd64(&g_freeRunDecommittedBytes, got);
+    }
+    return decommitted;
 }
 
 static void CommitPageFor(uint8_t* addr)
@@ -2828,6 +2907,7 @@ void LXRCollector::CarveFreeRuns(size_t i)
             g_chunks[i].Start = fa; g_chunks[i].UsedEnd = fb;
             g_chunks[i].Size = (size_t)(fb - fa); g_chunks[i].Owner = nullptr;
             g_chunks[i].Committed = true; g_chunks[i].FreeRun = true;
+            g_chunks[i].FreeRunDecommitted = false;
             firstWritten = true;
             fidx = (int)i;
         }
@@ -2975,6 +3055,7 @@ int64_t LXRCollector::CarveDeadRunsByRC(size_t i, const std::vector<uint8_t*>& r
             g_chunks[i].Start = fa; g_chunks[i].UsedEnd = fb;
             g_chunks[i].Size = (size_t)(fb - fa); g_chunks[i].Owner = nullptr;
             g_chunks[i].Committed = true; g_chunks[i].FreeRun = true;
+            g_chunks[i].FreeRunDecommitted = false;
             firstWritten = true;
             fidx = (int)i;
         }
@@ -3105,6 +3186,7 @@ void LXRCollector::VerifyTraceComplete()
     {
         ChunkRegion& c = g_chunks[i];
         if (!c.Committed) continue;
+        if (c.FreeRun) continue; // carved dead space (may be interior-decommitted); never live
         uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
         uint8_t* p = c.Start;
         while (p < end)
@@ -8560,6 +8642,11 @@ HRESULT LXRGCHeap::Initialize()
         g_matureOnlySatb = (e != nullptr) ? (atoi(e) != 0) : 0; // default OFF (see decl: counterproductive until young reclaim is unsuppressed in-window)
     }
     {
+        const char* e = getenv("LXR_FREERUN_CAP_MB");
+        g_freeRunCapBytes = (e != nullptr) ? (_atoi64(e) * (int64_t)(1024 * 1024))
+                                           : (int64_t)64 * 1024 * 1024; // default 64 MiB pool
+    }
+    {
         const char* e = getenv("LXR_ONPAUSE_RC");
         g_onPauseRC = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON (paper-faithful)
     }
@@ -8704,6 +8791,11 @@ static void LXRDumpRegionComposition(const char* tag)
     if (g_chunks == nullptr) return;
     int64_t yMarked=0, yRC=0, yDead=0, mMarked=0, mRC=0, mDead=0, freeRun=0, owned=0;
     int64_t nY=0, nM=0;
+    // Occupancy slack in mature marked regions (via DeadPctEstimate stamped by the
+    // last evac/sweep occupancy scan): mMarkedDeadEst = estimated reclaimable bytes
+    // inside marked mature regions. High => sparse => compaction/evac can reclaim;
+    // low => dense => the bytes are genuinely live and footprint is near-optimal.
+    int64_t mMarkedDeadEst=0, mMarkedScanned=0;
     for (size_t i = 0; i < g_chunkCount; i++)
     {
         ChunkRegion& c = g_chunks[i];
@@ -8726,16 +8818,19 @@ static void LXRDumpRegionComposition(const char* tag)
         else
         {
             nM++;
-            if (marked)      mMarked += sz;
+            if (marked)      { mMarked += sz; mMarkedScanned += sz;
+                               mMarkedDeadEst += (sz * (int64_t)c.DeadPctEstimate) / 100; }
             else if (anyRC)  mRC += sz;
             else             mDead += sz;
         }
     }
     fprintf(stderr, "LXRGC: [region-comp] tag=%s young[marked=%lld rc=%lld dead=%lld n=%lld] "
-                    "mature[marked=%lld rc=%lld dead=%lld n=%lld] freeRunMB=%lld ownedMB=%lld (MB)\n",
+                    "mature[marked=%lld rc=%lld dead=%lld n=%lld] freeRunMB=%lld ownedMB=%lld "
+                    "matMarkedDeadEstMB=%lld (of %lldMB scanned) (MB)\n",
             tag, (long long)(yMarked>>20), (long long)(yRC>>20), (long long)(yDead>>20), (long long)nY,
             (long long)(mMarked>>20), (long long)(mRC>>20), (long long)(mDead>>20), (long long)nM,
-            (long long)(freeRun>>20), (long long)(owned>>20));
+            (long long)(freeRun>>20), (long long)(owned>>20),
+            (long long)(mMarkedDeadEst>>20), (long long)(mMarkedScanned>>20));
     fflush(stderr);
 }
 
@@ -9912,6 +10007,22 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         }
 
         LXRSetPhase("stw:restart");
+        // LXR_FREERUN_CAP: bound the committed idle line-reuse pool. Under STW here
+        // (mutators suspended) with g_chunkLock held, decommit the page-aligned
+        // interior of pooled free-runs beyond the cap. Free-runs are dead carved
+        // space (never traced/written while pooled), so this is safe against a
+        // parked-or-running trace-only marker; ReuseFreeRun re-commits on pop. Skip
+        // while a trace window is open EXCEPT at the finish (meFinish closes it):
+        // conservatively mirror ReuseFreeRun's in-window suppression.
+        if (suspended && g_freeRunCapBytes > 0 && (!g_traceWindowOpen || meFinish))
+        {
+            EnterCriticalSection(&g_chunkLock);
+            int64_t dec = DecommitIdleFreeRuns(g_freeRunCapBytes);
+            LeaveCriticalSection(&g_chunkLock);
+            if (dec > 0 && getenv("LXR_VERIFY_TRACE") != nullptr)
+                fprintf(stderr, "LXRGC: [freerun-cap] decommitted %lld MiB (pool decommitted total %lld MiB)\n",
+                        (long long)(dec >> 20), (long long)(g_freeRunDecommittedBytes >> 20));
+        }
         // Region-composition diagnostic (LXR_REGION_COMP) BEFORE RestartEE, while
         // mutators are suspended (STW) so the region parse + alloc_ptr reads are
         // stable. The concurrent marker only reads the heap, never mutates region

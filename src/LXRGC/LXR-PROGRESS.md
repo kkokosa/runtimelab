@@ -184,6 +184,24 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-31d** — **Free-run pool cap (`LXR_FREERUN_CAP_MB`, default 64 MiB) +
+  occupancy augmentation of the region-composition diagnostic.** The occupancy scan
+  (`matMarkedDeadEstMB` via `DeadPctEstimate`) showed the ~450 MB mature marked set is
+  **~89 % dense** (only ~50 MB reclaimable slack) → evacuation/compaction is NOT the
+  footprint win (dense regions = genuinely resident ≈ Server's live set). The real
+  swing excess is the **carved line-reuse free-run pool**, which ballooned to ~370 MB
+  and was never decommitted. Fix: `DecommitIdleFreeRuns` MEM_DECOMMITs the page-aligned
+  interior of idle pooled free-runs beyond the cap at each STW pause (outside a trace
+  window, or at finish); `ReuseFreeRun` re-commits on pop; `g_committedInUse` tracks
+  both so `committedMB` reflects the reclaim. Sound (free-runs are dead carved space,
+  never traced/written while pooled): the decommitted region is set to an empty parse
+  extent (`UsedEnd=Start`) and `VerifyTraceComplete` now skips `FreeRun` regions, so no
+  linear heap walker touches the returned pages. **Verified: 11/11 storm runs clean, 0
+  `LXR_VERIFY_TRACE` errors, 203 MiB reclaimed in a single event.** Committed A/B (cap
+  0 vs 64): median unchanged (~590 MB — already near Server ~500 MB), p90/max peaks
+  trimmed and less spiky (p90 1070→796, max 1198→880 in the worst baseline run). NOTE
+  the residual ~1 GB transient peaks are trace-window allocate-black accumulation
+  (young + mature retained until finish), a separate ratchet — NOT the free-run pool.
 - **2026-07-31c** — **Region-composition diagnostic (`LXR_REGION_COMP`) + DIRECT
   measurement of the storm footprint driver.** Added `LXRDumpRegionComposition`, an
   env-gated STW-safe (called before `RestartEE`) classifier that splits committed
