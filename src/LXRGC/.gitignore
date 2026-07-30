@@ -28,3 +28,7 @@ results/phase-report.html
 # TraceAnalyzer offline tool build output (source under tools/ is tracked)
 tools/**/bin/
 tools/**/obj/
+
+# Local copy of the LXR paper (arXiv:2210.17175) for offline reference - do not commit
+paper/
+
