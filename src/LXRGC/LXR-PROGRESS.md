@@ -184,6 +184,23 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-31c** — **Region-composition diagnostic (`LXR_REGION_COMP`) + DIRECT
+  measurement of the storm footprint driver.** Added `LXRDumpRegionComposition`, an
+  env-gated STW-safe (called before `RestartEE`) classifier that splits committed
+  bytes into young/mature × {marked, rc, dead} + freeRun + owned. Clean measurement of
+  the `-tagb 3` storm at steady state (~1 GB committed) decomposes as: **mature
+  `marked` ~450–680 MB across ~27,000 regions** (dominant), **freeRun ~100–280 MB**
+  (committed carved line-reuse runs never decommitted), young marked ~80–145 MB, and
+  **`dead`≈0 everywhere** (the sweep already frees unmarked+RC0). The `rc`≈0 buckets are
+  a **classification artifact** — bucketing is marked-first per region, so right after a
+  trace nearly everything reachable is marked and `rc` reads low; it is NOT evidence
+  mature objects lack RC (`RCIncrement` counts all ages). **Conclusion: the footprint
+  driver is a mature-retention ratchet** — genuinely-live + SATB floating garbage
+  fragmented across ~27,000 regions (region-count exploded by line-reuse carve-splitting),
+  reclaimed too slowly by the evacuation/trace cadence — NOT young-reclaim suppression
+  (the prior hypothesis). This redirects the fix toward **mature evacuation throughput /
+  compaction + free-run decommit**, away from young suppression. Diagnostic committed as
+  a tool (inert unless `LXR_REGION_COMP=1`).
 - **2026-07-31b** — **Mature-Only SATB / "implicitly dead" optimization
   (`LXR_MATURE_ONLY_SATB`, implemented + verified, DEFAULT OFF) + structural
   root-cause of the storm footprint.** Paper §3.2.2 bounds SATB floating garbage by

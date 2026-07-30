@@ -8689,6 +8689,56 @@ static void LXRDumpCommittedBreakdown(int64_t stallN)
     fflush(stderr);
 }
 
+// Region-composition diagnostic (LXR_REGION_COMP): classify committed region bytes
+// into young/mature x {marked (SATB-retained), RC-live, dead-but-committed} so we
+// can see WHICH component drives the finish-pause committed ratchet. "Dead" = no
+// mark bit AND no RC>0 object => reclaimable memory still held committed (the true
+// footprint waste); "marked" = live-or-SATB-floating-garbage retained by the trace
+// until the next cycle; "rc" = live with no mark. NOTE the bucketing is marked-first
+// per region: a region with ANY mark bit counts wholly as "marked", so right after a
+// trace (nearly everything reachable is marked) the "rc" bucket reads low as an
+// artifact -- it is NOT evidence mature objects lack RC (RCIncrement counts all ages).
+// Called at pauses under STW (mutators suspended), so the parse is stable.
+static void LXRDumpRegionComposition(const char* tag)
+{
+    if (g_chunks == nullptr) return;
+    int64_t yMarked=0, yRC=0, yDead=0, mMarked=0, mRC=0, mDead=0, freeRun=0, owned=0;
+    int64_t nY=0, nM=0;
+    for (size_t i = 0; i < g_chunkCount; i++)
+    {
+        ChunkRegion& c = g_chunks[i];
+        if (!c.Committed) continue;
+        int64_t sz = (int64_t)c.Size;
+        if (c.FreeRun) { freeRun += sz; continue; }
+        if (c.Owner != nullptr) { owned += sz; }
+        uint8_t* end = (c.Owner != nullptr) ? c.Owner->alloc_ptr : c.UsedEnd;
+        if (end <= c.Start) continue;
+        bool marked = g_poolCollector->AnyMarkedInRange(c.Start, end);
+        bool anyRC  = g_poolCollector->AnyRCNonZeroInRange(c.Start, end);
+        bool young  = g_poolCollector->IsYoung((Object*)c.Start);
+        if (young)
+        {
+            nY++;
+            if (marked)      yMarked += sz;
+            else if (anyRC)  yRC += sz;
+            else             yDead += sz;
+        }
+        else
+        {
+            nM++;
+            if (marked)      mMarked += sz;
+            else if (anyRC)  mRC += sz;
+            else             mDead += sz;
+        }
+    }
+    fprintf(stderr, "LXRGC: [region-comp] tag=%s young[marked=%lld rc=%lld dead=%lld n=%lld] "
+                    "mature[marked=%lld rc=%lld dead=%lld n=%lld] freeRunMB=%lld ownedMB=%lld (MB)\n",
+            tag, (long long)(yMarked>>20), (long long)(yRC>>20), (long long)(yDead>>20), (long long)nY,
+            (long long)(mMarked>>20), (long long)(mRC>>20), (long long)(mDead>>20), (long long)nM,
+            (long long)(freeRun>>20), (long long)(owned>>20));
+    fflush(stderr);
+}
+
 Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_t flags)
 {
     // Provision this thread's write-barrier buffers here (safe frame), so the
@@ -9862,6 +9912,21 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         }
 
         LXRSetPhase("stw:restart");
+        // Region-composition diagnostic (LXR_REGION_COMP) BEFORE RestartEE, while
+        // mutators are suspended (STW) so the region parse + alloc_ptr reads are
+        // stable. The concurrent marker only reads the heap, never mutates region
+        // metadata, so it is safe against a parked-or-running marker.
+        if (suspended)
+        {
+            static int s_regionComp = -1;
+            if (s_regionComp < 0) s_regionComp = (getenv("LXR_REGION_COMP") != nullptr) ? 1 : 0;
+            if (s_regionComp)
+            {
+                const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
+                    (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
+                LXRDumpRegionComposition(ptag);
+            }
+        }
         if (suspended)
             LXRRestartEE();
         QueryPerformanceCounter(&t1); // TRUE pause end: mutators run from here
