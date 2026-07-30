@@ -184,6 +184,32 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-31e** — **Trace-cadence sweet-spot finding (negative result) + transient-peak
+  driver identified.** Correlating cadence `committedMB` with pause type showed committed
+  peaks at SNAPSHOT pauses (~860 MB, `win=1`, spanning 2–4 epochs) and is released at
+  finish — i.e. ~270 MB accumulates per trace WINDOW and only drops at the finish. Unlike
+  the older suppression hypothesis, in-window young reclaim now ENGAGES here
+  (`nurserySkipped=0`, `parks=2`, `winReclaims=2` — the marker-park machinery from
+  checkpoints 084–089 works), so the peak is NOT young suppression: it is **allocate-black
+  retention** (window-born young that die mid-window are allocate-blacked=marked, so
+  `CollectNursery` — which skips marked — cannot reclaim them until finish). Tested three
+  levers: (1) **Mature-Only SATB re-test** (now that in-window reclaim works): only a
+  marginal median win (~583 vs ~600 MB), no clear peak win (noisy, one run worse) — stays
+  DEFAULT OFF. (2) **More-frequent tracing** (`BUDGET_MB=48 EVERY=4`): clearly WORSE
+  (median ~600, max 1207–1375) — more windows → more allocate-black retention. (3)
+  **Less-frequent tracing** (`BUDGET_MB=256 EVERY=16`): also WORSE (median 656–736, max
+  1007–1265) — more floating garbage + young accrues between traces. **Conclusion: the
+  default cadence (128 MB growth / 8 epochs, survival-scaled) is a genuine sweet spot;
+  both directions backfire.** The transient peak is fundamentally **allocate-black
+  floating garbage inherent to CONCURRENT (windowed) tracing**: window-born young are
+  marked-at-birth (above `g_concWatermark`), so `CollectNursery` skips them and the
+  mark-authoritative sweep retains them as live until the NEXT cycle (see the backpressure
+  comment ~L963–986). A synchronous STW trace has no window and reclaims to true-live
+  (≈ Server ~500 MB), but sacrifices LXR's low-pause property — this is the paper's core
+  latency↔footprint tradeoff. Mature-Only SATB only marginally dents it because most
+  window-born objects are RC-referenced (survive the window anyway). Footprint median
+  ~590 MB is the correct operating point for a low-latency concurrent collector; matching
+  Server's ~500 MB would require STW traces (defeating the purpose). Not pursued further.
 - **2026-07-31d** — **Free-run pool cap (`LXR_FREERUN_CAP_MB`, default 64 MiB) +
   occupancy augmentation of the region-composition diagnostic.** The occupancy scan
   (`matMarkedDeadEstMB` via `DeadPctEstimate`) showed the ~450 MB mature marked set is
