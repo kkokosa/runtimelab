@@ -1244,6 +1244,24 @@ static CRITICAL_SECTION g_chunkLock;
 // entry is decommitted. Serialized by the single-driver collection loop, so the
 // drain always completes before the next sweep.
 static int g_deferDecommit = 1;
+// In-window physical reclaim of young regions (LXR_INWINDOW_DECOMMIT, default ON).
+// While a multi-epoch trace window is open, CollectNursery reclaims ONLY young
+// regions that lie entirely above the snapshot high-water AND carry no mark bit,
+// no root, and no RC>=1 object (see CollectNursery's gate) -- a victim set the
+// concurrent marker provably cannot hold any edge into (post-snapshot => not in
+// the snapshot graph; a marked/current-edge referent would give RC>=1). Those
+// regions are therefore safe to decommit + publish to the free list DURING the
+// pause, while the marker is PARKED (not reading the heap) and mutators are
+// suspended, instead of stranding them byte-intact in "limbo" (committed, off the
+// free list, unreusable) until the trace FINISH pause. Draining in-window bounds
+// window footprint to the live set + one window's allocation and lets the
+// allocator REUSE freed young regions mid-window (fixing the storm balloon where
+// committed grew with cumulative window allocation because reclaimed regions sat
+// idle). Only ever runs at the exclusive marker-parked point; mature reclaim
+// (ReclaimMatureByRC, which may free big-array regions the marker holds SATB
+// edges to) fully defers in-window, so nothing but young post-snapshot regions
+// is ever in g_pendingDecommit here.
+static int g_inWindowDecommit = 1;
 // Paper-faithful on-pause reference counting (LXR_ONPAUSE_RC, default ON). LXR
 // processes RC increments/decrements + reclaims dead young AT EACH PAUSE (bounded
 // by pause frequency); the concurrent thread does cyclic TRACING only. Our older
@@ -8487,6 +8505,10 @@ HRESULT LXRGCHeap::Initialize()
         g_deferDecommit = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON
     }
     {
+        const char* e = getenv("LXR_INWINDOW_DECOMMIT");
+        g_inWindowDecommit = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON
+    }
+    {
         const char* e = getenv("LXR_ONPAUSE_RC");
         g_onPauseRC = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON (paper-faithful)
     }
@@ -9760,6 +9782,23 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 fflush(stderr);
             }
         }
+
+        // In-window physical reclaim (LXR_INWINDOW_DECOMMIT): the regions
+        // CollectNursery reclaimed this pause are provably marker-invisible
+        // (strictly post-snapshot, unmarked, unrooted, all-RC-0 -- see
+        // CollectNursery's gate) and ReclaimMatureByRC fully defers while the window
+        // is open, so g_pendingDecommit here holds ONLY those young victims. With
+        // the marker STILL PARKED (not reading the heap) and mutators suspended,
+        // decommit them and publish them to the free list NOW rather than stranding
+        // them in limbo until the trace finish. This bounds window footprint to the
+        // live set + one window's allocation and lets the allocator reuse freed
+        // young regions mid-window (the storm balloon fix). Guarded on
+        // spanMarkerParked: only at the exclusive marker-quiescent point is it safe
+        // to physically free pages mid-window; if we could not park the marker this
+        // pause, the deferred post-RestartEE drain (gated on !g_traceWindowOpen)
+        // still handles it at finish.
+        if (spanMarkerParked && g_inWindowDecommit && g_traceWindowOpen)
+            g_lxrCollector.DrainPendingDecommit();
 
         // Release the marker park held across this spanned-window reclaim (buffers
         // + young + mature). Done before RestartEE so the (trace-only) marker

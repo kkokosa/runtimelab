@@ -184,6 +184,32 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-31** — **In-window physical reclaim of young regions
+  (`LXR_INWINDOW_DECOMMIT`, default ON) + storm-footprint root-cause pivot.**
+  Paper-faithful refinement of the multi-epoch marker-park path: while a trace
+  window is open, `CollectNursery` reclaims ONLY young regions that lie entirely
+  above the snapshot high-water AND carry no mark bit, no root, and no RC≥1 object
+  — a victim set the concurrent marker provably cannot hold any edge into
+  (post-snapshot ⇒ not in the snapshot graph; a marked/current-edge referent would
+  give RC≥1). Previously those regions were stranded byte-intact in **limbo**
+  (committed, off the free list, unreusable) until the trace FINISH pause drained
+  them, so committed grew with cumulative window allocation. Since
+  `ReclaimMatureByRC` fully defers in-window (only young post-snapshot regions are
+  ever in `g_pendingDecommit` mid-window), and the marker is PARKED (not reading
+  the heap) with mutators suspended at the spanned RC pause, those regions are now
+  decommitted + published to the free list DURING the pause via a marker-parked
+  `DrainPendingDecommit`. Verified 6/6 storm runs clean with the change ON vs OFF
+  (no AV / no verify error either way).
+  **However — root-cause pivot:** in the `-tagb 3` GCPerfSim storm the concurrent
+  trace completes within a single pause gap (snapshot → the very next pause is
+  finish, `epSinceTrace≈0`), so there is NEVER a spanned in-window RC pause: the
+  marker never parks (`parks=0`, `winReclaims=0`) and this change is **inert here**
+  (it engages only when a trace genuinely spans multiple RC pauses, e.g. WebApi).
+  The storm footprint balloon is a **mature-retention / trace-cadence ratchet, not
+  a limbo problem**: the FINISH-pause committed climbs monotonically
+  59→62→90→178→518→640→689→758→812→864→971→1053 MB — each trace reclaims less than
+  a window's allocation, so (allocate-black + SATB new-value) floating garbage
+  accumulates faster than it is freed. Addressing that is the next target.
 - **2026-07-30** — **Adaptive evacuation budget to bound storm footprint, plus a
   full characterization of the footprint/latency Pareto.** Follow-up to the D-copy
   disable (whose paper-faithful cost was ~1.47 GB WS / ~1.20 GB committed on the
