@@ -533,10 +533,15 @@ foreach ($scenarioId in $Scenarios) {
         switch ($scenario.Kind) {
             "console" {
                 $publishDir = Join-Path $root "samples\ConsoleApp\publish"
+                $env2 = @{} + $gcMode.Env
+                # LXRGC self-reports each STW pause to this file (harmless for the
+                # built-in GCs, which use the in-process EventListener instead).
+                $env2["LXR_PAUSE_LOG"] = $lxrPauseLog
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "ConsoleApp.exe") -WorkingDirectory $publishDir `
-                    -Arguments "$DurationSeconds $label" -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase
+                    -Arguments "$DurationSeconds $label" -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase
                 $resultJson = Get-ResultLineJson $run.StdOut
                 if (-not $resultJson) { Write-Host $run.StdOut; Write-Host $run.StdErr; throw "No ##RESULT## for $label" }
+                $pauseSamplesMs = @($resultJson.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $summary = [ordered]@{
                     OperationsTotal      = $resultJson.Operations
                     OpsPerSecondOverall  = $resultJson.OpsPerSecond
