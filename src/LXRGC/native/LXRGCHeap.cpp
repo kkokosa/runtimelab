@@ -1262,6 +1262,40 @@ static int g_deferDecommit = 1;
 // edges to) fully defers in-window, so nothing but young post-snapshot regions
 // is ever in g_pendingDecommit here.
 static int g_inWindowDecommit = 1;
+// Paper-faithful Mature-Only SATB / "implicitly dead" optimization
+// (LXR_MATURE_ONLY_SATB, default ON; arXiv:2210.17175 §3.2.2, "LXR implements this
+// optimization by ignoring objects with a zero reference count when it performs
+// the SATB trace ... eliminates its prior conservative treatment of objects
+// allocated during the SATB trace"). Classic Yuasa SATB conservatively keeps ALL
+// objects allocated during the trace live (allocate-black), which in a high-alloc
+// storm retains a whole window's allocation as FLOATING GARBAGE and drives a
+// positive-feedback footprint ratchet (more retention -> longer next trace ->
+// longer window -> even more allocate-black). LXR instead leaves window-born
+// objects to REFERENCE COUNTING: a reachable window-born object has RC>=1 (the
+// coalescing barrier increments the new referent of every store), so it survives
+// by RC and is still allocate-black-scanned here; a window-born object still at
+// RC 0 is IMPLICITLY DEAD (unreferenced from the heap) and is reclaimed by the
+// next RC pause's CollectNursery instead of being retained by the trace. Skipping
+// RC 0 window-born objects in allocate-black is sound because (a) they are not in
+// the snapshot graph (born after the snapshot) so the trace never holds a
+// reference to them, and (b) any that are reachable ONLY from a mutator root are
+// still caught by the unconditional FINAL ROOT RESCAN that runs immediately after
+// allocate-black. This directly removes the floating-garbage source of the storm
+// footprint ratchet.
+//
+// DEFAULT OFF (counterproductive in our CURRENT structure -- empirically committed
+// ON 1075MB vs OFF 955MB on the -tagb3 storm, 0/8 LXR_VERIFY_TRACE errors either
+// way). Root cause: our concurrent trace WINDOWS SUPPRESS young RC reclaim
+// (CollectNursery bails unless the marker is parked, and the marker only parks at a
+// spanned in-window RC pause, which never occurs in a brief-window storm where
+// snapshot->finish are back-to-back, parks=0). Removing allocate-black floating
+// garbage lowers measured survival -> raises the wastage EWMA -> fires SATB traces
+// MORE often (DecidePhase) -> opens MORE young-suppressing windows -> net footprint
+// RISES. The paper does not hit this because its RC pauses reclaim young FREQUENTLY
+// and INDEPENDENTLY of trace windows. So this optimization becomes a net win only
+// once young reclamation is no longer suppressed during trace windows (the real
+// structural fix). Keep it gated + verified so it can be flipped on with that fix.
+static int g_matureOnlySatb = 0;
 // Paper-faithful on-pause reference counting (LXR_ONPAUSE_RC, default ON). LXR
 // processes RC increments/decrements + reclaims dead young AT EACH PAUSE (bounded
 // by pause frequency); the concurrent thread does cyclic TRACING only. Our older
@@ -4977,6 +5011,19 @@ static void LXRPromoteRootFinal(PTR_PTR_Object ppObj, ScanContext* /*sc*/, uint3
 // STW finish, pool idle, marker parked -> plain IsMarked reads are race-free (each
 // object lives in exactly one chunk owned by one lane).
 struct AllocBlackCtx { std::vector<Object*>* laneOut; bool floorStart; };
+// Mature-Only SATB / "implicitly dead" optimization (paper §3.2.2): a window-born
+// object still at RC 0 is unreferenced from the heap and therefore implicitly dead
+// -- it must NOT be retained by allocate-black; the next RC pause's CollectNursery
+// reclaims it. An uncommitted RC-table page means the object was never incremented,
+// which is definitionally RC 0. Root-only-reachable RC 0 objects are still caught
+// by the unconditional final root rescan that runs immediately after allocate-black.
+static inline bool LXRImplicitlyDeadYoung(Object* o)
+{
+    if (!g_matureOnlySatb) return false;
+    uint8_t* slot = g_poolCollector->RCSlot(o);
+    if (!g_poolCollector->RCPageCommitted(slot)) return true; // never incremented => RC 0
+    return *slot == 0;
+}
 static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
 {
     AllocBlackCtx* ctx = (AllocBlackCtx*)ctxp;
@@ -5004,7 +5051,7 @@ static void AllocBlackScanFn(int lane, int lanes, void* ctxp)
             size_t sz = LXRObjectSize(o);
             if (sz == 0)
                 break;
-            if (p >= floor && !g_poolCollector->IsMarked(o))
+            if (p >= floor && !g_poolCollector->IsMarked(o) && !LXRImplicitlyDeadYoung(o))
                 out.push_back(o);
             p += sz;
         }
@@ -5129,7 +5176,7 @@ void LXRCollector::ConcurrentTraceFinish()
                 // marked. (With per-thread alloc contexts a black object can even
                 // sit below the global high-water, so parentNew classification is
                 // not a reliable proxy for "already scanned".)
-                if (!IsMarked(o))
+                if (!IsMarked(o) && !LXRImplicitlyDeadYoung(o))
                 {
                     PushMark(o);
                     InterlockedIncrement64(&g_lxrCounters.ConcAllocBlack);
@@ -8507,6 +8554,10 @@ HRESULT LXRGCHeap::Initialize()
     {
         const char* e = getenv("LXR_INWINDOW_DECOMMIT");
         g_inWindowDecommit = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON
+    }
+    {
+        const char* e = getenv("LXR_MATURE_ONLY_SATB");
+        g_matureOnlySatb = (e != nullptr) ? (atoi(e) != 0) : 0; // default OFF (see decl: counterproductive until young reclaim is unsuppressed in-window)
     }
     {
         const char* e = getenv("LXR_ONPAUSE_RC");

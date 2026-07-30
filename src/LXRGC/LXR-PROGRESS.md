@@ -184,6 +184,31 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-31b** — **Mature-Only SATB / "implicitly dead" optimization
+  (`LXR_MATURE_ONLY_SATB`, implemented + verified, DEFAULT OFF) + structural
+  root-cause of the storm footprint.** Paper §3.2.2 bounds SATB floating garbage by
+  *"ignoring objects with a zero reference count when it performs the SATB trace…
+  eliminat[ing] its prior conservative treatment of objects allocated during the
+  SATB trace."* Implemented faithfully: `AllocBlackScanFn` / the serial allocate-black
+  loop now skip window-born objects still at RC 0 (implicitly dead — reclaimed by
+  the next RC pause's `CollectNursery`), retaining only RC≥1 window-born objects;
+  root-only-reachable RC 0 objects are still caught by the unconditional final root
+  rescan. **Verified sound: 0/8 `LXR_VERIFY_TRACE` errors, 0 AV.** However — flipped
+  to **DEFAULT OFF** because it is **counterproductive in our current structure**
+  (clean committed A/B: ON 1075 MB vs OFF 955 MB on the `-tagb 3` storm). Root cause,
+  now firmly established: our concurrent trace **windows suppress young RC reclaim**
+  (`CollectNursery` bails unless the marker is parked; the marker only parks at a
+  *spanned* in-window RC pause, which never occurs in the brief-window storm where
+  snapshot→finish are back-to-back, `parks=0`). Removing allocate-black floating
+  garbage lowers measured survival → raises the wastage EWMA → fires SATB traces
+  MORE often (`DecidePhase`) → opens MORE young-suppressing windows → net footprint
+  RISES. The paper avoids this because its RC pauses reclaim young frequently and
+  independently of trace windows. **The real structural fix is to make young RC
+  reclaim run during (or unaffected by) open trace windows** — only then does
+  Mature-Only SATB (and reducing trace frequency) pay off. Also confirmed the
+  storm's finish-committed ratchet is mature SATB floating garbage (reclaimed next
+  cycle), inherent to snapshot tracing and bounded by trace cadence, not the young
+  limbo path.
 - **2026-07-31** — **In-window physical reclaim of young regions
   (`LXR_INWINDOW_DECOMMIT`, default ON) + storm-footprint root-cause pivot.**
   Paper-faithful refinement of the multi-epoch marker-park path: while a trace
