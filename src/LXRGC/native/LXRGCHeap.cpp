@@ -329,6 +329,11 @@ static uint8_t* g_evacCandidateBase  = nullptr;  // == heap base
 static size_t   g_evacCandidateSlots = 0;
 static volatile LONG g_evacCandidateScope = 0;   // 1 => candidate-scoped recording active this cycle
 static int      g_evacCandidateEnabled = -1;     // env LXR_EVAC_CANDIDATE_SCOPE (default ON)
+// Adaptive per-trace evacuation copy budget (bytes), recomputed by
+// SelectEvacCandidates each trace from committed-memory pressure and consumed by
+// Evacuate so the copy volume matches the candidate scope. 0 => not set this
+// cycle (Evacuate falls back to its env/default budget). See SelectEvacCandidates.
+static volatile int64_t g_evacAdaptiveBudgetBytes = 0;
 
 static inline bool CandidateScopeEnabled()
 {
@@ -4653,16 +4658,60 @@ static void SelectEvacCandidates()
     // intends. A cap of 0 means "unbounded" (the pre-cap heap-wide behaviour).
     static int64_t s_budgetBytes = -1;
     static int64_t s_maxRegions  = -1;
+    static int     s_budgetEnvSet = -1;
+    static int     s_regionsEnvSet = -1;
     if (s_budgetBytes < 0)
     {
         const char* b = getenv("LXR_EVAC_BUDGET_MB");
+        s_budgetEnvSet = (b != nullptr) ? 1 : 0;
         s_budgetBytes = (b ? _atoi64(b) : 8) * (int64_t)(1024 * 1024);
     }
     if (s_maxRegions < 0)
     {
         const char* r = getenv("LXR_EVAC_MAX_REGIONS");
+        s_regionsEnvSet = (r != nullptr) ? 1 : 0;
         s_maxRegions = r ? _atoi64(r) : 64;
     }
+
+    // Adaptive evacuation budget (paper §"limited judicious copying", scaled by
+    // footprint pressure): the floor caps above (8 MiB / 64 regions) keep pauses
+    // short on well-behaved workloads, but under an allocation storm committed
+    // memory balloons with fragmented partially-dead regions that ONLY evacuation
+    // can reclaim (RC frees fully-dead young; the sweep frees fully-dead regions;
+    // neither touches a region that keeps even one live object). A fixed tiny
+    // budget lets fragmentation outrun defragmentation and footprint ratchets up.
+    // So when committed grows beyond a target working set, raise the per-trace copy
+    // budget proportionally to the excess (reclaiming a fraction of the surplus
+    // each trace) up to a ceiling, and lift the region cap (the byte budget still
+    // binds copy volume). Below the target we keep the small bounded caps, so the
+    // common low-footprint case pays no extra pause. Explicit env overrides win.
+    // Uses immutable-floor statics + per-call locals so it never compounds.
+    int64_t budgetBytes = s_budgetBytes;
+    int64_t maxRegions  = s_maxRegions;
+    if (s_budgetEnvSet == 0)
+    {
+        static int64_t s_targetBytes = -1, s_ceilBytes = -1;
+        if (s_targetBytes < 0)
+        {
+            const char* t = getenv("LXR_EVAC_TARGET_MB");
+            s_targetBytes = (t ? _atoi64(t) : 512) * (int64_t)(1024 * 1024);
+            const char* cM = getenv("LXR_EVAC_BUDGET_MAX_MB");
+            s_ceilBytes = (cM ? _atoi64(cM) : 256) * (int64_t)(1024 * 1024);
+        }
+        int64_t committed = g_committedInUse;
+        if (committed > s_targetBytes)
+        {
+            int64_t excess = committed - s_targetBytes;
+            int64_t adaptive = s_budgetBytes + excess / 4; // reclaim ~25% of surplus/trace
+            if (adaptive > s_ceilBytes) adaptive = s_ceilBytes;
+            budgetBytes = adaptive;
+            if (s_regionsEnvSet == 0)
+                maxRegions = 0; // unbounded region count under pressure; byte budget binds
+        }
+    }
+    // Publish the chosen copy budget so Evacuate copies exactly as much as this
+    // candidate scope admits (keeps scope and copy volume consistent).
+    InterlockedExchange64(&g_evacAdaptiveBudgetBytes, budgetBytes);
     memset(g_evacCandidate, 0, g_evacCandidateSlots);
     size_t nCand = 0;
     EnterCriticalSection(&g_chunkLock);
@@ -4686,10 +4735,10 @@ static void SelectEvacCandidates()
     size_t budgetUsed = 0;
     for (const EvacPick& p : picks)
     {
-        if (s_maxRegions > 0 && (int64_t)nCand >= s_maxRegions)
+        if (maxRegions > 0 && (int64_t)nCand >= maxRegions)
             break;
-        if (s_budgetBytes > 0 && budgetUsed > 0 &&
-            budgetUsed + p.estLive > (size_t)s_budgetBytes)
+        if (budgetBytes > 0 && budgetUsed > 0 &&
+            budgetUsed + p.estLive > (size_t)budgetBytes)
             break; // always admit at least one region even if it alone exceeds budget
         ChunkRegion& c = g_chunks[p.idx];
         SetEvacCandidateRange(c.Start, c.UsedEnd);
@@ -4706,9 +4755,9 @@ static void SelectEvacCandidates()
     if (getenv("LXR_VERBOSE") != nullptr)
     {
         fprintf(stderr, "LXRGC: [evac-cand] selected %zu candidate regions (>=%lld%% dead est,"
-                        " ~%zu KiB est copy; cap %lld regions / %lld MiB)\n",
+                        " ~%zu KiB est copy; cap %lld regions / %lld MiB adaptive)\n",
                 nCand, (long long)s_fragPct, budgetUsed / 1024,
-                (long long)s_maxRegions, (long long)(s_budgetBytes / (1024 * 1024)));
+                (long long)maxRegions, (long long)(budgetBytes / (1024 * 1024)));
         fflush(stderr);
     }
 }
@@ -5944,14 +5993,26 @@ void LXRCollector::Evacuate()
 
     // Policy knobs.
     static int64_t s_fragPct = -1, s_budgetBytes = -1, s_budgetMs = -1;
+    static int     s_budgetEnvSet = -1;
     if (s_fragPct < 0)
     {
         const char* f = getenv("LXR_EVAC_FRAG_PCT");
         s_fragPct = f ? _atoi64(f) : 50;              // evacuate regions >= this % dead
         const char* b = getenv("LXR_EVAC_BUDGET_MB");
+        s_budgetEnvSet = (b != nullptr) ? 1 : 0;
         s_budgetBytes = (b ? _atoi64(b) : 32) * (int64_t)1024 * 1024; // copy at most this per pause
         const char* ms = getenv("LXR_EVAC_BUDGET_MS");
         s_budgetMs = ms ? _atoi64(ms) : 20;           // and stop after this wall-clock ms
+    }
+    // When the budget is not pinned by env, honour the adaptive per-trace budget
+    // that SelectEvacCandidates published at this trace's snapshot pause (scaled to
+    // committed-memory pressure), so the copy volume matches the candidate scope.
+    int64_t budgetBytesThisPass = s_budgetBytes;
+    if (s_budgetEnvSet == 0)
+    {
+        int64_t adaptive = g_evacAdaptiveBudgetBytes;
+        if (adaptive > 0)
+            budgetBytesThisPass = adaptive;
     }
 
     // 1. Pin all root/handle referents (interior roots resolve to their base).
@@ -6085,7 +6146,7 @@ void LXRCollector::Evacuate()
     });
 
     std::vector<EvacRegion> evac;
-    int64_t liveBudget = s_budgetBytes;
+    int64_t liveBudget = budgetBytesThisPass;
     for (const EvacCand& c : cands)
     {
         if (liveBudget <= 0)

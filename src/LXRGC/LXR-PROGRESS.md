@@ -184,6 +184,41 @@ vs Server GC and Workstation GC. Regenerate `results/report.html`.
 ---
 
 ## Changelog
+- **2026-07-30** — **Adaptive evacuation budget to bound storm footprint, plus a
+  full characterization of the footprint/latency Pareto.** Follow-up to the D-copy
+  disable (whose paper-faithful cost was ~1.47 GB WS / ~1.20 GB committed on the
+  `-tagb 3` storm vs Server ~0.5 GB). Confirmed first that `Evacuate` already
+  compacts fragmented YOUNG regions — there is NO young exclusion in candidate
+  selection (`SelectEvacCandidates` / `Evacuate` gate purely on `DeadPctEstimate`,
+  which the sweep stamps for young survivor regions too), so young defrag already
+  rides the STW mark-authoritative trace. The real limiter is evacuation
+  THROUGHPUT: the per-trace copy budget was a fixed 8 MiB / 64 regions ("limited
+  judicious copying"), while committed balloons to tens of thousands of fragmented
+  partially-dead regions that only evacuation can reclaim (RC frees fully-dead
+  young; sweep frees fully-dead regions; neither touches a region with one live
+  object). Fix: `SelectEvacCandidates` now computes an **adaptive per-trace copy
+  budget** scaled to committed-memory pressure — below `LXR_EVAC_TARGET_MB`
+  (default 512) it keeps the small bounded caps (short pauses on well-behaved
+  workloads); above it, budget = floor + 25% of the surplus, capped at
+  `LXR_EVAC_BUDGET_MAX_MB` (default 256), and the region cap is lifted (byte budget
+  binds). `Evacuate` consumes the same published budget (`g_evacAdaptiveBudgetBytes`)
+  so copy volume matches candidate scope. Explicit `LXR_EVAC_BUDGET_MB` /
+  `LXR_EVAC_MAX_REGIONS` overrides still win. **Verified: 6/6 storm runs clean
+  (0 AV), WS 1473→1276 MB (~13%), committed 1198→962 MB (~20%); ConsoleApp smoke
+  135 MB WS / 132 MB committed (< target → adaptive inert, no pause penalty).**
+  Pareto findings (why footprint can't reach Server's ~0.5 GB without more work):
+  (1) raising the budget CEILING alone barely helps (927 vs 962 MB) — per-trace
+  budget is not the sole binding constraint; (2) peak ≈ alloc-rate × inter-trace
+  time (proof: the final trace reclaims committed down to ~424 MB once allocation
+  stops); (3) tracing MORE frequently (`LXR_TRACE_BUDGET_MB=48`) makes footprint
+  WORSE (1622 MB), because every open trace window suppresses `CollectNursery`
+  (the paper's primary per-pause young reclaimer bails on `g_traceWindowOpen`), so
+  more/overlapping windows = more young accumulation. **Next lever (the deeper
+  architectural blocker): make young RC reclamation run DURING the trace window
+  without racing the un-quiesced concurrent marker** — the same marker/reclaim race
+  that made off-pause young reclaim (checkpoints 82–88) unsound. Until that is
+  solved, frequency tuning trades against footprint and the adaptive budget is the
+  bounded, sound win. No runtime change.
 - **2026-07-24c** — **Root-caused & fixed the frequent-trigger storm AV (~50% of
   runs) by making RC-pause young-survivor copy (D-copy) DEFAULT-OFF, faithful to the
   paper (which does not copy at RC pauses).** Under `LXR_GC_GROWTH_PCT=0` GCPerfSim
