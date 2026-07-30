@@ -9216,8 +9216,24 @@ static void EnsureTracePolicy()
         // once this many reference-count increments have been logged since the
         // last pause, bounding per-pause RC work on mutation-heavy/alloc-light
         // phases where the allocation-growth trigger alone would fire too rarely.
+        //
+        // The cap directly bounds ProcessModifiedBuffers' cost, which is O(modified
+        // fields) at ~0.35us/field (coalesce map build + applyrc + dcopy capture +
+        // clearlog). A high cap lets a mutation burst accumulate a huge epoch: at
+        // the old 2,000,000 default a rare burst produced a 2M-field epoch and a
+        // ~1.6s STW rcpause (measured via LXR_PAUSE_PROFILE/LXR_PMB_PROFILE). Cap at
+        // 32Ki fields, honoring the paper's "frequent light RC pauses" (§3.2.2).
+        // Measured on a 70s WebApi mutation-heavy load, this default gives the
+        // tightest, most predictable pause distribution (P50~16ms, P90~17ms,
+        // Max~24ms) AND the lowest total STW of the swept caps -- vs the old 2M
+        // default's P50~4ms but a catastrophic 1.6s tail. Lower caps (16Ki) shave
+        // P50 further but incur more fixed per-pause reclaim overhead (higher total
+        // STW) and expose non-buffer pause outliers; higher caps (64Ki) inflate
+        // every mutation-phase pause. Normal (non-mutation) pauses fire on the
+        // allocation-growth trigger well under this cap, so it only binds the
+        // mutation-heavy burst it is meant to bound.
         const char* e = getenv("LXR_INCREMENT_TRIGGER");
-        g_incrementTrigger = e ? _atoi64(e) : 2000000; // ~2M increments (0 disables)
+        g_incrementTrigger = e ? _atoi64(e) : 32768; // 32Ki increments (~16ms pause; 0 disables)
     }
     if (g_wastageTriggerPct < 0)
     {
@@ -9481,6 +9497,13 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     bool syncStwTrace = (phase == LXRPhase::TracePause) && doTrace && !meStart && !useConcurrent;
 
     int64_t pauseMicros = 0;
+
+    // RC-pause per-phase timing (LXR_PAUSE_PROFILE): captured at each STW sub-phase
+    // boundary so an outlier pause self-reports WHICH phase dominated (suspend /
+    // park-wait / buffers / young-reclaim / mature-reclaim / decommit+restart)
+    // instead of guessing. Emitted below when a pause exceeds the profile threshold.
+    LARGE_INTEGER qpSuspended = {0}, qpParkEnd = {0}, qpBuffersEnd = {0},
+                  qpYoungEnd = {0}, qpMatureEnd = {0}, qpRestartStart = {0};
 
     if (meStart)
     {
@@ -9817,6 +9840,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         if (verbose) { fprintf(stderr, "LXRGC: [stage] phase=%s suspended=%d\n",
                                phase == LXRPhase::TracePause ? "trace" : "rc", (int)suspended); fflush(stderr); }
 
+        QueryPerformanceCounter(&qpSuspended);
         LXRSetPhase("stw:buffers");
         // Multi-epoch spanned RC epoch: DRAIN the modified buffers accumulated so
         // far in the marking window (paper: RC pauses continue during a spanning
@@ -9847,6 +9871,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         // the spin cap tripped) we DEFER: skip freeing this pause; the buffers
         // accumulate and the next pause (or the finish) drains them.
         bool skipBuffersForSpan = spannedRC && !spanMarkerParked;
+        QueryPerformanceCounter(&qpParkEnd);
         if (doBuffers && !skipBuffersForSpan)
         {
             LARGE_INTEGER tpb0; QueryPerformanceCounter(&tpb0);
@@ -9855,6 +9880,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             if (verbose) { fprintf(stderr, "LXRGC: [stage] ProcessModifiedBuffers done (%lldus)\n",
                                    (long long)((tpb1.QuadPart - tpb0.QuadPart) * 1000000 / freq.QuadPart)); fflush(stderr); }
         }
+        QueryPerformanceCounter(&qpBuffersEnd);
         if (phase == LXRPhase::TracePause)
         {
             // STW backup trace is complete by construction (no mutator window) ->
@@ -9952,6 +9978,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
                 LARGE_INTEGER tnc1; QueryPerformanceCounter(&tnc1);
                 g_lxrCollector.CollectNursery();
                 LARGE_INTEGER tnc2; QueryPerformanceCounter(&tnc2);
+                qpYoungEnd = tnc2;
                 if (verbose)
                 {
                     fprintf(stderr, "LXRGC: [rc-breakdown] copy=%lldus nursery=%lldus%s\n",
@@ -9970,6 +9997,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
             LARGE_INTEGER trr0; QueryPerformanceCounter(&trr0);
             g_lxrCollector.ReclaimMatureByRC();
             LARGE_INTEGER trr1; QueryPerformanceCounter(&trr1);
+            qpMatureEnd = trr1;
             if (verbose)
             {
                 fprintf(stderr, "LXRGC: [rc-breakdown] rc-reclaim=%lldus (chunks=%zu)\n",
@@ -10007,6 +10035,7 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         }
 
         LXRSetPhase("stw:restart");
+        QueryPerformanceCounter(&qpRestartStart);
         // LXR_FREERUN_CAP: bound the committed idle line-reuse pool. Under STW here
         // (mutators suspended) with g_chunkLock held, decommit the page-aligned
         // interior of pooled free-runs beyond the cap. Free-runs are dead carved
@@ -10067,6 +10096,43 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
         const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
             (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
         fprintf(stderr, "LXRGC: [pause-tag] type=%s pause=%lldus\n", ptag, (long long)pauseMicros);
+        fflush(stderr);
+    }
+    // Per-phase breakdown of STW RC/trace pauses (LXR_PAUSE_PROFILE=<ms threshold>,
+    // default 20). When a pause exceeds the threshold, self-report which sub-phase
+    // dominated: suspend (SuspendEE handshake), park (marker-quiesce wait),
+    // buffers (ProcessModifiedBuffers), young (CopyYoungSurvivors+CollectNursery),
+    // mature (ReclaimMatureByRC / trace+evac+sweep), decommit (DrainPendingDecommit
+    // + RestartEE tail). This roots-causes outliers like the 1725ms rcpause with
+    // DATA instead of guessing. Only the non-concurrent STW branch captures these
+    // boundaries (qpSuspended != 0); meStart/useConcurrent paths are timed above.
+    static int s_pauseProfileMs = -1;
+    if (s_pauseProfileMs < 0) {
+        const char* e = getenv("LXR_PAUSE_PROFILE");
+        s_pauseProfileMs = (e != nullptr) ? (atoi(e) > 0 ? atoi(e) : 20) : 0;
+    }
+    if (s_pauseProfileMs > 0 && qpSuspended.QuadPart != 0 &&
+        pauseMicros >= (int64_t)s_pauseProfileMs * 1000) {
+        const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
+            (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
+        // Fall back to the buffers boundary for phases that were skipped this pause
+        // (e.g. young reclaim gated off, or a trace pause that has no RC young/mature
+        // split) so the segment simply reads 0us rather than a garbage delta.
+        LARGE_INTEGER yEnd = (qpYoungEnd.QuadPart  != 0) ? qpYoungEnd  : qpBuffersEnd;
+        LARGE_INTEGER mEnd = (qpMatureEnd.QuadPart != 0) ? qpMatureEnd : yEnd;
+        LARGE_INTEGER rSt  = (qpRestartStart.QuadPart != 0) ? qpRestartStart : mEnd;
+        auto seg = [&](LONGLONG a, LONGLONG b) -> long long {
+            return (b > a) ? (long long)((b - a) * 1000000 / freq.QuadPart) : 0;
+        };
+        fprintf(stderr, "LXRGC: [pause-profile] type=%s total=%lldus suspend=%lldus park=%lldus "
+                        "buffers=%lldus young=%lldus mature=%lldus decommit+restart=%lldus\n",
+                ptag, (long long)pauseMicros,
+                seg(t0.QuadPart, qpSuspended.QuadPart),
+                seg(qpSuspended.QuadPart, qpParkEnd.QuadPart),
+                seg(qpParkEnd.QuadPart, qpBuffersEnd.QuadPart),
+                seg(qpBuffersEnd.QuadPart, yEnd.QuadPart),
+                seg(yEnd.QuadPart, mEnd.QuadPart),
+                seg(rSt.QuadPart, t1.QuadPart));
         fflush(stderr);
     }
     // Cadence trajectory (LXR_CADENCE): one compact line per pause with the state

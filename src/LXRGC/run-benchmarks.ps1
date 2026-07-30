@@ -204,7 +204,17 @@ $allScenarios = @(
 $gcModeDefs = @(
     [pscustomobject]@{ Id = "workstation"; DisplayName = "Workstation GC"; Env = @{ DOTNET_gcServer = "0" }; RemoveEnv = @("DOTNET_GCName") },
     [pscustomobject]@{ Id = "server";      DisplayName = "Server GC";      Env = @{ DOTNET_gcServer = "1" }; RemoveEnv = @("DOTNET_GCName") },
-    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_LINE_REUSE = "1"; LXR_CONC_DECREMENTS = "1"; LXR_YOUNG_RC = "1"; LXR_NURSERY = "1"; LXR_NURSERY_COPY = "1"; LXR_MULTIEPOCH = "1"; LXR_GC_THREADS = "16"; DOTNET_ReadyToRun = "0" }; RemoveEnv = @("DOTNET_gcServer") }
+    # LXRGC recommended/sound config (matches the storm-validated parkdiag_exp.ps1 baseline).
+    # NOTE: LXR_NURSERY_COPY is intentionally NOT set - RC-pause young-copy was found
+    # unsound (stale mature->young remset edges) and is default-OFF in code. Young defrag
+    # rides STW Evacuate instead. LXR_MARKER_PARK=1 enables paper-faithful in-window young
+    # RC (§3.2.2); LXR_TRACE_MAX_SPAN=3 bounds the concurrent trace window.
+    # (LXR_GC_GROWTH_PCT is left at its code default of 50 = adaptive budget: pinning it
+    # to 0/32MiB was a storm-footprint diagnostic that forces collect-every-32MB and
+    # inflates churn pauses to ~250ms, defeating LXR's low-latency purpose.)
+    # Diagnostic knobs (LXR_VERIFY_TRACE/LXR_CADENCE/LXR_AV_*) are omitted here - they add
+    # overhead and are for A/B debugging, not perf measurement.
+    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_LINE_REUSE = "1"; LXR_CONC_DECREMENTS = "1"; LXR_YOUNG_RC = "1"; LXR_NURSERY = "1"; LXR_MULTIEPOCH = "1"; LXR_MARKER_PARK = "1"; LXR_TRACE_MAX_SPAN = "3"; LXR_GC_THREADS = "16"; DOTNET_ReadyToRun = "0" }; RemoveEnv = @("DOTNET_gcServer") }
 )
 
 $scenarioMap = @{}
