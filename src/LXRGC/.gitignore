@@ -27,6 +27,7 @@ results/raw/
 # (raw, trace, and any experiment/smoke/repro output dir) is regenerated and ignored.
 results/*/
 results/repro_*.ps1
+results/*.log
 
 # Out-of-process trace captures (regenerate via capture-lxr-trace.ps1)
 results/trace/
