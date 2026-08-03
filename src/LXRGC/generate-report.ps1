@@ -220,24 +220,19 @@ function Stats-Row($label, $statsByMode, $fmt) {
     return "<tr><td>$label</td>$($cells -join '')</tr>"
 }
 
-# GC pause time is captured natively as a %-of-wall-clock-time stat/series
-# (PauseTimePctStats / TimeSeries.PauseTimePct). Since dotnet-counters
-# samples "dotnet.gc.pause.time" once per second (--refresh-interval 1),
-# each raw sample already equals the seconds of pause within that ~1s
-# window, so ms-of-pause = pct-of-time * 10 exactly. Older results-full.json
-# files (produced before ms tracking was added to run-benchmarks.ps1) won't
-# have PauseTimeMsStats/TimeSeries.PauseTimeMs, so derive them here on the
-# fly instead of requiring a full benchmark re-run.
+# STW pause distribution is now sourced ENTIRELY from the out-of-process
+# dotnet-trace event capture (harness PauseDistMsStats): built-in GCs from
+# GCSuspendEEStart->GCRestartEEStop, LXRGC from its own GCDynamic pause events,
+# reconstructed offline by TraceAnalyzer. The old coarse 1Hz dotnet-counters
+# pause metric (PauseTimeMsStats/PauseTimePctStats) has been removed, so there is
+# a single, authoritative, cross-GC-uniform pause metric.
 function Get-PauseMsStats($run) {
-    if ($run.PauseTimeMsStats) { return $run.PauseTimeMsStats }
-    if (-not $run.PauseTimePctStats) { return $null }
-    $s = $run.PauseTimePctStats
-    return [ordered]@{ Avg = $s.Avg * 10.0; P50 = $s.P50 * 10.0; P90 = $s.P90 * 10.0; P99 = $s.P99 * 10.0; Max = $s.Max * 10.0; Min = $s.Min * 10.0; Count = $s.Count }
+    if ($run.PauseDistMsStats) { return $run.PauseDistMsStats }
+    return $null
 }
 function Get-PauseMsSeries($run) {
     if ($run.TimeSeries.PauseTimeMs) { return $run.TimeSeries.PauseTimeMs }
-    if (-not $run.TimeSeries.PauseTimePct) { return @() }
-    return @($run.TimeSeries.PauseTimePct | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V * 10.0, 3) } })
+    return @()
 }
 
 $genDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -291,20 +286,19 @@ foreach ($scenarioId in $scenarioOrder) {
         @{ Label = "Total committed bytes"; Get = { param($m) Fmt-Bytes $m.Summary.TotalCommittedBytes }; Bar = $true; Max = $maxCommitted; Val = { param($m) $m.Summary.TotalCommittedBytes } }
         @{ Label = "Peak working set"; Get = { param($m) Fmt-Bytes $m.Summary.WorkingSetBytes }; Bar = $true; Max = $maxWs; Val = { param($m) $m.Summary.WorkingSetBytes } }
     )
-    # Precise per-pause STW latency (webapi GcPauseCollector): the authoritative,
-    # cross-GC-uniform pause metric (every real pause timed from GC events / LXR's
-    # QPC log), replacing the coarse 1Hz counter that reported ~0 for LXR. Shown as
-    # headline rows only when the scenario self-reported per-pause samples.
+    # Per-pause STW latency from the out-of-process dotnet-trace event capture:
+    # the authoritative, cross-GC-uniform pause metric (every real pause timed from
+    # GC events for the built-in GCs / LXR's own GCDynamic pause events for LXRGC).
     $anyPauseDist = ($byMode.Values | Where-Object { $_.PauseDistMsStats } | Select-Object -First 1)
     if ($anyPauseDist) {
         $maxPauseDist = ($byMode.Values | ForEach-Object { $_.PauseDistMsStats.Max } | Where-Object { $_ } | Measure-Object -Maximum).Maximum
-        $metricRows += @{ Label = "Precise STW pause - max (ms)"; Get = { param($m) if ($m.PauseDistMsStats) { "$(Fmt-Dec $m.PauseDistMsStats.Max 2) ms" } else { "n/a" } }
+        $metricRows += @{ Label = "STW pause - max (ms)"; Get = { param($m) if ($m.PauseDistMsStats) { "$(Fmt-Dec $m.PauseDistMsStats.Max 2) ms" } else { "n/a" } }
             Bar = $true; Max = $maxPauseDist; Val = { param($m) if ($m.PauseDistMsStats) { $m.PauseDistMsStats.Max } else { 0 } } }
-        $metricRows += @{ Label = "Precise STW pause - p99 (ms)"; Get = { param($m) if ($m.PauseDistMsStats) { "$(Fmt-Dec $m.PauseDistMsStats.P99 2) ms" } else { "n/a" } }
+        $metricRows += @{ Label = "STW pause - p99 (ms)"; Get = { param($m) if ($m.PauseDistMsStats) { "$(Fmt-Dec $m.PauseDistMsStats.P99 2) ms" } else { "n/a" } }
             Bar = $true; Max = $maxPauseDist; Val = { param($m) if ($m.PauseDistMsStats) { $m.PauseDistMsStats.P99 } else { 0 } } }
-        $metricRows += @{ Label = "Precise STW pause - p50 (ms)"; Get = { param($m) if ($m.PauseDistMsStats) { "$(Fmt-Dec $m.PauseDistMsStats.P50 2) ms" } else { "n/a" } }
+        $metricRows += @{ Label = "STW pause - p50 (ms)"; Get = { param($m) if ($m.PauseDistMsStats) { "$(Fmt-Dec $m.PauseDistMsStats.P50 2) ms" } else { "n/a" } }
             Bar = $true; Max = $maxPauseDist; Val = { param($m) if ($m.PauseDistMsStats) { $m.PauseDistMsStats.P50 } else { 0 } } }
-        $metricRows += @{ Label = "Precise STW pauses (count)"; Get = { param($m) if ($m.PauseDistMsStats) { Fmt-Num $m.PauseDistMsStats.Count } else { "n/a" } }; Bar = $false }
+        $metricRows += @{ Label = "STW pauses (count, from events)"; Get = { param($m) if ($m.PauseDistMsStats) { Fmt-Num $m.PauseDistMsStats.Count } else { "n/a" } }; Bar = $false }
     }
     if ($isGrowingCache) {
         $maxObservedPause = ($byMode.Values | ForEach-Object { $_.Summary.ObservedGen2PauseMaxMs } | Where-Object { $_ } | Measure-Object -Maximum).Maximum
@@ -338,17 +332,11 @@ foreach ($scenarioId in $scenarioOrder) {
     }
     $pauseHeaderCells = ($gcModeOrder | ForEach-Object { "<th colspan='4'>$($gcModeLabel[$_])</th>" }) -join ""
     $subHeaderCells = ($gcModeOrder | ForEach-Object { "<th>avg</th><th>p50</th><th>p90</th><th>p99</th>" }) -join ""
-    $pauseMsRow = Stats-Row "GC pause time (ms per ~1s sample)" $pauseMsStatsByMode { param($v) "{0:N2} ms" -f $v }
-    # Precise per-pause STW distribution (real per-pause samples; see harness
-    # PauseDistMsStats). Authoritative + uniform across GCs, unlike the coarse
-    # 1Hz counter row above. Only emitted when the scenario reported samples.
-    $pauseDistStatsByMode = @{}
-    foreach ($modeId in $gcModeOrder) {
-        $m = $byMode[$modeId]
-        if ($m -and $m.PauseDistMsStats) { $pauseDistStatsByMode[$modeId] = $m.PauseDistMsStats }
-    }
-    $hasPauseDist = $pauseDistStatsByMode.Count -gt 0
-    $pauseDistRow = if ($hasPauseDist) { Stats-Row "Precise STW pause (ms, real per-pause)" $pauseDistStatsByMode { param($v) "{0:N2} ms" -f $v } } else { "" }
+    # Single, authoritative per-pause STW distribution from dotnet-trace events
+    # (harness PauseDistMsStats). Uniform across GCs; the coarse 1Hz counter row
+    # has been removed.
+    $pauseMsRow = if ($pauseMsStatsByMode.Values | Where-Object { $_ }) { Stats-Row "STW pause (ms, per-pause from dotnet-trace events)" $pauseMsStatsByMode { param($v) "{0:N2} ms" -f $v } } else { "" }
+    $pauseDistRow = ""
     $wsRow = Stats-Row "Working set (MB)" $wsStatsByMode { param($v) "{0:N0}" -f ($v / 1MB) }
     $throughputUnit = if ($isGcPerfSim) { "MB/s" } else { "ops/sec" }
     $throughputRow = Stats-Row "Throughput ($throughputUnit)" $throughputStatsByMode { param($v) "{0:N1}" -f $v }
@@ -366,7 +354,6 @@ foreach ($scenarioId in $scenarioOrder) {
     $wsChart = New-LineChartSvg -SeriesByMode $wsSeries -YSuffix " MB"
     $throughputChart = New-LineChartSvg -SeriesByMode $throughputSeries -YSuffix " $throughputUnit"
     $pauseMsBarChart = New-PauseStatsBarChartSvg -StatsByMode $pauseMsStatsByMode -YSuffix " ms" -Decimals 2
-    $pauseDistBarChart = if ($hasPauseDist) { New-PauseStatsBarChartSvg -StatsByMode $pauseDistStatsByMode -YSuffix " ms" -Decimals 2 } else { "" }
     $pauseMsSparseNote = Get-SparseSeriesNote $pauseMsSeries
     $wsSparseNote = Get-SparseSeriesNote $wsSeries
     $throughputSparseNote = Get-SparseSeriesNote $throughputSeries
@@ -387,7 +374,7 @@ $rowsHtml
   </table>
 
   <details class="statsDetails" open>
-    <summary><h3>GC pause time / memory / throughput percentiles (over the full run)</h3></summary>
+    <summary><h3>STW pause / memory / throughput percentiles (over the full run)</h3></summary>
     <table class="cmp stats">
       <thead><tr><th></th>$pauseHeaderCells</tr><tr><th>Metric</th>$subHeaderCells</tr></thead>
       <tbody>
@@ -401,7 +388,7 @@ $rowsHtml
 
   <div class="chartsGrid">
     <div class="chartCard">
-      <h4>GC pause time (ms) over time</h4>
+      <h4>STW pause (ms) over time (per-pause, dotnet-trace events)</h4>
       $pauseMsSparseNote
       $pauseMsChart
     </div>
@@ -411,15 +398,9 @@ $rowsHtml
       $throughputChart
     </div>
     <div class="chartCard">
-      <h4>GC pause time (ms) percentiles (avg / p50 / p90 / p99 / max, full run)</h4>
+      <h4>STW pause (ms) percentiles (avg / p50 / p90 / p99 / max, per-pause from events)</h4>
       $pauseMsBarChart
     </div>
-    $(if ($hasPauseDist) { @"
-    <div class="chartCard">
-      <h4>Precise STW pause (ms) percentiles (real per-pause: GC events / LXR QPC log)</h4>
-      $pauseDistBarChart
-    </div>
-"@ })
     <div class="chartCard">
       <h4>Working set (MB) over time</h4>
       $wsSparseNote

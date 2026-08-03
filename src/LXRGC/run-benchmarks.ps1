@@ -8,15 +8,18 @@
     high-throughput transient object churn).
 
     For every (workload, GC mode) pair, the target process is launched with
-    the right environment variables and `dotnet-counters collect` attaches
-    to it for the whole run, capturing a real second-by-second time series
-    (GC pause time, working set, committed bytes, heap size, collection
-    counts, allocation rate, and - for ConsoleApp/WebApi - a custom
-    "operations" throughput counter) via the standard "System.Runtime"
-    EventCounters/Meters that ship in every .NET process. This works
-    identically for LXRGC because its IGCHeap counters
-    (GC.CollectionCount/GetTotalAllocatedBytes/GetGCMemoryInfo) feed the same
-    counters as the built-in GC.
+    the right environment variables and a SINGLE out-of-process `dotnet-trace`
+    session attaches to it by PID for the whole run, capturing one .nettrace
+    that TraceAnalyzer reconstructs offline into every metric:
+      * per-pause STW latency - built-in GCs from GCSuspendEEStart->
+        GCRestartEEStop, LXRGC from its own GCDynamic "LXRGCPause" events;
+      * heap size / alloc rate / collection counts from the CLR GC events;
+      * working set / committed bytes / a custom "operations" throughput
+        counter from EventCounters riding the same session.
+    There is NO dotnet-counters client and NO custom pause log: pause metrics
+    are 100% event-sourced from dotnet-trace, uniform across all three GCs.
+    This works identically for LXRGC because it fires the standard GC events
+    (plus its own GCDynamic pause events) through the GC-EE event sink.
 
     Writes results\results-full.json (summary + percentiles + downsampled
     time series per run) and then renders results\report.html.
@@ -51,12 +54,34 @@ $root = $PSScriptRoot
 $gcDll = Join-Path $root "native\obj\Release\LXRGC.dll"
 if (-not (Test-Path $gcDll)) { throw "LXRGC.dll not built. Run native\build.ps1 first." }
 
-$dotnetCounters = Get-Command dotnet-counters -ErrorAction SilentlyContinue
-if (-not $dotnetCounters) {
-    $candidate = Join-Path $env:USERPROFILE ".dotnet\tools\dotnet-counters.exe"
-    if (Test-Path $candidate) { $dotnetCounters = $candidate } else { throw "dotnet-counters not found. Install via: dotnet tool install --global dotnet-counters" }
+# Event-based, OUT-OF-PROCESS measurement via a SINGLE dotnet-trace session is the
+# authoritative (and only) path. dotnet-trace attaches by PID and captures, over
+# one EventPipe stream:
+#   * CLR GC events (built-in GCs fire GCSuspendEE*/GCHeapStats/GCAllocationTick/
+#     GCStart natively; LXR fires the same events through the GC->EE event sink) -
+#     source pauses, heap size, alloc rate, collection counts;
+#   * System.Runtime EventCounters (working-set, gc-committed) - the memory metrics
+#     that have no GC *event*;
+#   * the app's LXRGC.Bench "operations" IncrementingEventCounter - throughput.
+# TraceAnalyzer reconstructs every series offline. A single session deliberately
+# replaces the earlier dotnet-trace + dotnet-counters pair: two concurrent
+# EventPipe diagnostic clients intermittently DEADLOCK the target at attach, which
+# (with dotnet-counters blocking on the hung app) froze the whole suite.
+$dotnetTrace = Get-Command dotnet-trace -ErrorAction SilentlyContinue
+if (-not $dotnetTrace) {
+    $candidate = Join-Path $env:USERPROFILE ".dotnet\tools\dotnet-trace.exe"
+    if (-not (Test-Path $candidate)) { throw "dotnet-trace not found. Install via: dotnet tool install --global dotnet-trace" }
+    $dotnetTrace = $candidate
 }
-else { $dotnetCounters = $dotnetCounters.Source }
+else { $dotnetTrace = $dotnetTrace.Source }
+
+$traceAnalyzerProj = Join-Path $root "tools\TraceAnalyzer\TraceAnalyzer.csproj"
+$traceAnalyzerExe = Join-Path $root "tools\TraceAnalyzer\bin\Release\net8.0\TraceAnalyzer.exe"
+if (-not (Test-Path $traceAnalyzerExe)) {
+    Write-Host "Building TraceAnalyzer (offline event analyzer)..."
+    dotnet build $traceAnalyzerProj -c Release -v quiet | Out-Null
+    if (-not (Test-Path $traceAnalyzerExe)) { throw "Failed to build TraceAnalyzer at $traceAnalyzerExe" }
+}
 
 # dotllm (https://github.com/kkokosa/dotLLM) is only required for the
 # "dotllm-serve"/"dotllm-serve-1_5b" scenarios - real-world, (near-)zero-
@@ -209,12 +234,16 @@ $gcModeDefs = @(
     # unsound (stale mature->young remset edges) and is default-OFF in code. Young defrag
     # rides STW Evacuate instead. LXR_MARKER_PARK=1 enables paper-faithful in-window young
     # RC (§3.2.2); LXR_TRACE_MAX_SPAN=3 bounds the concurrent trace window.
+    # LXR_OFFPAUSE_PARALLEL=1 runs the off-pause concurrent marker on the parallel
+    # worker pool (paper §3.5); the shared-stack drain now honors the same prompt-
+    # finish bail as the serial path, so the window closes within a few RC epochs
+    # (footprint stays bounded) while marking ~3x faster than the serial marker.
     # (LXR_GC_GROWTH_PCT is left at its code default of 50 = adaptive budget: pinning it
     # to 0/32MiB was a storm-footprint diagnostic that forces collect-every-32MB and
     # inflates churn pauses to ~250ms, defeating LXR's low-latency purpose.)
     # Diagnostic knobs (LXR_VERIFY_TRACE/LXR_CADENCE/LXR_AV_*) are omitted here - they add
     # overhead and are for A/B debugging, not perf measurement.
-    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_LINE_REUSE = "1"; LXR_CONC_DECREMENTS = "1"; LXR_YOUNG_RC = "1"; LXR_NURSERY = "1"; LXR_MULTIEPOCH = "1"; LXR_MARKER_PARK = "1"; LXR_TRACE_MAX_SPAN = "3"; LXR_GC_THREADS = "16"; DOTNET_ReadyToRun = "0" }; RemoveEnv = @("DOTNET_gcServer") }
+    [pscustomobject]@{ Id = "lxrgc";      DisplayName = "LXRGC (full)"; Env = @{ DOTNET_GCName = "LXRGC.dll"; LXR_CONCURRENT = "1"; LXR_EVAC = "1"; LXR_REMSET = "1"; LXR_LINE_REUSE = "1"; LXR_CONC_DECREMENTS = "1"; LXR_YOUNG_RC = "1"; LXR_NURSERY = "1"; LXR_MULTIEPOCH = "1"; LXR_MARKER_PARK = "1"; LXR_TRACE_MAX_SPAN = "3"; LXR_OFFPAUSE_PARALLEL = "1"; LXR_GC_THREADS = "16"; DOTNET_ReadyToRun = "0" }; RemoveEnv = @("DOTNET_gcServer") }
 )
 
 $scenarioMap = @{}
@@ -259,45 +288,58 @@ function Get-Downsampled($Series, [int]$MaxPoints = 150) {
     return $out
 }
 
-# Parses a dotnet-counters CSV export into a hashtable of
-# metricKey -> @(@{T=<seconds-since-start>; V=<double>}, ...), sorted by time.
-function Parse-CountersCsv([string]$CsvPath) {
-    $metricMap = [ordered]@{
-        "working_set"     = "dotnet.process.memory.working_set*"
-        "pause_time"      = "dotnet.gc.pause.time*"
-        "gen0_collections"= "*gc.collections*gen0*"
-        "gen1_collections"= "*gc.collections*gen1*"
-        "gen2_collections"= "*gc.collections*gen2*"
-        "alloc_rate"      = "dotnet.gc.heap.total_allocated*"
-        "committed_bytes" = "dotnet.gc.last_collection.memory.committed_size*"
-        "operations"      = "operations*"
-    }
-
-    $rows = Import-Csv $CsvPath
-    if (-not $rows -or $rows.Count -eq 0) { return @{} }
-
-    $parsedRows = foreach ($r in $rows) {
-        $ts = [datetime]::Parse($r.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture)
-        $val = 0.0
-        [double]::TryParse($r.'Mean/Increment', [ref]$val) | Out-Null
-        [pscustomobject]@{ Timestamp = $ts; Name = $r.'Counter Name'; Value = $val }
-    }
-    $t0 = ($parsedRows | Measure-Object -Property Timestamp -Minimum).Minimum
-
-    $result = @{}
-    foreach ($key in $metricMap.Keys) {
-        $pattern = $metricMap[$key]
-        $series = $parsedRows | Where-Object { $_.Name -like $pattern } | Sort-Object Timestamp |
-            ForEach-Object { @{ T = [Math]::Round(($_.Timestamp - $t0).TotalSeconds, 1); V = $_.Value } }
-        $result[$key] = @($series)
-    }
-    return $result
+# Attaches dotnet-trace to a running process BY PID (attach-by-PID avoids the
+# EventPipe attach-during-startup hang) and captures the CLR GC EventPipe stream
+# out-of-process to a .nettrace. --duration auto-stops + flushes a clean rundown
+# after $DurationSeconds, so the trace is complete even though the target app is
+# still alive. Returns the background dotnet-trace process (wait on it later).
+function Start-TraceCollector([int]$TargetPid, [string]$TraceOut, [int]$DurationSeconds) {
+    if (Test-Path $TraceOut) { Remove-Item $TraceOut -Force -ErrorAction SilentlyContinue }
+    $dur = [TimeSpan]::FromSeconds([Math]::Max(1, $DurationSeconds)).ToString("hh\:mm\:ss")
+    # One EventPipe session carrying everything:
+    #   * Microsoft-Windows-DotNETRuntime:0x1:5  - GC keyword @ verbose: GCSuspendEE*/
+    #     GCHeapStats/GCStart/GCEnd + GCAllocationTick + GCDynamicEvent (LXR pauses).
+    #   * System.Runtime EventCounters @1s        - working-set + gc-committed.
+    #   * LXRGC.Bench EventCounters   @1s          - the app's "operations" throughput.
+    $providers = "Microsoft-Windows-DotNETRuntime:0x1:5," +
+        "System.Runtime:0:1:EventCounterIntervalSec=1," +
+        "LXRGC.Bench:0:1:EventCounterIntervalSec=1"
+    $args = @("collect", "--process-id", "$TargetPid",
+        "--providers", $providers,
+        "--duration", $dur, "--output", $TraceOut)
+    $outLog = Join-Path $rawDir "dotnet-trace-$TargetPid.log"
+    return Start-Process -FilePath $dotnetTrace -ArgumentList $args -PassThru -NoNewWindow `
+        -RedirectStandardOutput $outLog -RedirectStandardError "$outLog.err"
 }
 
-# Launches a workload process with per-child environment variables (NOT the
-# parent shell's env, so dotnet-counters - itself a .NET app - never
-# inherits e.g. DOTNET_GCName and fails to start), attaches dotnet-counters
-# for the whole run duration, and returns stdout + parsed counter series.
+# Runs TraceAnalyzer offline on a captured .nettrace and fills $Series from the
+# SINGLE trace session: GC-event series (pause_time_ms, heap_size, alloc_rate,
+# gen0/1/2 collections) plus the EventCounter series (working_set, committed_bytes
+# from System.Runtime; operations from LXRGC.Bench). Returns the unified per-pause
+# sample array (ms), preferring LXR's own dynamic pause events, else built-in
+# suspend-pair pauses.
+function Merge-TraceSeries([hashtable]$Series, [string]$TraceOut, [string]$Label) {
+    if (-not (Test-Path $TraceOut)) { return @() }
+    $json = Join-Path $rawDir "$Label.tracestats.json"
+    & $traceAnalyzerExe $TraceOut --json $json *> (Join-Path $rawDir "$Label.traceanalyzer.log") 2>&1
+    if (-not (Test-Path $json)) { return @() }
+    $a = Get-Content $json -Raw | ConvertFrom-Json
+    if ($a.series) {
+        foreach ($src in @("pause_time_ms", "heap_size", "alloc_rate", "working_set", "committed_bytes", "operations", "gen0_collections", "gen1_collections", "gen2_collections")) {
+            $s = $a.series.$src
+            if ($null -ne $s -and @($s).Count -gt 0) {
+                $Series[$src] = @($s | ForEach-Object { @{ T = [double]$_.T; V = [double]$_.V } })
+            }
+        }
+    }
+    return @($a.pauseSamplesMs | Where-Object { $_ -ne $null } | ForEach-Object { [double]$_ })
+}
+# Runs a self-terminating benchmark process (console apps that stop themselves
+# after their internal duration) under a single out-of-process dotnet-trace
+# session. NO dotnet-counters: a second concurrent EventPipe client intermittently
+# deadlocks the target at attach (which then hangs the whole suite). All series -
+# pauses, heap, alloc, working-set, committed, operations - come from the trace.
+# A watchdog kills a hung app + trace so one bad run can't freeze the suite.
 function Invoke-MonitoredRun {
     param(
         [string]$ExePath,
@@ -306,7 +348,10 @@ function Invoke-MonitoredRun {
         [hashtable]$ExtraEnv,
         [string[]]$RemoveEnvKeys,
         [string]$CsvBasePath,
-        [int]$AttachDelayMs = 1500
+        [int]$AttachDelayMs = 1500,
+        [string]$TraceOut,
+        [int]$TraceDurationSeconds = 0,
+        [string]$Label = "run"
     )
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -324,40 +369,56 @@ function Invoke-MonitoredRun {
     $stderrTask = $proc.StandardError.ReadToEndAsync()
     Start-Sleep -Milliseconds $AttachDelayMs
 
-    $dcArgs = @("collect", "-p", $proc.Id, "--refresh-interval", $CounterRefreshIntervalSeconds,
-        "--format", "csv", "--counters", "System.Runtime,LXRGC.Bench", "-o", $CsvBasePath)
-    & $dotnetCounters @dcArgs *> (Join-Path $rawDir "dotnet-counters.log") 2>&1
+    # Out-of-process event capture (authoritative, single session). Stop it a few
+    # seconds before the app exits so dotnet-trace performs a clean rundown ->
+    # complete .nettrace.
+    $traceProc = $null
+    if ($TraceOut -and $TraceDurationSeconds -gt 0 -and -not $proc.HasExited) {
+        $traceSecs = [Math]::Max(1, $TraceDurationSeconds - 3)
+        $traceProc = Start-TraceCollector -TargetPid $proc.Id -TraceOut $TraceOut -DurationSeconds $traceSecs
+    }
 
-    $proc.WaitForExit(300000) | Out-Null
+    # Watchdog: allow the app its full duration plus generous slack, then force it
+    # (and the trace) down so a hung run can't block the whole suite.
+    $watchdogMs = ([Math]::Max(30, $TraceDurationSeconds) + 60) * 1000
+    if (-not $proc.WaitForExit($watchdogMs)) {
+        Write-Warning "[$Label] app did not exit within $([int]($watchdogMs/1000))s - killing (watchdog)."
+        try { if ($traceProc -and -not $traceProc.HasExited) { $traceProc.Kill($true) } } catch {}
+        try { if (-not $proc.HasExited) { $proc.Kill($true) } } catch {}
+        $proc.WaitForExit(10000) | Out-Null
+    }
+    if ($traceProc -and -not $traceProc.HasExited) { $traceProc.WaitForExit(30000) | Out-Null }
     $stdout = $stdoutTask.Result
     $stderr = $stderrTask.Result
 
-    $csvPath = "$CsvBasePath.csv"
-    $series = if (Test-Path $csvPath) { Parse-CountersCsv $csvPath } else { @{} }
+    # Every series is event-sourced; Merge-TraceSeries fills the (initially empty)
+    # hashtable from the single trace and returns the per-pause sample array.
+    $series = @{}
+    $pauseSamplesMs = @()
+    if ($TraceOut) { $pauseSamplesMs = Merge-TraceSeries -Series $series -TraceOut $TraceOut -Label $Label }
 
     return [pscustomobject]@{
         StdOut = $stdout
         StdErr = $stderr
         Series = $series
+        PauseSamplesMs = $pauseSamplesMs
         ExitCode = $proc.ExitCode
     }
 }
 
 # Monitors a long-running HTTP server process for scenarios where the
-# harness (not the target app) controls when the run ends. Key difference
-# from Invoke-MonitoredRun: dotnet-counters is invoked with --duration so it
-# auto-stops and flushes a valid CSV on its own after a fixed time span,
-# regardless of whether the server is still alive. The server process is
-# force-killed only AFTER dotnet-counters has already exited cleanly -
-# killing it first would make dotnet-counters throw (ServerNotAvailableException)
-# and write no CSV at all.
+# harness (not the target app) controls when the run ends. A single
+# out-of-process dotnet-trace session (started with --duration = RunSeconds+slack)
+# is the timing anchor: it auto-stops and flushes a complete .nettrace on its own
+# after the fixed span, regardless of whether the server is still alive, and
+# carries every series (pauses/heap/alloc/working-set/committed). NO dotnet-counters
+# (a second concurrent EventPipe client intermittently deadlocks the target). The
+# server is force-killed only AFTER the trace has exited.
 #
 # Load is driven by a background job that repeatedly POSTs small inference
 # requests and records one completed-request count per wall-clock second;
 # that per-second count is returned as a synthetic "operations" series in
-# exactly the same {T=seconds; V=count} shape Parse-CountersCsv produces,
-# so it plugs into the existing stats/percentile/downsampling pipeline
-# unmodified.
+# exactly the {T=seconds; V=count} shape the rest of the pipeline expects.
 function Invoke-MonitoredServerRun {
     param(
         [string]$ExePath,
@@ -370,7 +431,9 @@ function Invoke-MonitoredServerRun {
         [string]$RequestUrl,
         [string]$RequestBodyJson,
         [int]$RunSeconds,
-        [int]$ReadyTimeoutSeconds = 90
+        [int]$ReadyTimeoutSeconds = 90,
+        [string]$TraceOut,
+        [string]$Label = "run"
     )
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -422,18 +485,26 @@ function Invoke-MonitoredServerRun {
         return $perSecond
     } -ArgumentList $RequestUrl, $RequestBodyJson, $RunSeconds
 
-    # dotnet-counters --duration makes it stop and flush a complete CSV on
-    # its own after this span, independent of the server's lifetime. Give it
-    # a little slack over the load-driver duration so the last few seconds
-    # of load are fully captured.
-    $durSpan = [TimeSpan]::FromSeconds($RunSeconds + 5)
-    $durArg = "{0:00}:{1:00}:{2:00}:{3:00}" -f $durSpan.Days, $durSpan.Hours, $durSpan.Minutes, $durSpan.Seconds
-    $dcArgs = @("collect", "-p", $proc.Id, "--refresh-interval", $CounterRefreshIntervalSeconds,
-        "--format", "csv", "--counters", "System.Runtime,LXRGC.Bench", "-o", $CsvBasePath, "--duration", $durArg)
-    & $dotnetCounters @dcArgs *> (Join-Path $rawDir "dotnet-counters.log") 2>&1
+    # The dotnet-trace session (started with --duration) is the timing anchor: it
+    # stops and flushes a complete .nettrace on its own after the fixed span,
+    # independent of the server's lifetime. Slack over the load-driver duration so
+    # the last few seconds of load are fully captured.
+    $traceProc = $null
+    if ($TraceOut) {
+        $traceProc = Start-TraceCollector -TargetPid $proc.Id -TraceOut $TraceOut -DurationSeconds ($RunSeconds + 5)
+    }
+    if ($traceProc) {
+        if (-not $traceProc.WaitForExit(($RunSeconds + 90) * 1000)) {
+            Write-Warning "[$Label] dotnet-trace did not finish in time - killing (watchdog)."
+            try { $traceProc.Kill($true) } catch {}
+        }
+    }
+    else {
+        Start-Sleep -Seconds ($RunSeconds + 5)
+    }
 
-    # dotnet-counters has now exited cleanly on its own - safe to reap the
-    # load-driver job and finally kill the server.
+    # The trace has now exited on its own - safe to reap the load-driver job and
+    # finally kill the server.
     Wait-Job -Job $job -Timeout 30 | Out-Null
     $perSecondCounts = Receive-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
@@ -441,8 +512,8 @@ function Invoke-MonitoredServerRun {
     if (-not $proc.HasExited) { $proc.Kill() }
     $proc.WaitForExit(15000) | Out-Null
 
-    $csvPath = "$CsvBasePath.csv"
-    $series = if (Test-Path $csvPath) { Parse-CountersCsv $csvPath } else { @{} }
+    # Every non-synthetic series is event-sourced via the trace.
+    $series = @{}
 
     # Build a synthetic "operations" series (requests completed per second)
     # in the same {T=seconds-since-start; V=value} shape used elsewhere.
@@ -452,13 +523,20 @@ function Invoke-MonitoredServerRun {
             $opsSeries += @{ T = [double]$sec; V = [double]$perSecondCounts[$sec] }
         }
     }
-    $series["operations"] = $opsSeries
     $totalOps = ($perSecondCounts.Values | Measure-Object -Sum).Sum
     if (-not $totalOps) { $totalOps = 0 }
+
+    # Overlay event-sourced series (working_set/committed/heap/pauses/...) + collect
+    # the authoritative per-pause samples. Set the synthetic operations LAST so the
+    # load-driver count wins over any app-emitted operations EventCounter.
+    $pauseSamplesMs = @()
+    if ($TraceOut) { $pauseSamplesMs = Merge-TraceSeries -Series $series -TraceOut $TraceOut -Label $Label }
+    $series["operations"] = $opsSeries
 
     return [pscustomobject]@{
         Series   = $series
         TotalOps = $totalOps
+        PauseSamplesMs = $pauseSamplesMs
     }
 }
 
@@ -515,33 +593,25 @@ foreach ($scenarioId in $Scenarios) {
         $csvBase = Join-Path $rawDir $label
         $runStart = Get-Date
 
-        # Precise per-pause STW samples (ms). The webapi sample self-reports these
-        # in its ##RESULT## (built-in GCs via an in-process EventListener pairing
-        # GCSuspendEEBegin->GCRestartEEEnd; LXRGC via its LXR_PAUSE_LOG file, since
-        # it fires no GC events). Reset per run so a prior run's samples never leak.
+        # Authoritative per-pause STW samples (ms) come from an OUT-OF-PROCESS
+        # dotnet-trace capture, reconstructed offline by TraceAnalyzer from the CLR
+        # GC EventPipe stream (built-in GCs: GCSuspendEE*; LXRGC: its own GCDynamic
+        # pause events). No in-process collector, no custom pause log. Reset per run
+        # so a prior run's samples never leak.
         $pauseSamplesMs = $null
-        # Per-run LXR pause log: the LXRGC native collector appends "type,micros"
-        # per pause here; the webapi app reads it back to fill PauseSamplesMs. MUST
-        # be absolute - the app runs with a different CWD (its publish dir), so a
-        # relative path would resolve differently for the native writer vs here.
-        # Convert-Path (not [IO.Path]::GetFullPath, which uses the process
-        # CurrentDirectory PowerShell does NOT keep in sync with its location).
-        $lxrPauseLog = Join-Path (Convert-Path $rawDir) "$label.pauselog"
-        if (Test-Path $lxrPauseLog) { Remove-Item $lxrPauseLog -Force -ErrorAction SilentlyContinue }
+        $traceOut = Join-Path (Convert-Path $rawDir) "$label.nettrace"
 
         try {
         switch ($scenario.Kind) {
             "console" {
                 $publishDir = Join-Path $root "samples\ConsoleApp\publish"
                 $env2 = @{} + $gcMode.Env
-                # LXRGC self-reports each STW pause to this file (harmless for the
-                # built-in GCs, which use the in-process EventListener instead).
-                $env2["LXR_PAUSE_LOG"] = $lxrPauseLog
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "ConsoleApp.exe") -WorkingDirectory $publishDir `
-                    -Arguments "$DurationSeconds $label" -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase
+                    -Arguments "$DurationSeconds $label" -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase `
+                    -TraceOut $traceOut -TraceDurationSeconds $DurationSeconds -Label $label
                 $resultJson = Get-ResultLineJson $run.StdOut
                 if (-not $resultJson) { Write-Host $run.StdOut; Write-Host $run.StdErr; throw "No ##RESULT## for $label" }
-                $pauseSamplesMs = @($resultJson.PauseSamplesMs | Where-Object { $_ -ne $null })
+                $pauseSamplesMs = @($run.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $summary = [ordered]@{
                     OperationsTotal      = $resultJson.Operations
                     OpsPerSecondOverall  = $resultJson.OpsPerSecond
@@ -562,14 +632,12 @@ foreach ($scenarioId in $Scenarios) {
                 $env2 = @{} + $gcMode.Env
                 $env2["LXRGC_BENCH_DURATION_SECONDS"] = "$DurationSeconds"
                 $env2["LXRGC_BENCH_LABEL"] = $label
-                # LXRGC self-reports each STW pause to this file (harmless for the
-                # built-in GCs, which use the in-process EventListener instead).
-                $env2["LXR_PAUSE_LOG"] = $lxrPauseLog
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "WebApi.exe") -WorkingDirectory $publishDir `
-                    -Arguments "" -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs 3000
+                    -Arguments "" -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs 3000 `
+                    -TraceOut $traceOut -TraceDurationSeconds $DurationSeconds -Label $label
                 $resultJson = Get-ResultLineJson $run.StdOut
                 if (-not $resultJson) { Write-Host $run.StdOut; Write-Host $run.StdErr; throw "No ##RESULT## for $label" }
-                $pauseSamplesMs = @($resultJson.PauseSamplesMs | Where-Object { $_ -ne $null })
+                $pauseSamplesMs = @($run.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $summary = [ordered]@{
                     OperationsTotal      = $resultJson.Operations
                     OpsPerSecondOverall  = $resultJson.OpsPerSecond
@@ -601,7 +669,9 @@ foreach ($scenarioId in $Scenarios) {
                 # much smaller attach delay.
                 $attachDelayMs = if ($scenario.Id -in @("gcperfsim-mt-throughput", "gcperfsim-mt-throughput-moderate")) { 300 } else { 1500 }
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "GCPerfSim.exe") -WorkingDirectory $publishDir `
-                    -Arguments $fullArgs -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs $attachDelayMs
+                    -Arguments $fullArgs -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs $attachDelayMs `
+                    -TraceOut $traceOut -TraceDurationSeconds $DurationSeconds -Label $label
+                $pauseSamplesMs = @($run.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $stats = Get-GcPerfSimStats $run.StdOut
                 $totalAlloc = $stats.SohAllocatedBytes + $stats.LohAllocatedBytes + $stats.PohAllocatedBytes
                 $summary = [ordered]@{
@@ -624,7 +694,9 @@ foreach ($scenarioId in $Scenarios) {
             "zeroalloc" {
                 $publishDir = Join-Path $root "samples\ZeroAllocApp\publish"
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "ZeroAllocApp.exe") -WorkingDirectory $publishDir `
-                    -Arguments "$DurationSeconds $label" -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase
+                    -Arguments "$DurationSeconds $label" -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase `
+                    -TraceOut $traceOut -TraceDurationSeconds $DurationSeconds -Label $label
+                $pauseSamplesMs = @($run.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $resultJson = Get-ResultLineJson $run.StdOut
                 if (-not $resultJson) { Write-Host $run.StdOut; Write-Host $run.StdErr; throw "No ##RESULT## for $label" }
                 $summary = [ordered]@{
@@ -658,7 +730,9 @@ foreach ($scenarioId in $Scenarios) {
                 $svrRun = Invoke-MonitoredServerRun -ExePath $exePath -WorkingDirectory $root `
                     -Arguments $serveArgs `
                     -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase `
-                    -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds
+                    -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds `
+                    -TraceOut $traceOut -Label $label
+                $pauseSamplesMs = @($svrRun.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $run = [pscustomobject]@{ Series = $svrRun.Series }
                 $summary = [ordered]@{
                     OperationsTotal      = $svrRun.TotalOps
@@ -703,7 +777,9 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
                 $svrRun = Invoke-MonitoredServerRun -ExePath $exePath -WorkingDirectory $root `
                     -Arguments $serveArgs `
                     -ExtraEnv $env2 -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase `
-                    -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds -ReadyTimeoutSeconds 300
+                    -ReadyUrl $baseUrl -RequestUrl $baseUrl -RequestBodyJson $reqBody -RunSeconds $DurationSeconds -ReadyTimeoutSeconds 300 `
+                    -TraceOut $traceOut -Label $label
+                $pauseSamplesMs = @($svrRun.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $run = [pscustomobject]@{ Series = $svrRun.Series }
                 $summary = [ordered]@{
                     OperationsTotal      = $svrRun.TotalOps
@@ -723,7 +799,9 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
             "growingcache" {
                 $publishDir = Join-Path $root "samples\GrowingCacheApp\publish"
                 $run = Invoke-MonitoredRun -ExePath (Join-Path $publishDir "GrowingCacheApp.exe") -WorkingDirectory $publishDir `
-                    -Arguments "$DurationSeconds $label $($scenario.Args)" -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs 3000
+                    -Arguments "$DurationSeconds $label $($scenario.Args)" -ExtraEnv $gcMode.Env -RemoveEnvKeys $gcMode.RemoveEnv -CsvBasePath $csvBase -AttachDelayMs 3000 `
+                    -TraceOut $traceOut -TraceDurationSeconds $DurationSeconds -Label $label
+                $pauseSamplesMs = @($run.PauseSamplesMs | Where-Object { $_ -ne $null })
                 $resultJson = Get-ResultLineJson $run.StdOut
                 if (-not $resultJson) { Write-Host $run.StdOut; Write-Host $run.StdErr; throw "No ##RESULT## for $label" }
                 $summary = [ordered]@{
@@ -777,22 +855,21 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
             if ($cbVals.Count -gt 0) { $summary.TotalCommittedBytes = ($cbVals | Measure-Object -Maximum).Maximum }
         }
 
-        # Percentile/avg stats for the interesting time-series metrics.
-        $pauseVals = @($run.Series["pause_time"] | ForEach-Object { $_.V * 100.0 }) # seconds/sec -> %
-        $pauseMsVals = @($run.Series["pause_time"] | ForEach-Object { $_.V * 1000.0 }) # seconds/sec, ~1s sample window -> ms of pause in that window
+        # Pause distribution comes entirely from the out-of-process event trace
+        # ($pauseSamplesMs, reconstructed by TraceAnalyzer). "over time" plots each
+        # real pause (ms) at its timestamp - no coarse 1Hz counter involved.
         $wsValsAll = @($run.Series["working_set"] | ForEach-Object { $_.V })
-        $allocRateVals = @($run.Series["alloc_rate"] | ForEach-Object { $_.V / 1MB }) # MB/s
+        $allocRateVals = @($run.Series["alloc_rate"] | ForEach-Object { $_.V / 1MB }) # MB/s (event-sourced)
         $opsVals = @($run.Series["operations"] | ForEach-Object { $_.V })
 
         $elapsedWall = (Get-Date) - $runStart
         Write-Host ("  done in {0:N0}s wall (bench duration {1:N1}s), gen0/1/2={2}/{3}/{4}" -f `
             $elapsedWall.TotalSeconds, $durationActual, $summary.Gen0Collections, $summary.Gen1Collections, $summary.Gen2Collections)
 
-        # Exact per-pause STW distribution (see webapi GcPauseCollector): p50/p95/
-        # p99/max computed from every real pause, uniform across all three GCs. This
-        # is the authoritative pause metric; the 1Hz PauseTimeMsStats above is a
-        # coarse counter-derived fallback that misses LXR's sub-5ms pauses. Empty
-        # for scenarios that don't self-report per-pause samples.
+        # Authoritative, event-sourced per-pause STW distribution (out-of-process
+        # dotnet-trace: built-in GCs via GCSuspendEE*, LXRGC via its own GCDynamic
+        # pause events). This is the SINGLE pause metric - the old coarse 1Hz
+        # dotnet-counters pause row has been removed.
         $pauseDistVals = @($pauseSamplesMs | Where-Object { $_ -ne $null } | ForEach-Object { [double]$_ })
         $pauseDistStats = if ($pauseDistVals.Count -gt 0) {
             [ordered]@{
@@ -814,15 +891,13 @@ Question: Summarize the tradeoff between generation 0 and generation 2 collectio
             GcModeName      = $gcMode.DisplayName
             DurationSeconds = $durationActual
             Summary         = $summary
-            PauseTimePctStats = (Get-Stats $pauseVals)
-            PauseTimeMsStats  = (Get-Stats $pauseMsVals)
             PauseDistMsStats  = $pauseDistStats
+            PauseSource       = $(if ($pauseDistVals.Count -gt 0) { "dotnet-trace events" } else { "n/a" })
             WorkingSetStats   = (Get-Stats $wsValsAll)
             AllocRateMBStats  = (Get-Stats $allocRateVals)
             OpsPerSecStats    = (Get-Stats $opsVals)
             TimeSeries = [ordered]@{
-                PauseTimePct = Get-Downsampled (@($run.Series["pause_time"] | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V * 100.0, 4) } }))
-                PauseTimeMs  = Get-Downsampled (@($run.Series["pause_time"] | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V * 1000.0, 3) } }))
+                PauseTimeMs  = Get-Downsampled (@($run.Series["pause_time_ms"] | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V, 3) } }))
                 WorkingSetMB = Get-Downsampled (@($run.Series["working_set"] | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V / 1MB, 2) } }))
                 AllocRateMB  = Get-Downsampled (@($run.Series["alloc_rate"] | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V / 1MB, 2) } }))
                 OpsPerSec    = Get-Downsampled (@($run.Series["operations"] | ForEach-Object { @{ T = $_.T; V = [Math]::Round($_.V, 1) } }))

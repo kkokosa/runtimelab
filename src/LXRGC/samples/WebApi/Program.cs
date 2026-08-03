@@ -8,15 +8,14 @@
 // both can be compared/plotted uniformly.
 
 using System.Diagnostics;
-using System.Diagnostics.Metrics;
 using System.Diagnostics.Tracing;
 using System.Runtime;
 using System.Text.Json;
 
-// Same custom Meter convention as ConsoleApp - lets `dotnet-counters collect`
-// capture a uniform request-throughput time series across both sample apps.
-var meter = new Meter("LXRGC.Bench");
-var opsCounter = meter.CreateCounter<long>("operations", description: "Completed benchmark operations");
+// Throughput surfaced as an IncrementingEventCounter (see BenchEventSource) so a
+// single out-of-process dotnet-trace session - the same one capturing GC events -
+// records a uniform request-throughput series across all sample apps, with no
+// separate dotnet-counters client (which risks a dual-EventPipe-attach hang).
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders(); // keep stdout free for the ##RESULT## line
@@ -29,19 +28,6 @@ var app = builder.Build();
 // (DrainDeferredBigArrays) is exercised on every trace. Held in a static field so
 // it stays a GC root for the process lifetime.
 BigArrayProbe.Start();
-
-// Precise, per-pause STW latency capture (headline metric for a low-pause
-// collector). Two paths, unified into one ms sample list emitted in ##RESULT##:
-//   * built-in Workstation/Server GC: an in-process EventListener on the runtime
-//     GC provider pairs GCSuspendEEBegin -> GCRestartEEEnd events, so every STW
-//     pause is timed exactly (100ns event timestamps).
-//   * standalone LXRGC: fires no ETW/EventPipe GC events, so the listener sees
-//     nothing; instead LXR writes each QPC-timed pause to LXR_PAUSE_LOG, which we
-//     read at the end. (Not attaching an EventListener under LXR also sidesteps
-//     the known EventPipe-attach-during-startup hang.)
-// This replaces the coarse 1Hz "% time in GC" counter the report used before -
-// that sampling missed LXR's sub-5ms pauses entirely (they fell between samples).
-var pauseCollector = GcPauseCollector.Start();
 
 // Per-request handler: simulates a small JSON API endpoint that builds a
 // response object, serializes it, and does a bit of string/list work -
@@ -62,12 +48,12 @@ app.MapGet("/api/ping", () => "pong");
 app.Lifetime.ApplicationStarted.Register(() =>
 {
     // Kick off the self-driving load generator once Kestrel is actually listening.
-    _ = Task.Run(() => RunBenchmarkAndExitAsync(app, opsCounter, pauseCollector));
+    _ = Task.Run(() => RunBenchmarkAndExitAsync(app));
 });
 
 app.Run();
 
-static async Task RunBenchmarkAndExitAsync(WebApplication app, Counter<long> opsCounter, GcPauseCollector pauseCollector)
+static async Task RunBenchmarkAndExitAsync(WebApplication app)
 {
     int durationSeconds = int.TryParse(Environment.GetEnvironmentVariable("LXRGC_BENCH_DURATION_SECONDS"), out var d) ? d : 60;
     string label = Environment.GetEnvironmentVariable("LXRGC_BENCH_LABEL") ?? "run";
@@ -122,7 +108,7 @@ static async Task RunBenchmarkAndExitAsync(WebApplication app, Counter<long> ops
                 int size = rng.Next(5, 50);
                 var resp = await workerClient.GetStringAsync($"/api/work?size={size}");
                 Interlocked.Increment(ref requests);
-                opsCounter.Add(1);
+                BenchEventSource.Log.AddOperations(1);
                 if (resp.Length == -1) Console.WriteLine(resp); // never true; prevents dead-code elimination
             }
             catch
@@ -174,18 +160,6 @@ static async Task RunBenchmarkAndExitAsync(WebApplication app, Counter<long> ops
     result.TotalPauseTimeMs = GC.GetTotalPauseDuration().TotalMilliseconds;
     var pd = memInfo.PauseDurations;
     result.MaxPauseTimeMs = pd.Length > 1 ? pd[1].TotalMilliseconds : (pd.Length > 0 ? pd[0].TotalMilliseconds : 0);
-
-    // Exact per-pause distribution (see GcPauseCollector). When available it is the
-    // authoritative pause source: p50/p95/p99/max computed from every STW pause,
-    // uniform across all three GCs. Overwrites the coarse Max/Total above with the
-    // sample-derived figures so the report shows true tail latency.
-    var pauses = pauseCollector.GetSamplesMs();
-    if (pauses.Count > 0)
-    {
-        result.PauseSamplesMs = pauses;
-        result.MaxPauseTimeMs = pauses.Max();
-        result.TotalPauseTimeMs = pauses.Sum();
-    }
 
     string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = false });
     Console.WriteLine("##RESULT##" + json);
@@ -252,121 +226,24 @@ internal class BenchResult
     public double TotalPauseTimeMs { get; set; }
     public double MaxPauseTimeMs { get; set; }
     public long Errors { get; set; }
-    public List<double>? PauseSamplesMs { get; set; }
 }
 
-// Precise per-pause STW latency capture, unified across all three GCs.
-//
-//  * Built-in Workstation/Server GC: hosts an in-process EventListener on the
-//    runtime GC provider ("Microsoft-Windows-DotNETRuntime", GC keyword 0x1) and
-//    pairs each GCSuspendEEBegin -> GCRestartEEEnd, timing the exact stop-the-world
-//    window from the 100ns event timestamps. This is the same Suspend->Restart
-//    window LXR times internally, so the numbers are directly comparable.
-//  * Standalone LXRGC: fires no ETW/EventPipe GC events, so the listener would see
-//    nothing. Instead the native GC writes each QPC-timed pause to LXR_PAUSE_LOG
-//    (env), which we read at the end. Not attaching an EventListener under LXR also
-//    avoids the known EventPipe-attach-during-startup hang.
-//
-// Both paths yield one flat list of per-pause milliseconds -> p50/p95/p99/max in
-// the report, replacing the coarse 1Hz "% time in GC" counter that missed LXR's
-// sub-5ms pauses between samples.
-internal sealed class GcPauseCollector
+// Throughput counter surfaced as an IncrementingEventCounter so a single
+// dotnet-trace EventPipe session (also capturing GC events) records the
+// per-second "operations" rate - no separate dotnet-counters process and no
+// in-process EventListener (both removed in favour of one out-of-process trace).
+[EventSource(Name = "LXRGC.Bench")]
+internal sealed class BenchEventSource : EventSource
 {
-    private readonly GcEventListener? _listener;
-    private readonly string? _lxrPauseLog;
-
-    private GcPauseCollector(GcEventListener? listener, string? lxrPauseLog)
+    public static readonly BenchEventSource Log = new();
+    private IncrementingEventCounter? _ops;
+    private BenchEventSource() { }
+    protected override void OnEventCommand(EventCommandEventArgs command)
     {
-        _listener = listener;
-        _lxrPauseLog = lxrPauseLog;
+        if (command.Command == EventCommand.Enable)
+            _ops ??= new IncrementingEventCounter("operations", this)
+            { DisplayName = "Completed benchmark operations", DisplayRateTimeScale = TimeSpan.FromSeconds(1) };
     }
-
-    public static GcPauseCollector Start()
-    {
-        // LXRGC is selected via DOTNET_GCName; it self-reports pauses to a file.
-        bool isLxr = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTNET_GCName"));
-        if (isLxr)
-            return new GcPauseCollector(null, Environment.GetEnvironmentVariable("LXR_PAUSE_LOG"));
-        return new GcPauseCollector(new GcEventListener(), null);
-    }
-
-    public List<double> GetSamplesMs()
-    {
-        if (_listener != null)
-            return _listener.Snapshot();
-
-        var list = new List<double>();
-        try
-        {
-            if (!string.IsNullOrEmpty(_lxrPauseLog) && File.Exists(_lxrPauseLog))
-            {
-                // The native GC keeps LXR_PAUSE_LOG open for the whole run (append,
-                // flush per pause), so open with shared read/write access - a plain
-                // File.ReadAllLines would hit a sharing violation and yield nothing.
-                using var fs = new FileStream(_lxrPauseLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var sr = new StreamReader(fs);
-                string? line;
-                while ((line = sr.ReadLine()) != null)
-                {
-                    // "type,micros"
-                    int comma = line.LastIndexOf(',');
-                    if (comma < 0) continue;
-                    if (long.TryParse(line.AsSpan(comma + 1), out long micros) && micros > 0)
-                        list.Add(micros / 1000.0);
-                }
-            }
-        }
-        catch { /* best-effort: a missing/locked log just yields no samples */ }
-        return list;
-    }
-}
-
-internal sealed class GcEventListener : EventListener
-{
-    private const string RuntimeProvider = "Microsoft-Windows-DotNETRuntime";
-    private const EventKeywords GCKeyword = (EventKeywords)0x1;
-    private readonly List<double> _pausesMs = new();
-    private readonly object _lock = new();
-    private DateTime _suspendStart;
-    private bool _inSuspend;
-
-    protected override void OnEventSourceCreated(EventSource source)
-    {
-        // _pausesMs/_lock are already initialized here: C# runs derived field
-        // initializers before the base EventListener constructor (which is what
-        // enumerates existing sources and calls this), so no NRE races the enable.
-        if (source.Name == RuntimeProvider)
-            EnableEvents(source, EventLevel.Informational, GCKeyword);
-    }
-
-    protected override void OnEventWritten(EventWrittenEventArgs e)
-    {
-        // A stop-the-world pause is SuspendEEBegin -> RestartEEEnd (the whole
-        // interval the managed threads are frozen). Event names carry a _V1 suffix
-        // in current runtimes; accept both for forward/backward compatibility.
-        switch (e.EventName)
-        {
-            case "GCSuspendEEBegin_V1":
-            case "GCSuspendEEBegin":
-                lock (_lock) { _suspendStart = e.TimeStamp; _inSuspend = true; }
-                break;
-            case "GCRestartEEEnd_V1":
-            case "GCRestartEEEnd":
-                lock (_lock)
-                {
-                    if (_inSuspend)
-                    {
-                        double ms = (e.TimeStamp - _suspendStart).TotalMilliseconds;
-                        if (ms >= 0) _pausesMs.Add(ms);
-                        _inSuspend = false;
-                    }
-                }
-                break;
-        }
-    }
-
-    public List<double> Snapshot()
-    {
-        lock (_lock) return new List<double>(_pausesMs);
-    }
+    [NonEvent] public void AddOperations(double count) => _ops?.Increment(count);
+    protected override void Dispose(bool disposing) { _ops?.Dispose(); base.Dispose(disposing); }
 }

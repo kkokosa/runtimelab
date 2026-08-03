@@ -15,12 +15,10 @@
 // should show near-identical throughput, ~0 collections, and flat memory.
 
 using System.Diagnostics;
-using System.Diagnostics.Metrics;
+using System.Diagnostics.Tracing;
 using System.Runtime;
 using System.Text.Json;
 
-var meter = new Meter("LXRGC.Bench");
-var opsCounter = meter.CreateCounter<long>("operations", description: "Completed benchmark operations");
 
 int durationSeconds = args.Length > 0 && int.TryParse(args[0], out var d) ? d : 60;
 string label = args.Length > 1 ? args[1] : "run";
@@ -59,7 +57,7 @@ while (sw.Elapsed < deadline)
     MatMul(a, b, c, N);
     checksumBits += BitConverter.SingleToInt32Bits(c[(int)(ops % (N * N))]);
     ops++;
-    opsCounter.Add(1);
+    BenchEventSource.Log.AddOperations(1);
 }
 
 sw.Stop();
@@ -134,4 +132,23 @@ internal class BenchResult
     public long TotalCommittedBytes { get; set; }
     public double PauseTimePercentage { get; set; }
     public long Checksum { get; set; }
+}
+
+// Throughput counter surfaced as an IncrementingEventCounter so a single
+// dotnet-trace EventPipe session (also capturing GC events) records the
+// per-second "operations" rate - no separate dotnet-counters process.
+[EventSource(Name = "LXRGC.Bench")]
+internal sealed class BenchEventSource : EventSource
+{
+    public static readonly BenchEventSource Log = new();
+    private IncrementingEventCounter? _ops;
+    private BenchEventSource() { }
+    protected override void OnEventCommand(EventCommandEventArgs command)
+    {
+        if (command.Command == EventCommand.Enable)
+            _ops ??= new IncrementingEventCounter("operations", this)
+            { DisplayName = "Completed benchmark operations", DisplayRateTimeScale = TimeSpan.FromSeconds(1) };
+    }
+    [NonEvent] public void AddOperations(double count) => _ops?.Increment(count);
+    protected override void Dispose(bool disposing) { _ops?.Dispose(); base.Dispose(disposing); }
 }
