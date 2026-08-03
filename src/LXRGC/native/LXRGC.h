@@ -230,6 +230,16 @@ public:
     uint8_t* HeapBase()  const { return m_heapBase; }
     size_t   HeapBytes() const { return m_heapBytes; }
 
+    // --- Heap-page committed side metadata (paper §L427/§L512: LXR keeps state in
+    // side metadata addressed by O(1) arithmetic). 1 bit per OS page of the object
+    // heap reservation: set when the page is MEM_COMMIT'd, cleared when it is
+    // MEM_DECOMMIT'd. Replaces the per-object VirtualQuery in LXRRegionCommitted so
+    // the concurrent mark scan and the STW finish closure never issue a syscall
+    // (which convoyed all mark lanes on the kernel VAD lock -> >20s "hang"). ---
+    void HeapPagesCommit(uint8_t* addr, size_t size);    // set bits for [addr,addr+size)
+    void HeapPagesDecommit(uint8_t* addr, size_t size);  // clear bits for [addr,addr+size)
+    bool HeapPageCommitted(uint8_t* addr) const;         // syscall-free committed test
+
     // --- RC side table (1 byte of saturating count per 8-byte granule) ---
     uint8_t* RCSlot(Object* obj) const;
     void EnsureRCPage(uint8_t* slot); // lazily commit the RC-table page backing slot (per-page bit cache)
@@ -423,6 +433,11 @@ public:
     void ReclaimMatureByRC();
 
     lxr::BlockMeta* MetaForBlock(uint8_t* blockAddr);
+    // (A) selective mature-RC reclaim (paper §3.3): mark the block containing obj
+    // as decrement-dirty, and test/clear all dirty bits in a region range. Only
+    // dirty regions are re-scanned by ReclaimMatureByRC.
+    void MarkRCDirty(Object* obj);
+    bool AnyRCDirtyInRegionAndClear(uint8_t* start, uint8_t* end);
     // Young-object nursery (LXR difference #6). StampBornEpoch marks the blocks
     // spanned by a freshly (re)registered allocation region with the current
     // inter-trace window id; IsYoung reports whether an object still lives in the
@@ -519,6 +534,8 @@ public:
     void DrainMarkStack();              // transitive closure via GCScanObjectRefs
     void ParallelDrainMarkStack(int workers); // P5: parallel transitive closure
     void DrainSliceLocal(std::vector<Object*>& local); // drain one worker's grey set
+    void DrainMarkStackShared();        // P5/§3.5: shared-stack parallel drain (load-balanced)
+    void ScanObjectRefsInto(Object* o, size_t osz, std::vector<Object*>& out); // per-object edge scan
     void DrainClosure();                // parallel or serial closure per LXR_GC_THREADS
     // Item G (§3.5): partition the scan of a single very large reference array
     // across the mark pool. A lane that meets such an array defers it (marks it,
@@ -578,10 +595,19 @@ private:
     size_t          m_loggedCommittedBytes = 0; // committed logged-table prefix (bytes)
     lxr::BlockMeta* m_blockMeta = nullptr;   // 1 entry / 32 KiB block
     size_t          m_blockCount = 0;
+    uint8_t*        m_rcDirty = nullptr;     // (A) selective mature-RC reclaim: 1 byte
+                                             // per 32 KiB block, set when any object
+                                             // in the block is decremented since the
+                                             // last ReclaimMatureByRC pass. A separate
+                                             // side array (not in BlockMeta) so the
+                                             // hot decrement path avoids the lazily-
+                                             // committed BlockMeta cacheline.
     uint8_t*        m_metaPageCommitted = nullptr; // 1 bit / block-meta-table page: committed?
     size_t          m_metaPageCount = 0;
     uint8_t*        m_rcPageCommitted = nullptr;   // 1 bit / RC-table page: committed?
     size_t          m_rcPageCount = 0;
+    uint8_t*        m_heapPageCommitted = nullptr; // 1 bit / heap OS page: committed? (side metadata)
+    size_t          m_heapPageCount = 0;
     volatile int64_t m_reclaimedBytes = 0;   // cumulative bytes decommitted by sweeps
     // Deferred-RC root buffers (see CaptureRoots). Only ever touched by the single
     // collection thread, at STW pauses or the serialized off-pause drain, so no

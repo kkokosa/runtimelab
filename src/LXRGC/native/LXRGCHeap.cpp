@@ -112,6 +112,7 @@ static thread_local ThreadHeapState t_threadHeap;
 struct FrozenSegment
 {
     uint8_t* Base;
+    uint8_t* FirstObject; // pvMem + ibFirstObject: start of the first parseable object
     uint8_t* Allocated;
     uint8_t* Committed;
     uint8_t* Reserved;
@@ -688,7 +689,57 @@ static CRITICAL_SECTION     g_markSpillLock;       // (retained for future use)
 static volatile LONG64      g_markerParkCount = 0; // diagnostic: parks served
 static volatile LONG64      g_windowReclaims  = 0; // diagnostic: RC pauses that reclaimed young mid-trace-window via the park
 static volatile LONG        g_markerReclaimSafe = 0; // driver parked the marker; window reclaim is safe now
-
+// Set while the background marker is running its OFF-PAUSE ConcurrentTraceDrain.
+// The off-pause drain must NOT use the parallel worker pool: those workers are
+// shared with the RC-pause reclaimers' RunOnPool and with the marker-park
+// handshake, and dispatching the pool off-pause (holding g_poolLock across a
+// wake->join while a concurrent RC pause parks lanes / wants the pool) livelocks
+// the 16-thread unified config (empirically: LXR_GC_THREADS=1 terminates,
+// LXR_GC_THREADS=16 hangs with the window stuck open). Parallel marking is instead
+// applied at the STW finish/backup-trace pauses (DrainClosure below), where the
+// pool is uncontended (mutators suspended, no concurrent RC pause). So DrainClosure
+// forces the serial DrainMarkStack whenever this flag is set. Paper-aligned: the
+// concurrent collector is a background tracer; scalability/parallelism is exploited
+// at the pauses.
+static volatile LONG        g_offPauseDrain     = 0;
+// Set to 1 ONLY while the marker runs its OFF-PAUSE *parallel* drain
+// (DrainMarkStackShared, LXR_OFFPAUSE_PARALLEL=1), and 0 during the STW finish/
+// backup-trace drain (which also uses DrainMarkStackShared but MUST complete the
+// closure). The shared-stack drain consults this flag for the same prompt-finish
+// bail the serial path gets via g_offPauseDrain: under heavy continuous mutation a
+// single shared drain round never empties the grey set (mutators keep greying newly
+// reachable objects), so checking the finish signal only between rounds keeps the
+// trace window open for hundreds of RC epochs. When set AND a finish is signalled
+// (g_traceForceFinish / g_forceSyncTrace), each lane flushes its local greys back to
+// the shared g_markStack and returns, so the window closes at object-scan granularity
+// and the STW finish (which re-scans all roots+handles and drains the retained shared
+// stack) completes the closure -> no missed liveness, bounded footprint.
+static volatile LONG        g_offPauseParallelDrain = 0;
+// The mark-stack drain loop (DrainMarkStack) consults g_offPauseDrain to bail out
+// PROMPTLY -- at object-scan granularity, not only between drain rounds -- when a
+// window finish is signalled (g_traceForceFinish / g_forceSyncTrace). Under heavy
+// continuous mutation a single drain round can run for seconds, so checking the
+// finish signal only between rounds let the trace window stay open for hundreds of
+// RC epochs (footprint + a multi-second batched finish). Bailing at the checkpoint
+// closes the window immediately; sound because the STW finish pause re-scans all
+// roots+handles and completes the closure (residual greys stay on g_markStack and
+// are mopped up there). g_offPauseDrain is 1 ONLY during the serial off-pause drain,
+// where bailed greys remain on the shared g_markStack -- so the bail cannot lose a
+// grey. It is 0 during the STW finish and during the (experimental) parallel
+// off-pause drain, so neither bails.
+static volatile LONG64      g_markerRoundHeartbeat = 0; // bumped each ConcurrentTraceDrain round
+// LXR_OFFPAUSE_PARALLEL (default 0): experimental. When 1, the OFF-PAUSE concurrent
+// marker drains with the parallel worker pool instead of the single collector
+// thread. The earlier "parallel off-pause deadlock" was actually the per-object
+// VirtualQuery convoy (all lanes stuck in ZwQueryVirtualMemory on the VAD lock,
+// unable to reach the marker-park checkpoints); now that the committed test is the
+// syscall-free side-metadata bitmap, parallel off-pause may be safe + far faster.
+static int LXROffPauseParallel()
+{
+    static int v = -1;
+    if (v < 0) v = (getenv("LXR_OFFPAUSE_PARALLEL") != nullptr) ? 1 : 0;
+    return v;
+}
 static inline bool LXRMarkerParkEnabled()
 {
     if (g_markerParkEnabled < 0)
@@ -738,6 +789,19 @@ static bool LXRRequestMarkerPark()
                       // park-checkpointed mark lane) and spanned pauses skip
                       // ProcessModifiedBuffers so RC isn't authoritative yet -> defer
                       // reclaim this pause rather than race the decrement replay.
+    if (g_traceForceFinish)
+        return false; // Span cap hit: we have decided to finalize this window. STOP
+                      // parking the marker for reclaim so it gets full CPU to drain
+                      // its current round, reach the ConcurrentTraceDrain ff-check,
+                      // quiesce (g_markerQuiescent=1), and let the next pause run
+                      // meFinish (which reclaims under STW). Otherwise, back-to-back
+                      // long spanned RC pauses (their ProcessModifiedBuffers backlog
+                      // grows as the window stays open) park the marker ~continuously
+                      // so it never completes a round to observe g_traceForceFinish;
+                      // the window then never closes -> footprint drift + a multi-
+                      // second me:finish hang forced only at teardown. Reclaim is
+                      // deferred (skipBuffersForSpan) for the handful of epochs until
+                      // mq flips; the finish pause reclaims, so footprint stays bounded.
     InterlockedExchange(&g_markParkReq, 1);
     // Wait until every lane committed to scanning has reached a checkpoint and
     // parked. active==parked (including 0==0 when idle) means no lane is touching
@@ -917,6 +981,21 @@ static int     g_poolActiveLanes = 1;
 // pause may briefly wait for an in-flight marker drain to finish, which is a
 // latency cost, not a hang.
 static CRITICAL_SECTION g_poolLock;
+
+// P5 / paper §3.5 (work distribution): the parallel mark closure shares ONE grey
+// stack (g_markStack/g_markTop) across all lanes instead of statically partitioning
+// the seed set into per-lane slices. Static partitioning load-imbalances badly --
+// a lane whose seed objects lead into a large connected component closes that whole
+// subgraph ALONE while the other lanes finish their (leaf) slices and idle; the
+// marker then blocks in the join for many seconds (observed: mtop~600k drained by
+// one lane, 14 idle, window spans unbounded). With a shared stack, lanes pull grey
+// batches from it and shed discovered overflow back to it, so idle lanes steal work
+// discovered by busy lanes. g_markStackLock guards batch pop/push + the active-lane
+// count; g_markShareActive is the count of lanes still holding work (termination:
+// a lane goes idle only when its local AND the shared stack are empty, so the count
+// hits 0 exactly when the whole closure is done).
+static CRITICAL_SECTION g_markStackLock;
+static volatile LONG     g_markShareActive = 0;
 static volatile LONG64 g_parRCApplies = 0; // item G diagnostic: epochs applied in parallel
 static volatile LONG64 g_serRCApplies = 0; // item G diagnostic: epochs applied serially
 
@@ -1247,6 +1326,40 @@ static CRITICAL_SECTION g_chunkLock;
 // entry is decommitted. Serialized by the single-driver collection loop, so the
 // drain always completes before the next sweep.
 static int g_deferDecommit = 1;
+// Committed-validated object scan on the concurrent stale-reference paths
+// (LXR_SCAN_SAFE, default ON). Uses LXRObjectSizeSafe instead of LXRObjectSize in
+// the parallel/concurrent mark drain and the RC zero-count drain so a stale ref
+// into reclaimed(+reused/decommitted) memory is skipped instead of faulting.
+static int g_scanSafe = 1;
+// (A) selective mature-RC reclaim (paper §3.3, line 448: "selectively sweeps those
+// blocks containing objects which received a decrement"). Default ON;
+// LXR_SELECTIVE_MATURE_RC=0 restores the full O(heap) per-pass scan for A/B.
+static int g_selectiveMatureRC = 1;
+// Paper §3.2.2 (line 427) "SATB with Interruptions" invariant, verbatim in MMTk
+// reference LXR (wenyuzhao/mmtk-core lxr-x/simplified, ProcessDecs::process_dead_object):
+// "RC may never delete an unmarked object while an SATB trace is underway ...
+// immediately marking and scanning any mature object that RC determines is dead
+// if the SATB has not already marked it." When RC drives a MATURE object to death
+// (RC 1->0) during an active concurrent trace, we grey (mark + enqueue) its
+// still-unmarked MATURE referents BEFORE the object's space is reclaimed, so the
+// trace never loses part of the snapshot reachable only through the dying object
+// (e.g. a mature referrer freed by RC with no write-barrier firing on the edge it
+// held). This is what lets young+mature reclaim run DURING the trace window
+// instead of being globally suppressed (the footprint-balloon fix). Adaptation vs
+// MMTk: we do NOT set the mark bit on the dying object itself (our mark bit is the
+// sweep's liveness authority, so marking a dead object would wrongly retain its
+// block); the committed-validated stale-ref scan (LXR_SCAN_SAFE) + deferred reuse
+// keep the tracer from ever scanning the freed object. Default ON.
+static int g_markDeadScan = 1;
+static volatile LONG64 g_markDeadGreyed = 0; // referents greyed by the invariant
+// Monotonic generation of the committed page map. Bumped after every physical
+// MEM_DECOMMIT so the per-thread committed-region caches used by LXRRegionCommitted
+// / LXRObjectSizeSafe can detect that their cached "committed" verdict may be stale
+// (a region freed since the cache was filled) and re-query. Without this, a cache
+// filled in one GC cycle wrongly reports a since-decommitted region as committed in
+// a later cycle -> the drain follows a stale pointer into freed pages and AVs.
+static volatile LONG64 g_committedGen = 0;
+static inline void LXRBumpCommittedGen() { InterlockedIncrement64(&g_committedGen); }
 // In-window physical reclaim of young regions (LXR_INWINDOW_DECOMMIT, default ON).
 // While a multi-epoch trace window is open, CollectNursery reclaims ONLY young
 // regions that lie entirely above the snapshot high-water AND carry no mark bit,
@@ -1389,6 +1502,84 @@ size_t LXRObjectSize(Object* o)
     return (size + (sizeof(void*) - 1)) & ~(size_t)(sizeof(void*) - 1);
 }
 
+// True iff every OS page overlapping [addr, addr+len) is committed in the object-
+// heap side-metadata bitmap (paper §L427/§L512: LXR state lives in O(1) address-
+// indexed side metadata). Syscall-free: len/pageSize bit tests against the bitmap
+// maintained at every heap MEM_COMMIT / MEM_DECOMMIT site. Replaces the old per-
+// object VirtualQuery whose 1-entry cache thrashed on the fragmented multi-epoch
+// heap (and whose syscalls convoyed all mark lanes on the kernel VAD lock -> the
+// >20s STW-finish "hang"). A clear bit means never-committed OR reclaimed
+// (decommitted) memory -> the caller must skip the stale/dangling reference.
+static inline bool LXRHeapRangeCommitted(uint8_t* addr, size_t len)
+{
+    uint8_t* p   = (uint8_t*)((uintptr_t)addr & ~((uintptr_t)g_pageSize - 1));
+    uint8_t* end = addr + (len ? len : 1);
+    for (; p < end; p += g_pageSize)
+        if (!g_lxrCollector.HeapPageCommitted(p)) return false;
+    return true;
+}
+
+// Committed test for a MethodTable pointer. MTs live in the runtime's loader/type
+// memory, NOT in the object heap, so the heap bitmap does not cover them; use a
+// PERSISTENT thread-local region cache (loaded modules are not decommitted, so it
+// is never invalidated - unlike the old g_committedGen-invalidated cache that
+// re-VirtualQueried on every heap decommit). After warmup all real MTs cluster in
+// a few module regions -> ~zero syscalls. A miss costs one VirtualQuery.
+static bool LXRMethodTableCommitted(uint8_t* mt)
+{
+    thread_local uint8_t* cBase = nullptr;
+    thread_local size_t   cLen = 0;
+    thread_local bool     cCommitted = false;
+    if (mt < cBase || mt >= cBase + cLen)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(mt, &mbi, sizeof(mbi)) == 0) { cBase = nullptr; cLen = 0; cCommitted = false; return false; }
+        cBase = (uint8_t*)mbi.BaseAddress; cLen = mbi.RegionSize;
+        cCommitted = (mbi.State == MEM_COMMIT);
+    }
+    return cCommitted;
+}
+
+// Committed-validated object size for the stale-reference-prone concurrent paths.
+// Unlike LXRObjectSize (which only range-checks the MethodTable pointer and so
+// still dereferences a wild-but-plausible MT read from reclaimed-then-reused
+// memory, e.g. 0x310060, and faults in GetBaseSize()), this confirms BOTH that
+// 'o's own header + MethodTable are committed, AND that the whole object extent
+// [o, o+sz) is committed, before trusting any of it. Returns 0 (skip) for any
+// stale/decommitted/reused reference. All heap checks hit the O(1) side-metadata
+// bitmap; the MT check hits a persistent module-region cache.
+static size_t LXRObjectSizeSafe(Object* o)
+{
+    uint8_t* op = (uint8_t*)o;
+    // The object header (MethodTable pointer + array length = 2 words) must be
+    // committed before we read it. A stale/interior reference can point at the
+    // last bytes of a committed page whose successor page was decommitted
+    // (reclaimed chunks decommit only their PAGE-ALIGNED interior), so validate
+    // the full header span, not just o's first byte.
+    if (!LXRHeapRangeCommitted(op, 2 * sizeof(void*)))
+        return 0; // object's header page reclaimed/decommitted/never-committed
+    MethodTable* mt = *(MethodTable**)o; // safe: header pages validated committed
+    uintptr_t m = (uintptr_t)mt;
+    if (m == 0 || (m & 7) != 0 || m < 0x10000ull || m > 0x00007FFFFFFFFFFFull)
+        return 0;
+    // A real MethodTable never lives inside the GC object heap; an MT value that
+    // does is garbage read from reused memory -> reject in O(1) with no syscall.
+    if (op != nullptr && (uint8_t*)mt >= g_lxrCollector.HeapBase() &&
+        (uint8_t*)mt < g_lxrCollector.HeapBase() + g_lxrCollector.HeapBytes())
+        return 0;
+    if (!LXRMethodTableCommitted((uint8_t*)mt))
+        return 0; // wild/reclaimed MethodTable -> stale reused object
+    size_t sz = LXRObjectSize(o);
+    if (sz == 0)
+        return 0;
+    // The whole object body must be committed (a wild size from reused memory, or
+    // a stale ref straddling into a decommitted neighbour, is rejected before the
+    // field scan reads it).
+    if (!LXRHeapRangeCommitted(op, sz))
+        return 0; // object body straddles decommitted/never-committed memory
+    return sz;
+}
+
 static size_t CommitRange(uint8_t* start, size_t size)
 {
     uint8_t* pbeg = (uint8_t*)(((uintptr_t)start + g_pageSize - 1) & ~((uintptr_t)g_pageSize - 1));
@@ -1396,6 +1587,7 @@ static size_t CommitRange(uint8_t* start, size_t size)
     if (pend > pbeg)
     {
         VirtualAlloc(pbeg, pend - pbeg, MEM_COMMIT, PAGE_READWRITE);
+        g_lxrCollector.HeapPagesCommit(pbeg, (size_t)(pend - pbeg)); // publish AFTER commit
         return (size_t)(pend - pbeg);
     }
     return 0;
@@ -1535,6 +1727,7 @@ static uint8_t* ReuseFreeRun(gc_alloc_context* owner, size_t needBytes, size_t h
             if (ie > ib)
             {
                 VirtualAlloc(ib, (size_t)(ie - ib), MEM_COMMIT, PAGE_READWRITE);
+                g_lxrCollector.HeapPagesCommit(ib, (size_t)(ie - ib)); // publish AFTER commit
                 InterlockedExchangeAdd64(&g_committedInUse, (int64_t)(ie - ib));
                 InterlockedExchangeAdd64(&g_freeRunDecommittedBytes, -(int64_t)(ie - ib));
             }
@@ -1633,7 +1826,9 @@ static int64_t DecommitIdleFreeRuns(int64_t capBytes)
         uint8_t* ib = (uint8_t*)(((uintptr_t)c.Start + ps - 1) & ~(ps - 1));
         uint8_t* ie = (uint8_t*)(((uintptr_t)(c.Start + c.Size)) & ~(ps - 1));
         if (ie <= ib) continue; // < 1 whole interior page: nothing to reclaim
+        g_lxrCollector.HeapPagesDecommit(ib, (size_t)(ie - ib)); // clear BEFORE decommit
         VirtualFree(ib, (size_t)(ie - ib), MEM_DECOMMIT);
+        LXRBumpCommittedGen();
         c.FreeRunDecommitted = true;
         // Make the region parse as empty so any linear [Start,UsedEnd) heap walker
         // skips it (the interior pages are gone). Size is untouched, so ReuseFreeRun
@@ -1676,6 +1871,17 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     m_rcPageCount = (rcTableBytes + g_pageSize - 1) / g_pageSize;
     m_rcPageCommitted = (uint8_t*)calloc((m_rcPageCount + 7) / 8, 1);
 
+    // Heap-page committed side metadata (paper §L427/§L512): 1 bit per OS page of
+    // the object-heap reservation. Starts all-zero (nothing committed); pages are
+    // committed lazily on the allocation path. LXRRegionCommitted consults this in
+    // O(1) instead of a per-object VirtualQuery. For a 16 GB reservation at 4 KB
+    // pages this bitmap is only 512 KB; commit it up front (calloc) so the hot
+    // mark-scan lookup never faults or syscalls.
+    m_heapPageCount = (heapReservedBytes + g_pageSize - 1) / g_pageSize;
+    m_heapPageCommitted = (uint8_t*)calloc((m_heapPageCount + 7) / 8, 1);
+    if (m_heapPageCommitted == nullptr)
+        return false;
+
     // Mark side table for the backup trace: 1 bit per 8-byte granule. Reserved
     // only; committed on touch and decommitted wholesale after each trace to
     // reset every bit to zero.
@@ -1706,6 +1912,10 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     // syscall once a page is committed. Was costing ~1us/field (~4ms/RC pause).
     m_metaPageCount = (metaBytes + g_pageSize - 1) / g_pageSize;
     m_metaPageCommitted = (uint8_t*)calloc((m_metaPageCount + 7) / 8, 1);
+    // (A) selective mature-RC reclaim: 1 committed byte per block. m_blockCount is
+    // heapReserved/32KB; even a 64 GB reservation is only 2 MB here, so commit it
+    // up front (avoids any lazy-commit in the hot decrement path).
+    m_rcDirty = (uint8_t*)calloc(m_blockCount, 1);
 
     // Immix line-mark side table: 1 bit per 256 B line. Reserved only; committed
     // and zeroed per trace over the used-heap prefix (see ResetMarks). Enables
@@ -1741,6 +1951,7 @@ bool LXRCollector::Initialize(uint8_t* heapBase, size_t heapReservedBytes)
     InitializeCriticalSection(&g_evacEdgeLock);
     InitializeCriticalSection(&g_dcopyEdgeLock);
     InitializeCriticalSection(&g_poolLock);
+    InitializeCriticalSection(&g_markStackLock);
     InitializeCriticalSection(&g_chunkLock);
     InitializeCriticalSection(&g_bigArrayLock);
     InitializeCriticalSection(&g_markSpillLock);
@@ -1838,6 +2049,42 @@ lxr::BlockMeta* LXRCollector::MetaForBlock(uint8_t* blockAddr)
     return &m_blockMeta[idx];
 }
 
+// (A) selective mature-RC reclaim: mark the 32 KiB block containing obj as
+// decrement-dirty. Called from both RC decrement choke points (RCDecrement and
+// RCDecrementAtomic). A plain committed-array store (no MetaForBlock / no
+// VirtualAlloc); a racing set from parallel RC lanes is a benign idempotent 1.
+void LXRCollector::MarkRCDirty(Object* obj)
+{
+    if (!g_selectiveMatureRC || m_rcDirty == nullptr)
+        return;
+    if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
+        return;
+    size_t idx = (size_t)((uint8_t*)obj - m_heapBase) / lxr::kBlockSize;
+    if (idx < m_blockCount)
+        m_rcDirty[idx] = 1;
+}
+
+// Test whether any block in [start,end) is decrement-dirty, clearing every dirty
+// bit as it goes (the region is being examined this pass, so its dirt is
+// consumed). Returns true if at least one block was dirty.
+bool LXRCollector::AnyRCDirtyInRegionAndClear(uint8_t* start, uint8_t* end)
+{
+    if (m_rcDirty == nullptr || start < m_heapBase)
+        return true; // fail-safe: examine the region
+    size_t bi = (size_t)(start - m_heapBase) / lxr::kBlockSize;
+    size_t be = (size_t)((end - 1) - m_heapBase) / lxr::kBlockSize;
+    bool any = false;
+    for (size_t i = bi; i <= be && i < m_blockCount; i++)
+    {
+        if (m_rcDirty[i])
+        {
+            any = true;
+            m_rcDirty[i] = 0;
+        }
+    }
+    return any;
+}
+
 // #6 young-object nursery. Stamp every 32 KiB block spanned by a freshly
 // (re)registered allocation region with the current inter-trace window id, so
 // objects born in the region are recognised as young until the next trace ages
@@ -1854,6 +2101,14 @@ void LXRCollector::StampBornEpoch(uint8_t* start, size_t size)
         lxr::BlockMeta* meta = MetaForBlock(blk);
         if (meta != nullptr)
             meta->bornTraceEpoch = epoch;
+        // (A) fresh/reused region: clear any stale decrement-dirty mark so the
+        // recycled blocks start clean.
+        if (m_rcDirty != nullptr)
+        {
+            size_t idx = (size_t)(blk - m_heapBase) / lxr::kBlockSize;
+            if (idx < m_blockCount)
+                m_rcDirty[idx] = 0;
+        }
     }
 }
 
@@ -1989,6 +2244,58 @@ void LXRCollector::EnsureRCPage(uint8_t* slot)
     }
 }
 
+// --- Heap-page committed side metadata (paper §L427/§L512) -------------------
+// Set/clear the per-OS-page committed bits for [addr, addr+size). The range must
+// match the exact extent handed to VirtualAlloc(MEM_COMMIT)/VirtualFree(MEM_
+// DECOMMIT) so the bitmap tracks the true committed state page-for-page. Commit:
+// publish the bits AFTER the physical MEM_COMMIT so a concurrent reader that sees
+// a set bit always finds a readable page. Decommit: clear the bits BEFORE the
+// physical MEM_DECOMMIT so a reader that sees a set bit still finds the page
+// mapped (the actual decommit races are already serialized under g_chunkLock /
+// the STW pause / the marker-park handshake, exactly as the old VirtualQuery was).
+void LXRCollector::HeapPagesCommit(uint8_t* addr, size_t size)
+{
+    if (m_heapPageCommitted == nullptr || size == 0) return;
+    uint8_t* a = addr; uint8_t* end = addr + size;
+    if (a < m_heapBase) a = m_heapBase;
+    if (end > m_heapBase + m_heapBytes) end = m_heapBase + m_heapBytes;
+    if (a >= end) return;
+    size_t p0 = (size_t)((uintptr_t)a - (uintptr_t)m_heapBase) / g_pageSize;
+    size_t p1 = (size_t)(((uintptr_t)end - 1) - (uintptr_t)m_heapBase) / g_pageSize;
+    for (size_t pg = p0; pg <= p1 && pg < m_heapPageCount; pg++)
+        m_heapPageCommitted[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+}
+
+void LXRCollector::HeapPagesDecommit(uint8_t* addr, size_t size)
+{
+    if (m_heapPageCommitted == nullptr || size == 0) return;
+    uint8_t* a = addr; uint8_t* end = addr + size;
+    if (a < m_heapBase) a = m_heapBase;
+    if (end > m_heapBase + m_heapBytes) end = m_heapBase + m_heapBytes;
+    if (a >= end) return;
+    size_t p0 = (size_t)((uintptr_t)a - (uintptr_t)m_heapBase) / g_pageSize;
+    size_t p1 = (size_t)(((uintptr_t)end - 1) - (uintptr_t)m_heapBase) / g_pageSize;
+    for (size_t pg = p0; pg <= p1 && pg < m_heapPageCount; pg++)
+        m_heapPageCommitted[pg >> 3] &= (uint8_t)~(1u << (pg & 7));
+}
+
+// O(1) syscall-free committed test for an object-heap address. A clear bit means
+// the page was never committed or has been reclaimed (decommitted) -> the caller
+// must skip the (stale/dangling) reference rather than dereference it. Falls back
+// to VirtualQuery only if the bitmap failed to allocate at Init (degenerate).
+bool LXRCollector::HeapPageCommitted(uint8_t* addr) const
+{
+    if (m_heapPageCommitted == nullptr)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        return VirtualQuery(addr, &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT;
+    }
+    if (addr < m_heapBase || addr >= m_heapBase + m_heapBytes) return false;
+    size_t pg = (size_t)((uintptr_t)addr - (uintptr_t)m_heapBase) / g_pageSize;
+    if (pg >= m_heapPageCount) return false;
+    return (m_heapPageCommitted[pg >> 3] & (uint8_t)(1u << (pg & 7))) != 0;
+}
+
 void LXRCollector::RCIncrement(Object* obj)
 {
     if ((uint8_t*)obj < m_heapBase || (uint8_t*)obj >= m_heapBase + m_heapBytes)
@@ -2013,6 +2320,7 @@ bool LXRCollector::RCDecrement(Object* obj)
     if (*slot == 0 || *slot == 0xFF)
         return false; // already zero, or stuck-high (resolved by backup trace)
     (*slot)--;
+    MarkRCDirty(obj);
     return (*slot == 0);
 }
 
@@ -2053,7 +2361,10 @@ bool LXRCollector::RCDecrementAtomic(Object* obj)
             return false;
         char nxt = (char)(u - 1);
         if (_InterlockedCompareExchange8(p, nxt, cur) == cur)
+        {
+            MarkRCDirty(obj);
             return (u - 1) == 0;                // exactly one worker sees the 1->0 edge
+        }
     }
 }
 
@@ -2718,9 +3029,28 @@ void LXRCollector::DrainZeroCountWorkList()
         // A stale/half-initialized referent (null or corrupt MethodTable) must
         // not be dereferenced by the object scan; LXRObjectSize returns 0 for
         // such granules. Skip it - its region was reclaimed or it is not yet a
-        // real object, so there is nothing to recurse into.
-        size_t sz = LXRObjectSize(dead);
+        // real object, so there is nothing to recurse into. The safe variant also
+        // validates that the MethodTable page is committed (a wild-but-plausible
+        // MT read from reclaimed+reused memory, e.g. 0x310060, passes the coarse
+        // range check yet faults when GetBaseSize() dereferences it) and that the
+        // whole object extent is committed.
+        size_t sz = g_scanSafe ? LXRObjectSizeSafe(dead) : LXRObjectSize(dead);
         if (sz == 0)
+            continue;
+        // The committed check above only validated 'dead's START page. 'dead' can
+        // be a STALE/WILD pointer (a modified-buffer old-value t_n whose object was
+        // reclaimed in a prior pause) whose reused-memory MethodTable yields a bogus
+        // (often large) size, OR a stale ref that straddles from a still-committed
+        // chunk into an ADJACENT reclaimed+decommitted chunk (c.Committed=0, pages
+        // freed off-pause by DrainPendingDecommit). Scanning [dead, dead+sz) would
+        // then read a decommitted page and fault inside GCScanObjectRefs (observed:
+        // fault on a field ~1KB into the object, in a chunk whose committed=0). The
+        // START-only guard cannot catch this. Require the WHOLE extent to fall
+        // inside the same committed region: our heap's committed pages share one
+        // protection, so contiguous committed chunks coalesce into a single
+        // VirtualQuery region -> a genuine object never crosses the boundary, while
+        // a wild/straddling extent does. Skip it if it does.
+        if ((uint8_t*)dead + sz > cacheBase + cacheLen)
             continue;
         uint8_t* blk = (uint8_t*)((uintptr_t)dead & ~(lxr::kBlockSize - 1));
         lxr::BlockMeta* meta = MetaForBlock(blk);
@@ -2729,10 +3059,31 @@ void LXRCollector::DrainZeroCountWorkList()
 
         // Recursive decrement: dropping 'dead' releases one reference from each
         // object it points at. Any referent that hits zero cascades.
-        GCScanObjectRefs(dead, sz, [this](Object** ref)
+        //
+        // §3.2.2 (L427) mark-and-scan-before-free: if a concurrent SATB trace is
+        // underway and we are the parked-reclaim owner (g_markerReclaimSafe -> the
+        // mark lanes are quiesced at an object-granular checkpoint, so PushMark's
+        // g_markStack write is race-free; greys resume in place on unpark), grey
+        // the DYING MATURE object's still-unmarked MATURE referents so the trace
+        // stays closed over the snapshot subgraph reachable only through it. Young
+        // referents are excluded: young objects born this window are not part of
+        // the snapshot (implicitly-dead optimization), and a surviving young got an
+        // RC increment from a live referrer, so RC already keeps it. We do NOT mark
+        // 'dead' (see g_markDeadScan decl): our mark bit is the sweep's liveness
+        // authority; the committed-safe scan protects the tracer from the corpse.
+        bool greyDead = g_markDeadScan && g_traceState == TRACE_MARKING &&
+                        g_markerReclaimSafe && !IsYoung(dead);
+        GCScanObjectRefs(dead, sz, [this, greyDead](Object** ref)
         {
             Object* child = *ref;
-            if (child != nullptr && RCDecrement(child))
+            if (child == nullptr)
+                return;
+            if (greyDead && InHeap(child) && !IsYoung(child) && !IsMarked(child))
+            {
+                PushMark(child);
+                InterlockedIncrement64(&g_markDeadGreyed);
+            }
+            if (RCDecrement(child))
                 EnqueueZeroCount(child);
         });
     }
@@ -3521,6 +3872,16 @@ void LXRCollector::DrainMarkStack()
     while (g_markTop > 0)
     {
         LXRMarkLaneCheckpoint(); // park here (between objects, no heap deref) if requested
+        // Prompt finish bail: only during the SERIAL off-pause concurrent drain
+        // (g_offPauseDrain==1) -- where any residual grey stays on the shared
+        // g_markStack -- quiesce the instant a window finish is signalled (span cap
+        // or backpressure) so the STW finish + reclamation runs promptly. Sound: the
+        // finish re-scans all roots and completes the closure from the retained
+        // g_markStack, so leaving residual greys here loses no liveness. NOT gated in
+        // the parallel path (slices), where a mid-drain break could strand a slice's
+        // greys.
+        if (g_offPauseDrain && (g_traceForceFinish > 0 || g_forceSyncTrace > 0))
+            break;
         Object* o = g_markStack[--g_markTop];
         if (verify)
         {
@@ -3533,7 +3894,7 @@ void LXRCollector::DrainMarkStack()
                 continue; // don't dereference garbage MT
             }
         }
-        size_t osz = LXRObjectSize(o);
+        size_t osz = g_scanSafe ? LXRObjectSizeSafe(o) : LXRObjectSize(o);
         if (osz == 0)
         {
             // Not a valid object start. This is almost always an interior/byref
@@ -3549,7 +3910,7 @@ void LXRCollector::DrainMarkStack()
                 if (base != nullptr)
                 {
                     o = base;
-                    osz = LXRObjectSize(o);
+                    osz = g_scanSafe ? LXRObjectSizeSafe(o) : LXRObjectSize(o);
                     MarkObject(o); // record the true base granule as marked
                 }
             }
@@ -3613,6 +3974,63 @@ void LXRCollector::DrainMarkStack()
     LXRMarkScanExit();
 }
 
+// Process ONE grey object `o`: resolve its size (handling interior/byref values),
+// mark its Immix lines, defer big ref arrays for parallel chunk-scan, and scan its
+// reference fields, pushing each newly-claimed child into `out`. Shared verbatim by
+// DrainSliceLocal (static per-lane slice) and DrainMarkStackShared (shared load-
+// balanced stack) so the two closures scan identically. `o` must already be claimed
+// (marked) by the caller.
+void LXRCollector::ScanObjectRefsInto(Object* o, size_t osz, std::vector<Object*>& out)
+{
+    if (osz == 0)
+        return;
+    if (g_lineMarksValid)
+        MarkLines(o, osz);
+    size_t bigSlots = 0;
+    if (g_bigArrayParallel && IsBigRefArray(o, osz, &bigSlots))
+    {
+        // Item G: array already claimed; defer its element scan so
+        // DrainDeferredBigArrays can partition it across the pool.
+        DeferBigRefArray(o);
+        return;
+    }
+    GCScanObjectRefs(o, osz, [this, &out, o](Object** ref)
+    {
+        Object* c = *ref;
+        if (c == nullptr)
+            return;
+        // Item F (F3): log inter-block reference slots on an evac-cycle mark.
+        if (g_recordEvacEdges && InHeap(c))
+        {
+            uintptr_t sblk = (uintptr_t)ref & ~(lxr::kBlockSize - 1);
+            uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
+            if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(c))) RecordEvacEdge(ref);
+        }
+        // D-copy trace-seeding: record edges to young targets.
+        if (g_recordDcopyEdges && InHeap(c) && IsYoung(c)) RecordDcopyEdge(ref);
+        if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
+        {
+            MethodTable* pmt = *(MethodTable**)o;
+            int crc = -1;
+            if ((uint8_t*)c >= m_heapBase && (uint8_t*)c < m_heapBase + m_heapBytes)
+                crc = (int)(*RCSlot(c));
+            int64_t cFreedEp = -1, pFreedEp = -1;
+            int cSite = FreedYoungSite((uint8_t*)c, &cFreedEp);
+            int pSite = FreedYoungSite((uint8_t*)o, &pFreedEp);
+            fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p childRC=%d childFreeSite=%d childFreedEp=%lld from parent=%p parentMT=%p "
+                    "parentSize=%llu fieldOff=%lld childYoung=%d childMARKED=%d parentYoung=%d parentMARKED=%d parentFreeSite=%d parentFreedEp=%lld gEp=%lld win=%d\n",
+                    (void*)c, crc, cSite, (long long)cFreedEp, (void*)o, (void*)pmt, (unsigned long long)LXRObjectSize(o),
+                    (long long)((uint8_t*)ref - (uint8_t*)o), IsYoung(c) ? 1 : 0, IsMarked(c) ? 1 : 0,
+                    IsYoung(o) ? 1 : 0, IsMarked(o) ? 1 : 0, pSite, (long long)pFreedEp,
+                    (long long)g_traceEpoch, (int)g_traceWindowOpen);
+            fflush(stderr);
+            return; // don't scan the freed child (avoid the AV) - diagnostic only
+        }
+        if (MarkObject(c)) // atomic claim
+            out.push_back(c);
+    });
+}
+
 // Drain one worker's local grey set to completion. The atomic mark bit
 // (MarkObject) claims each object for exactly one worker, so workers never scan
 // the same object and need no shared stack or termination protocol.
@@ -3627,7 +4045,7 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
         LXRMarkLaneCheckpoint(); // park here (between objects, no heap deref) if requested
         Object* o = local.back();
         local.pop_back();
-        size_t osz = LXRObjectSize(o);
+        size_t osz = g_scanSafe ? LXRObjectSizeSafe(o) : LXRObjectSize(o);
         if (osz == 0)
         {
             // Interior/byref value (see DrainMarkStack): resolve to base so the
@@ -3640,7 +4058,7 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
                 if (base != nullptr && MarkObject(base))
                 {
                     o = base;
-                    osz = LXRObjectSize(o);
+                    osz = g_scanSafe ? LXRObjectSizeSafe(o) : LXRObjectSize(o);
                 }
                 else
                 {
@@ -3650,58 +4068,134 @@ void LXRCollector::DrainSliceLocal(std::vector<Object*>& local)
             if (osz == 0)
                 continue;
         }
-        if (g_lineMarksValid)
-            MarkLines(o, osz);
-        size_t bigSlots = 0;
-        if (g_bigArrayParallel && IsBigRefArray(o, osz, &bigSlots))
+        ScanObjectRefsInto(o, osz, local);
+    }
+}
+
+// P5 / paper §3.5 work distribution: shared-stack parallel mark drain. ALL lanes
+// (marker lane 0 + pool workers) run this concurrently, pulling grey batches from
+// the SHARED g_markStack and shedding discovered overflow back to it, so a large
+// connected component discovered by ONE lane is redistributed to idle lanes instead
+// of that lane closing it alone (the static-slice imbalance that wedged the marker
+// in the join). Termination detection: g_markShareActive counts lanes still holding
+// work; a lane decrements it only when its local AND the shared stack are empty (all
+// under g_markStackLock), so the count reaches 0 exactly when every lane's local is
+// empty and the shared stack is empty -> the whole closure is complete. A lane that
+// holds any local work stays counted active, so its not-yet-flushed discoveries can
+// never be missed by the termination test.
+void LXRCollector::DrainMarkStackShared()
+{
+    const size_t kPopBatch  = 256;   // greys pulled from the shared stack per refill
+    const size_t kLocalHigh = 4096;  // shed overflow above this local size
+    const size_t kFlush     = 2048;  // greys pushed back to the shared stack per shed
+    std::vector<Object*> local;
+    local.reserve(kLocalHigh + 256);
+    bool active = true; // dispatched already-counted active (g_markShareActive seeded = lanes)
+
+    for (;;)
+    {
+        // Prompt finish bail (parallel OFF-PAUSE drain only): the instant a window
+        // finish is signalled, flush any local greys back to the shared g_markStack
+        // and return, so the trace window closes at object-scan granularity instead
+        // of waiting for this (possibly seconds-long, never-emptying under continuous
+        // mutation) round to finish. NOT taken during the STW finish itself
+        // (g_offPauseParallelDrain==0 there), where the closure MUST complete. Sound:
+        // residual greys are retained on the shared stack and the STW finish re-scans
+        // all roots+handles + drains that stack, so no reachable object is missed.
+        if (g_offPauseParallelDrain && (g_traceForceFinish > 0 || g_forceSyncTrace > 0))
         {
-            // Item G: this lane has already claimed (marked) the array; defer its
-            // element scan so DrainDeferredBigArrays can partition it across the
-            // pool instead of one lane walking all bigSlots serially.
-            DeferBigRefArray(o);
-            continue;
+            EnterCriticalSection(&g_markStackLock);
+            if (!local.empty())
+            {
+                size_t need = local.size();
+                if ((size_t)(g_markCap - g_markTop) < need)
+                {
+                    size_t newCap = g_markCap ? g_markCap : 1024;
+                    while (newCap - (size_t)g_markTop < need) newCap *= 2;
+                    Object** grown = (Object**)realloc(g_markStack, newCap * sizeof(Object*));
+                    if (grown != nullptr) { g_markStack = grown; g_markCap = newCap; }
+                }
+                size_t canMove = (size_t)(g_markCap - g_markTop);
+                size_t move = need < canMove ? need : canMove;
+                for (size_t i = 0; i < move; i++)
+                    g_markStack[g_markTop++] = local[i];
+                local.clear();
+            }
+            if (active) { active = false; g_markShareActive--; }
+            LeaveCriticalSection(&g_markStackLock);
+            return;
         }
-        GCScanObjectRefs(o, osz, [this, &local, o](Object** ref)
+        if (local.empty())
         {
-            Object* c = *ref;
-            if (c == nullptr)
-                return;
-            // Item F (F3): log inter-block reference slots on an evac-cycle mark
-            // (see DrainMarkStack). Per-lane thread-local log -> no lock on the
-            // hot path; distinct workers write distinct logs.
-            if (g_recordEvacEdges && InHeap(c))
+            EnterCriticalSection(&g_markStackLock);
+            size_t take = (g_markTop < kPopBatch) ? (size_t)g_markTop : kPopBatch;
+            for (size_t i = 0; i < take; i++)
+                local.push_back(g_markStack[--g_markTop]);
+            if (take == 0)
             {
-                uintptr_t sblk = (uintptr_t)ref & ~(lxr::kBlockSize - 1);
-                uintptr_t tblk = (uintptr_t)c   & ~(lxr::kBlockSize - 1);
-                if (sblk != tblk && (!g_evacCandidateScope || IsEvacCandidateAddr(c))) RecordEvacEdge(ref);
+                // No shared work: go idle. Decrement the active count under the lock
+                // so the count and the empty-stack observation are atomic together.
+                if (active) { active = false; g_markShareActive--; }
+                bool done = (g_markShareActive == 0);
+                LeaveCriticalSection(&g_markStackLock);
+                if (done)
+                    return;                // all lanes idle + stack empty => complete
+                LXRMarkLaneCheckpoint();   // let a pause driver park us while idle
+                Sleep(0);                  // yield; re-poll for redistributed work
+                continue;
             }
-            // D-copy trace-seeding: record every edge whose target is a young object
-            // so CopyYoungSurvivors can find and rebase this referrer even if the
-            // barrier's coalesced log of this (possibly ancient, stable) store was
-            // wiped at a prior trace bump. The mark visits every live object, so this
-            // is the complete incoming-edge set for currently-young objects.
-            if (g_recordDcopyEdges && InHeap(c) && IsYoung(c)) RecordDcopyEdge(ref);
-            if (g_nurseryGuard > 0 && InFreedYoung((uint8_t*)c))
+            if (!active) { active = true; g_markShareActive++; } // re-activate under lock
+            LeaveCriticalSection(&g_markStackLock);
+        }
+
+        // Drain a bounded run of local greys, then shed overflow so idle lanes can
+        // steal it. Bounding the run (not fully draining local) keeps discovered
+        // work visible to the shared stack promptly.
+        LXRMarkLaneCheckpoint();
+        Object* o = local.back();
+        local.pop_back();
+        size_t osz = g_scanSafe ? LXRObjectSizeSafe(o) : LXRObjectSize(o);
+        if (osz == 0)
+        {
+            if (InHeap(o))
             {
-                MethodTable* pmt = *(MethodTable**)o;
-                int crc = -1;
-                if ((uint8_t*)c >= m_heapBase && (uint8_t*)c < m_heapBase + m_heapBytes)
-                    crc = (int)(*RCSlot(c));
-                int64_t cFreedEp = -1, pFreedEp = -1;
-                int cSite = FreedYoungSite((uint8_t*)c, &cFreedEp);
-                int pSite = FreedYoungSite((uint8_t*)o, &pFreedEp);
-                fprintf(stderr, "LXRGC: [nursery-guard] REACHED FREED YOUNG child=%p childRC=%d childFreeSite=%d childFreedEp=%lld from parent=%p parentMT=%p "
-                        "parentSize=%llu fieldOff=%lld childYoung=%d childMARKED=%d parentYoung=%d parentMARKED=%d parentFreeSite=%d parentFreedEp=%lld gEp=%lld win=%d\n",
-                        (void*)c, crc, cSite, (long long)cFreedEp, (void*)o, (void*)pmt, (unsigned long long)LXRObjectSize(o),
-                        (long long)((uint8_t*)ref - (uint8_t*)o), IsYoung(c) ? 1 : 0, IsMarked(c) ? 1 : 0,
-                        IsYoung(o) ? 1 : 0, IsMarked(o) ? 1 : 0, pSite, (long long)pFreedEp,
-                        (long long)g_traceEpoch, (int)g_traceWindowOpen);
-                fflush(stderr);
-                return; // don't scan the freed child (avoid the AV) - diagnostic only
+                Object* base = ResolveInterior((uint8_t*)o);
+                if (base != nullptr && MarkObject(base))
+                {
+                    o = base;
+                    osz = g_scanSafe ? LXRObjectSizeSafe(o) : LXRObjectSize(o);
+                }
+                else
+                {
+                    continue;
+                }
             }
-            if (MarkObject(c)) // atomic claim
-                local.push_back(c);
-        });
+            if (osz == 0)
+                continue;
+        }
+        ScanObjectRefsInto(o, osz, local);
+
+        if (local.size() > kLocalHigh)
+        {
+            // Shed the OLDEST greys (front of local) to the shared stack -- they are
+            // the least likely to be re-touched soon, and moving them lets other
+            // lanes make progress on this subgraph in parallel.
+            EnterCriticalSection(&g_markStackLock);
+            if ((size_t)(g_markCap - g_markTop) < kFlush)
+            {
+                size_t newCap = g_markCap ? g_markCap : 1024;
+                while (newCap - (size_t)g_markTop < kFlush) newCap *= 2;
+                Object** grown = (Object**)realloc(g_markStack, newCap * sizeof(Object*));
+                if (grown != nullptr) { g_markStack = grown; g_markCap = newCap; }
+            }
+            size_t canMove = (size_t)(g_markCap - g_markTop);
+            size_t move = kFlush < canMove ? kFlush : canMove;
+            for (size_t i = 0; i < move; i++)
+                g_markStack[g_markTop++] = local[i];
+            LeaveCriticalSection(&g_markStackLock);
+            if (move > 0)
+                local.erase(local.begin(), local.begin() + move);
+        }
     }
 }
 
@@ -3719,6 +4213,11 @@ static void LXRMarkWorkerProc(void* idx)
             std::vector<std::vector<Object*>>* slices = g_poolSlices;
             if (slices != nullptr && (size_t)(w + 1) < slices->size() && g_poolCollector != nullptr)
                 g_poolCollector->DrainSliceLocal((*slices)[(size_t)(w + 1)]);
+        }
+        else if (g_poolWorkKind == 2) // shared-stack parallel drain (load-balanced)
+        {
+            if (g_poolCollector != nullptr)
+                g_poolCollector->DrainMarkStackShared();
         }
         else // g_poolWorkKind == 1: generic parallel-for, this worker is lane w+1
         {
@@ -3741,7 +4240,19 @@ static void LXRMarkWorkerProc(void* idx)
 // the RC apply that uses this runs at its own pause / off-pause, never nested.
 static void RunOnPool(int lanes, void (*fn)(int lane, int lanes, void* ctx), void* ctx)
 {
-    if (lanes < 2 || g_poolWorkers < 1)
+    // Deadlock avoidance for the parallel OFF-PAUSE marker: while a spanned RC pause
+    // holds the marker parked for reclaim (g_rcApplyForceSerial is set at the park
+    // and cleared just before RestartEE), the marker may be blocked INSIDE
+    // ParallelDrainMarkStack holding g_poolLock with its lanes parked at a mark
+    // checkpoint. If the reclaim took g_poolLock here it would wait on that parked
+    // marker, which cannot release g_poolLock until the reclaim reaches
+    // LXRReleaseMarkerPark and clears g_markParkReq -> circular wait (observed: the
+    // window never finalizes, hb frozen mid-round, footprint drift). Run the reclaim
+    // serially (never touching g_poolLock) across that window; per-epoch spanned-
+    // pause reclaim is small, and the pool is unavailable to it anyway (the marker
+    // owns it). The STW finish uses the pool normally (g_rcApplyForceSerial is 0
+    // there -- the marker has quiesced and released g_poolLock).
+    if (lanes < 2 || g_poolWorkers < 1 || g_rcApplyForceSerial)
     {
         LXRMarkScanEnter(1);
         fn(0, 1, ctx);
@@ -3993,26 +4504,24 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
     if (lanes > g_poolWorkers + 1)
         lanes = g_poolWorkers + 1; // clamp to what the pool can serve
 
-    static std::vector<std::vector<Object*>> slices; // reused; single drain at a time
+    // P5 / §3.5: SHARED-stack drain (not static per-lane slices). The seed set
+    // already sits in g_markStack; leave it there and have all lanes pull batches
+    // from it + shed overflow back, so a large connected component discovered by one
+    // lane is redistributed to idle lanes (fixing the static-partition imbalance
+    // that wedged the marker in the join). Termination is via g_markShareActive.
     EnterCriticalSection(&g_poolLock); // serialize with parallel-RC pool use (item G)
-    InterlockedExchange(&g_poolWorkKind, 0); // 0 = mark-drain body in the worker proc
-    slices.assign((size_t)lanes, std::vector<Object*>());
-    size_t n = g_markTop;
-    for (size_t i = 0; i < n; i++)
-        slices[i % (size_t)lanes].push_back(g_markStack[i]);
-    g_markTop = 0; // consumed into the per-lane slices
+    InterlockedExchange(&g_poolWorkKind, 2); // 2 = shared-stack mark drain
+    InterlockedExchange(&g_markShareActive, (LONG)lanes); // all lanes start active
 
-    g_poolSlices = &slices;
     LXRMarkScanEnter(lanes);          // account ALL lanes before any worker wakes
-    for (int w = 1; w < lanes; w++)   // wake pooled workers 0..lanes-2 -> slices 1..lanes-1
+    for (int w = 1; w < lanes; w++)   // wake pooled workers -> shared drain
         SetEvent(g_poolStart[w - 1]);
 
-    DrainSliceLocal(slices[0]);       // main thread drains lane 0
+    DrainMarkStackShared();           // main thread = lane 0, shared drain
     LXRMarkScanExit();                // lane 0 done (workers exit in their proc)
 
     for (int w = 1; w < lanes; w++)
         WaitForSingleObject(g_poolDone[w - 1], INFINITE);
-    g_poolSlices = nullptr;
     LeaveCriticalSection(&g_poolLock);
 
     // Item G: scan any huge reference arrays the lanes deferred during the closure,
@@ -4026,7 +4535,7 @@ void LXRCollector::ParallelDrainMarkStack(int workers)
 // the concurrent trace's drain/finish so all three compose with parallel marking.
 void LXRCollector::DrainClosure()
 {
-    if (g_gcThreads > 1)
+    if (g_gcThreads > 1 && !g_offPauseDrain)
         ParallelDrainMarkStack(g_gcThreads);
     else
         DrainMarkStack();
@@ -5025,8 +5534,11 @@ void LXRCollector::ConcurrentTraceDrain()
     const int kMaxRounds = 64;
     const long kParkMaxRounds = 4000000; // safety cap only; force-finish normally ends it
     long roundCap = park ? kParkMaxRounds : kMaxRounds;
+    InterlockedExchange(&g_offPauseDrain, LXROffPauseParallel() ? 0 : 1); // serial off-pause unless opted into parallel
+    InterlockedExchange(&g_offPauseParallelDrain, LXROffPauseParallel() ? 1 : 0); // arm the parallel-path prompt-finish bail
     for (long round = 0; round < roundCap; round++)
     {
+        InterlockedIncrement64(&g_markerRoundHeartbeat);
         size_t before = g_lxrCounters.SatbMarks;
         DrainClosure();         // scan everything currently grey (parallel if enabled)
         DrainSatbBuffers();     // pull in deletions logged since last pass
@@ -5047,6 +5559,8 @@ void LXRCollector::ConcurrentTraceDrain()
                                 // the STW finish completes the closure from roots.
         Sleep(0);               // yield so mutators make progress / accrue SATB work
     }
+    InterlockedExchange(&g_offPauseDrain, 0); // STW finish/backup-trace may parallelize
+    InterlockedExchange(&g_offPauseParallelDrain, 0); // disarm bail: the STW finish must complete
 }
 
 // promote_func for the FINAL root rescan at the concurrent finish pause. Marks
@@ -5591,6 +6105,28 @@ void LXRCollector::DrainPendingDecommit()
 {
     if (g_pendingDecommit.empty())
         return;
+    // Paper-faithful reclamation safety ("never free while the tracer may read"):
+    // the VirtualFree(MEM_DECOMMIT) below makes pages physically unreadable. A
+    // concurrent multi-epoch mark lane (DrainSliceLocal / DrainMarkStack) can still
+    // hold a STALE reference into one of these limbo regions and dereference it
+    // while scanning -> a TOCTOU access violation. Two defenses combine here:
+    //   1) The mark/RC drains use LXRObjectSizeSafe, which validates o's header +
+    //      MethodTable + whole extent against the committed page map (generation-
+    //      invalidated on every decommit) before any deref, so a stale ref into an
+    //      already-freed region is skipped rather than faulted.
+    //   2) Optional (LXR_DECOMMIT_DEFER_TRACE, default OFF): additionally DEFER
+    //      physical decommit entirely while a tracer is active, eliminating the
+    //      residual free-vs-read TOCTOU window. This is the strongest guarantee but
+    //      on continuously-tracing workloads (window ~always open) it starves
+    //      physical reclaim -> footprint balloon -> huge linear sweeps, so it is
+    //      off by default; defense (1) carries correctness in the default config.
+    static int s_deferTrace = -1;
+    if (s_deferTrace < 0)
+        s_deferTrace = (getenv("LXR_DECOMMIT_DEFER_TRACE") != nullptr) ? 1 : 0;
+    if (s_deferTrace &&
+        ((g_multiEpoch && g_traceState == TRACE_MARKING) ||
+         InterlockedCompareExchange(&g_markScanActive, 0, 0) != 0))
+        return; // tracer active; defer physical decommit to the next quiescent drain
     int64_t freedBytes = 0;
     EnterCriticalSection(&g_chunkLock);
     for (auto& p : g_pendingDecommit)
@@ -5616,6 +6152,7 @@ void LXRCollector::DrainPendingDecommit()
         }
         if (p.end > p.beg)
         {
+            g_lxrCollector.HeapPagesDecommit(p.beg, (size_t)(p.end - p.beg)); // clear BEFORE decommit
             VirtualFree(p.beg, p.end - p.beg, MEM_DECOMMIT);
             freedBytes += (int64_t)(p.end - p.beg);
         }
@@ -5635,6 +6172,8 @@ void LXRCollector::DrainPendingDecommit()
         InterlockedExchangeAdd64(&g_committedInUse, -freedBytes);
     }
     g_pendingDecommit.clear();
+    if (freedBytes != 0)
+        LXRBumpCommittedGen(); // invalidate committed-region caches (see g_committedGen)
 }
 
 int64_t LXRCollector::ReclaimRegionMemory(size_t chunkIndex)
@@ -5671,7 +6210,9 @@ int64_t LXRCollector::ReclaimRegionMemory(size_t chunkIndex)
     }
     if (dend > dbeg)
     {
+        g_lxrCollector.HeapPagesDecommit(dbeg, (size_t)(dend - dbeg)); // clear BEFORE decommit
         VirtualFree(dbeg, dend - dbeg, MEM_DECOMMIT);
+        LXRBumpCommittedGen(); // invalidate committed-region caches (see g_committedGen)
         InterlockedExchangeAdd64(&m_reclaimedBytes, bytes);
         InterlockedExchangeAdd64(&g_committedInUse, -bytes);
     }
@@ -6129,6 +6670,86 @@ static void EvacSelFn(int lane, int lanes, void* ctxp)
         out.push_back({ i, c.Start, c.UsedEnd, (int64_t)live, (int64_t)total });
     }
 }
+// Ground-truth address-space scan for durable dangling referrers (see call site,
+// LXR_EVAC_SCANALL). Isolated in its own function because it uses SEH __try, which
+// MSVC forbids in functions that also require C++ object unwinding (Evacuate does).
+static void LXREvacScanAll(const std::unordered_map<Object*, Object*>& forwarding,
+                           uint8_t* heapBase, size_t heapBytes)
+{
+    uintptr_t minOld = (uintptr_t)-1, maxOld = 0;
+    for (const auto& kv : forwarding)
+    {
+        uintptr_t v = (uintptr_t)kv.first;
+        if (v < minOld) minOld = v;
+        if (v > maxOld) maxOld = v;
+    }
+    fprintf(stderr, "LXRGC: [scanall] begin: %zu moved, oldRange=[%p,%p] heap=[%p,%p)\n",
+            forwarding.size(), (void*)minOld, (void*)maxOld,
+            (void*)heapBase, (void*)(heapBase + heapBytes));
+    fflush(stderr);
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    uint8_t* addr = (uint8_t*)si.lpMinimumApplicationAddress;
+    uint8_t* maxAddr = (uint8_t*)si.lpMaximumApplicationAddress;
+    int64_t totalHits = 0, reported = 0;
+    while (addr < maxAddr)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) break;
+        uint8_t* regBase = (uint8_t*)mbi.BaseAddress;
+        uint8_t* regNext = regBase + mbi.RegionSize;
+        bool readable = (mbi.State == MEM_COMMIT) &&
+            (mbi.Protect & (PAGE_READONLY|PAGE_READWRITE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_WRITECOPY|PAGE_EXECUTE_WRITECOPY)) != 0 &&
+            (mbi.Protect & (PAGE_GUARD|PAGE_NOACCESS)) == 0;
+        if (readable)
+        {
+            __try
+            {
+                for (uint8_t* p = regBase; p + 8 <= regNext; p += 8)
+                {
+                    uintptr_t val = *(uintptr_t*)p;
+                    if (val < minOld || val > maxOld) continue;
+                    auto it = forwarding.find((Object*)val);
+                    if (it == forwarding.end()) continue;
+                    totalHits++;
+                    bool inHeap = (p >= heapBase && p < heapBase + heapBytes);
+                    bool exec = (mbi.Protect & (PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY|PAGE_EXECUTE)) != 0;
+                    const char* typ = (mbi.Type == MEM_IMAGE) ? "IMAGE" : (mbi.Type == MEM_MAPPED ? "MAPPED" : "PRIVATE");
+                    if (reported < 40)
+                    {
+                        char modname[MAX_PATH] = "";
+                        if (mbi.Type == MEM_IMAGE)
+                            GetModuleFileNameA((HMODULE)mbi.AllocationBase, modname, MAX_PATH);
+                        fprintf(stderr, "LXRGC: [scanall] HIT slot=%p val=%p fwd=%p inHeap=%d type=%s exec=%d regBase=%p regSize=0x%zx mod=%s\n",
+                                (void*)p, (void*)val, (void*)it->second, inHeap ? 1 : 0,
+                                typ, exec ? 1 : 0, (void*)regBase, (size_t)mbi.RegionSize, modname);
+                        reported++;
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+        if (regNext <= regBase) break;
+        addr = regNext;
+    }
+    fprintf(stderr, "LXRGC: [scanall] end: totalHits=%lld reported=%lld\n", (long long)totalHits, (long long)reported);
+    for (int fi = 0; fi < MAX_FROZEN_SEGMENTS; fi++)
+    {
+        FrozenSegment& fs = g_frozenSegments[fi];
+        if (!fs.InUse) continue;
+        fprintf(stderr, "LXRGC: [scanall] frozenSeg[%d] base=%p first=%p allocated=%p committed=%p reserved=%p\n",
+                fi, (void*)fs.Base, (void*)fs.FirstObject, (void*)fs.Allocated, (void*)fs.Committed, (void*)fs.Reserved);
+    }
+    fprintf(stderr, "LXRGC: [scanall] markStack=%p bigRefArrays.data=%p\n",
+            (void*)g_markStack, (void*)(g_bigRefArrays.empty() ? nullptr : g_bigRefArrays.data()));
+    for (ModifiedBuffer* mb = g_registeredBuffers; mb != nullptr; mb = mb->NextRegistered)
+        fprintf(stderr, "LXRGC: [scanall] modBuf node=%p entries=%p count=%zu\n", (void*)mb, (void*)mb->Entries, mb->Count);
+    for (SatbBuffer* sb = g_registeredSatbBuffers; sb != nullptr; sb = sb->NextRegistered)
+        fprintf(stderr, "LXRGC: [scanall] satbBuf node=%p entries=%p count=%zu\n", (void*)sb, (void*)sb->Entries, sb->Count);
+    for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+        fprintf(stderr, "LXRGC: [scanall] remBuf node=%p entries=%p count=%zu\n", (void*)rb, (void*)rb->Entries, rb->Count);
+    fflush(stderr);
+}
+
 void LXRCollector::Evacuate()
 {
     InterlockedExchange(&g_freeSite, 2);
@@ -6453,6 +7074,87 @@ void LXRCollector::Evacuate()
             InterlockedIncrement64(&g_lxrCounters.EvacFieldsForwarded);
         }
     };
+    // 4b. Rebase pointers held in the GC's OWN remembered structures. The heap
+    //     fix-up (step 4c) only walks managed objects; but evacuation also moves
+    //     objects that are still referenced by PENDING, not-yet-consumed collector
+    //     buffers: the coalescing-RC modified log (ModifiedEntry.Slot points INTO a
+    //     moved object; ModifiedEntry.OldValue IS a moved referent), the SATB
+    //     deletion buffers (Object* referents), the remembered sets (Object** slots
+    //     that live inside moved objects), and deferred big-ref-array worklists.
+    //     These straddle the evac pause (the RC log is consumed at the NEXT RC
+    //     pause, remsets at the NEXT evac/young pause, SATB by the ongoing trace),
+    //     so a stale entry later dereferences a moved-then-reused address -> RC
+    //     corruption / premature free -> a wild-pointer AV that surfaces far away
+    //     (e.g. Monitor.Enter on the reused region). The paper's evacuation fixes
+    //     up all remembered-set entries the same way; this is that pass. Safe to
+    //     walk the registries unlocked: evacuation runs under STW (mutators
+    //     suspended, marker parked), so no buffer is being appended concurrently.
+    auto rebaseAddr = [&forwarding, &movedRanges](uint8_t* v) -> uint8_t*
+    {
+        if (v == nullptr) return v;
+        auto it = forwarding.find((Object*)v);
+        if (it != forwarding.end()) return (uint8_t*)it->second;
+        if (movedRanges.empty()) return v;
+        size_t lo = 0, hi = movedRanges.size();
+        while (lo < hi)
+        {
+            size_t mid = (lo + hi) >> 1;
+            if (movedRanges[mid].oldStart <= v) lo = mid + 1; else hi = mid;
+        }
+        if (lo == 0) return v;
+        const MovedRange& r = movedRanges[lo - 1];
+        if (v > r.oldStart && v < r.oldEnd)
+            return r.newStart + (v - r.oldStart);
+        return v;
+    };
+    if (!forwarding.empty())
+    {
+        int64_t remRebased = 0;
+        // Coalescing-RC modified log: rebase both the field-slot address (interior
+        // into a moved object) and the logged old referent (an object start).
+        for (ModifiedBuffer* mb = g_registeredBuffers; mb != nullptr; mb = mb->NextRegistered)
+        {
+            size_t n = mb->Count;
+            if (n > ModifiedBuffer::kCapacity) n = ModifiedBuffer::kCapacity;
+            for (size_t i = 0; i < n; i++)
+            {
+                uint8_t* ns = rebaseAddr((uint8_t*)mb->Entries[i].Slot);
+                if (ns != (uint8_t*)mb->Entries[i].Slot) { mb->Entries[i].Slot = (Object**)ns; remRebased++; }
+                uint8_t* nv = rebaseAddr((uint8_t*)mb->Entries[i].OldValue);
+                if (nv != (uint8_t*)mb->Entries[i].OldValue) { mb->Entries[i].OldValue = (Object*)nv; remRebased++; }
+            }
+        }
+        // SATB deletion buffers: dense Object* referents awaiting mark/scan.
+        for (SatbBuffer* sb = g_registeredSatbBuffers; sb != nullptr; sb = sb->NextRegistered)
+        {
+            size_t n = sb->Count;
+            if (n > SatbBuffer::kCapacity) n = SatbBuffer::kCapacity;
+            for (size_t i = 0; i < n; i++)
+            {
+                uint8_t* nv = rebaseAddr((uint8_t*)sb->Entries[i]);
+                if (nv != (uint8_t*)sb->Entries[i]) { sb->Entries[i] = (Object*)nv; remRebased++; }
+            }
+        }
+        // Remembered sets: Object** slots that physically live inside moved objects.
+        for (RemsetBuffer* rb = g_registeredRemsetBuffers; rb != nullptr; rb = rb->NextRegistered)
+        {
+            size_t n = rb->Count;
+            if (n > RemsetBuffer::kCapacity) n = RemsetBuffer::kCapacity;
+            for (size_t i = 0; i < n; i++)
+            {
+                uint8_t* ns = rebaseAddr((uint8_t*)rb->Entries[i]);
+                if (ns != (uint8_t*)rb->Entries[i]) { rb->Entries[i] = (Object**)ns; remRebased++; }
+            }
+        }
+        // Deferred huge-ref-array worklist: Object* array starts awaiting scan.
+        for (size_t i = 0; i < g_bigRefArrays.size(); i++)
+        {
+            uint8_t* nv = rebaseAddr((uint8_t*)g_bigRefArrays[i]);
+            if (nv != (uint8_t*)g_bigRefArrays[i]) { g_bigRefArrays[i] = (Object*)nv; remRebased++; }
+        }
+        if (remRebased > 0)
+            InterlockedExchangeAdd64(&g_lxrCounters.EvacFieldsForwarded, remRebased);
+    }
     // 4c. Apply the fix-up. Prefer the trace-bootstrapped, evac-scoped path
     //     (F3): fix up (a) the moved objects' destination copies (their outgoing
     //     edges) and (b) the inter-block slots recorded during this cycle's mark
@@ -6708,6 +7410,147 @@ void LXRCollector::Evacuate()
         { fprintf(stderr, "LXRGC: [intra-instr] FULLWALK regionsParsed=%lld objsParsed=%lld objsScanned=%lld\n",
                   (long long)g_intraRegions, (long long)g_intraObjsParsed, (long long)g_intraObjsScanned); fflush(stderr); }
     }
+    // (d) Pinned referrers' outgoing edges. A pinned object (a root/handle
+    //     referent - e.g. a runtime DomainLocalModule GC-statics block, kept alive
+    //     by a pinned handle) is itself never moved, but its FIELDS can point at a
+    //     NON-pinned object that DID move (only DIRECT root/handle referents are
+    //     pinned; a static-field target one hop away is not). Such an edge is
+    //     invisible to EVERY pass above: the remembered set never saw it when the
+    //     referrer lives in a barrier-bounds-EXCLUDED region (frozen / static
+    //     segments outside the LXR heap reservation, whose stores never fire the
+    //     callback barrier), the referrer sits in no evac touched-block, and even
+    //     the full-heap fallback only walks g_chunks (the LXR heap) - so an
+    //     out-of-heap static block is never scanned there either. Forward every
+    //     pinned object's fields. Bounded by the (small) pinned set. This closes a
+    //     ~50%-repro AV where a moved System.Diagnostics.Tracing EventCounter
+    //     object left EventListener.s_EventSources dangling to a reused/decommitted
+    //     page (Monitor.Enter -> wild-pointer read) when EventCounters were enabled.
+    for (Object* po : pinned)
+    {
+        if (po == nullptr)
+            continue;
+        size_t psz = LXRObjectSize(po);
+        if (psz == 0)
+            continue;
+        GCScanObjectRefs(po, psz, [&](Object** f) { rebaseField(f); });
+    }
+    // (e) TRANSITIVE out-of-heap referrers. Step (d) forwards the fields of the
+    //     DIRECT root/handle referents only. But a moved object's sole referrer
+    //     can be an out-of-heap object reached only TRANSITIVELY through other
+    //     out-of-heap objects - e.g. a pinned handle -> LoaderAllocator/module
+    //     managed object -> GC-statics blob -> the moved List. Every intermediate
+    //     out-of-heap object on that chain (except the direct referent) is
+    //     invisible to ALL passes: not pinned (only DIRECT referents are), not in
+    //     g_chunks (so the full-heap fallback misses it), and never in the remset
+    //     (its stores are barrier-bounds-EXCLUDED). Walk the out-of-heap object
+    //     closure from the pinned set and forward every field. We descend ONLY
+    //     through out-of-heap objects (in-heap objects are covered by (a)/(b)/(c)/
+    //     full-walk), so the closure is bounded by the tiny out-of-heap live set
+    //     (frozen / statics segments), not the movable heap. Every value we
+    //     descend into is a genuine managed Object* the GC reported, so parsing an
+    //     out-of-heap frozen/statics object with GCScanObjectRefs is safe.
+    {
+        static int s_oohDiag = -1;
+        if (s_oohDiag < 0)
+            s_oohDiag = (getenv("LXR_EVAC_DIAG") != nullptr) ? 1 : 0;
+        std::vector<Object*> oohStack;
+        std::unordered_set<Object*> oohVisited;
+        for (Object* po : pinned)
+            if (po != nullptr && !InHeap(po) && oohVisited.insert(po).second)
+                oohStack.push_back(po);
+        int64_t oohObjs = 0, oohForwarded = 0, oohDiagLogged = 0;
+        while (!oohStack.empty())
+        {
+            Object* o = oohStack.back();
+            oohStack.pop_back();
+            size_t sz = LXRObjectSize(o);
+            if (sz == 0)
+                continue;
+            oohObjs++;
+            GCScanObjectRefs(o, sz, [&](Object** f)
+            {
+                Object* before = *f;
+                if (s_oohDiag && before != nullptr && forwarding.find(before) != forwarding.end() && oohDiagLogged < 20)
+                {
+                    fprintf(stderr, "LXRGC: [evac-ooh] TRANSITIVE out-of-heap referrer=%p mt=%p -> stale %p (fwd->%p)\n",
+                            (void*)o, (void*)o->GetGCSafeMethodTable(), (void*)before, (void*)forwarding[before]);
+                    fflush(stderr);
+                    oohDiagLogged++;
+                }
+                rebaseField(f);
+                if (*f != before)
+                    oohForwarded++;
+                Object* t = *f;
+                if (t != nullptr && !InHeap(t) && oohVisited.insert(t).second)
+                    oohStack.push_back(t);
+            });
+        }
+        if (s_oohDiag && (oohForwarded > 0 || oohObjs > 0))
+        {
+            fprintf(stderr, "LXRGC: [evac-ooh] out-of-heap closure: objects=%lld fieldsForwarded=%lld\n",
+                    (long long)oohObjs, (long long)oohForwarded);
+            fflush(stderr);
+        }
+    }
+    // (f) FROZEN-SEGMENT referrers. The runtime registers frozen object heap
+    //     (FOH) segments directly with the GC via RegisterFrozenSegment; modern
+    //     CoreCLR places non-collectible GC statics (e.g. EventListener's
+    //     s_EventSources) in these immortal, never-moved segments OUTSIDE the LXR
+    //     movable heap. A frozen static field holding the only durable reference
+    //     to a moved object is fixed up by NO pass above: the write barrier is
+    //     bounds-excluded for frozen slots (so no remset edge), the frozen segment
+    //     is not in g_chunks (so the full-heap fallback misses it), and frozen
+    //     objects are not root/handle referents (so the pinned/OOH closure misses
+    //     them - the runtime treats registered frozen segments as an independent
+    //     root set the GC must scan itself). Walk every registered frozen segment
+    //     linearly (from ibFirstObject) and forward each object's fields. Bounded
+    //     by the (small) frozen-static live set, not the movable heap. This closes
+    //     the ~40%-repro AV where a moved System.Diagnostics.Tracing object left a
+    //     frozen GC-static dangling to a reused/decommitted page (Monitor.Enter ->
+    //     region-aligned wild-pointer read) when EventCounters were enabled.
+    {
+        static int s_frzDiag = -1;
+        if (s_frzDiag < 0)
+            s_frzDiag = (getenv("LXR_EVAC_DIAG") != nullptr) ? 1 : 0;
+        int64_t frozenObjs = 0, frozenForwarded = 0;
+        EnterCriticalSection(&g_frozenSegmentsLock);
+        for (int fi = 0; fi < MAX_FROZEN_SEGMENTS; fi++)
+        {
+            FrozenSegment& fs = g_frozenSegments[fi];
+            if (!fs.InUse || fs.FirstObject == nullptr)
+                continue;
+            uint8_t* p = fs.FirstObject;
+            while (p < fs.Allocated)
+            {
+                Object* o = (Object*)p;
+                size_t sz = LXRObjectSize(o);
+                if (sz == 0)
+                    break;
+                frozenObjs++;
+                GCScanObjectRefs(o, sz, [&](Object** f)
+                {
+                    Object* before = *f;
+                    if (s_frzDiag && before != nullptr && forwarding.find(before) != forwarding.end())
+                    {
+                        fprintf(stderr, "LXRGC: [evac-frozen] referrer=%p mt=%p -> stale %p (fwd->%p)\n",
+                                (void*)o, (void*)o->GetGCSafeMethodTable(), (void*)before, (void*)forwarding[before]);
+                        fflush(stderr);
+                    }
+                    rebaseField(f);
+                    if (*f != before)
+                        frozenForwarded++;
+                });
+                p += sz;
+            }
+        }
+        LeaveCriticalSection(&g_frozenSegmentsLock);
+        if (s_frzDiag && frozenObjs > 0)
+        {
+            fprintf(stderr, "LXRGC: [evac-frozen] objects=%lld fieldsForwarded=%lld\n",
+                    (long long)frozenObjs, (long long)frozenForwarded);
+            fflush(stderr);
+        }
+    }
     // Item D-copy: an evac copy M' is produced by memcpy, so M's mature->young
     // edges are duplicated into M' at NEW slot addresses while the D-copy old->
     // young remembered set (g_dcopyModifiedSlots) still holds the DEAD source M's
@@ -6774,6 +7617,20 @@ void LXRCollector::Evacuate()
                     (long long)misses, freeableEvacIndices.size());
             fflush(stderr);
         }
+    }
+
+    // GROUND-TRUTH DIAGNOSTIC (LXR_EVAC_SCANALL=1): after all our fix-up passes,
+    // scan the ENTIRE process address space for any 8-byte slot that STILL holds a
+    // moved object's OLD address. Any hit is a durable dangling referrer we failed
+    // to update -> classify its memory so we know exactly where the un-enumerated
+    // reference lives. One-shot per process, bounded output.
+    static int s_scanAll = -1;
+    if (s_scanAll < 0) s_scanAll = (getenv("LXR_EVAC_SCANALL") != nullptr) ? 1 : 0;
+    if (s_scanAll && !forwarding.empty())
+    {
+        static LONG s_scanDone = 0;
+        if (InterlockedCompareExchange(&s_scanDone, 1, 0) == 0)
+            LXREvacScanAll(forwarding, m_heapBase, m_heapBytes);
     }
 
     // 5. Free fully-evacuated regions (no pinned/left-behind live object).
@@ -8466,6 +9323,16 @@ void LXRCollector::ReclaimMatureByRC()
         if (anyYoung)
             continue;
 
+        // (A) selective mature-RC reclaim (paper §3.3, line 448): a mature region
+        // can only acquire a newly-dead object via a decrement, so skip any region
+        // whose blocks saw no decrement since the last pass. Root-transient mature
+        // objects (RC 0, dropped from a root with no decrement) are reclaimed by the
+        // mark-authoritative backup trace, exactly as in the paper -- not here. This
+        // replaces the O(heap) AnyRCNonZeroInRange scan of every region each pause
+        // with work proportional to the decremented (garbage-producing) regions.
+        if (g_selectiveMatureRC && !AnyRCDirtyInRegionAndClear(c.Start, c.UsedEnd))
+            continue;
+
         bool wholeDead = !AnyRCNonZeroInRange(c.Start, c.UsedEnd);
         bool rooted = rootInRange(c.Start, c.UsedEnd);
 
@@ -8567,6 +9434,9 @@ HRESULT LXRGCHeap::Initialize()
         return E_OUTOFMEMORY;
     m_heapReservedEnd = m_heapBase + HEAP_RESERVE_SIZE;
     m_heapNextFree = m_heapBase;
+    if (getenv("LXR_HEAP_BOUNDS") != nullptr)
+        fprintf(stderr, "LXRGC: [heap-bounds] base=%p reservedEnd=%p size=0x%zx\n",
+                (void*)m_heapBase, (void*)m_heapReservedEnd, (size_t)HEAP_RESERVE_SIZE);
 
     if (!g_lxrCollector.Initialize(m_heapBase, HEAP_RESERVE_SIZE))
         return E_OUTOFMEMORY;
@@ -8632,6 +9502,18 @@ HRESULT LXRGCHeap::Initialize()
     {
         const char* e = getenv("LXR_DEFER_DECOMMIT");
         g_deferDecommit = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON
+    }
+    {
+        const char* e = getenv("LXR_SCAN_SAFE");
+        g_scanSafe = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON (committed-validated object scan on concurrent stale-ref paths)
+    }
+    {
+        const char* e = getenv("LXR_SELECTIVE_MATURE_RC");
+        g_selectiveMatureRC = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON (paper §3.3 selective decrement sweep)
+    }
+    {
+        const char* e = getenv("LXR_MARK_DEAD_SCAN");
+        g_markDeadScan = (e != nullptr) ? (atoi(e) != 0) : 1; // default ON (paper §3.2.2 L427 mark-and-scan-before-free during a trace)
     }
     {
         const char* e = getenv("LXR_INWINDOW_DECOMMIT");
@@ -9042,6 +9924,7 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
                 commitSize = th.RunEnd - th.CommitEnd;
             if (VirtualAlloc(th.CommitEnd, commitSize, MEM_COMMIT, PAGE_READWRITE) == nullptr)
                 return nullptr;
+            g_lxrCollector.HeapPagesCommit(th.CommitEnd, commitSize); // publish AFTER commit
             th.CommitEnd += commitSize;
             InterlockedExchangeAdd64(&g_committedInUse, (int64_t)commitSize);
             LXRNoteCommitted();
@@ -9077,6 +9960,20 @@ Object* LXRGCHeap::AllocateSlow(gc_alloc_context* acontext, size_t size, uint32_
     // usedEnd) used extent per retired chunk), NOT here -- the mutator bump-
     // allocates most objects inline without re-entering AllocateSlow, so a per-
     // slow-path increment would only ever see the first object of each chunk.
+
+    // Allocation-tick event: fire one FireGCAllocationTick_V4 per AllocateSlow
+    // refill (~one per 128 KiB, mirroring the built-in GC's ~100 KiB AllocationTick
+    // cadence) so the out-of-process dotnet-trace consumer reconstructs an
+    // allocation-rate time series for LXR. This runs only on the slow path (the
+    // mutator bump-allocates most objects inline), so the cost is negligible; the
+    // sink self-gates to a no-op when the runtime provider is not enabled.
+    if (g_theGCToCLR != nullptr)
+    {
+        IGCToCLREventSink* sink = g_theGCToCLR->EventSink();
+        if (sink != nullptr)
+            sink->FireGCAllocationTick_V4((uint64_t)chunkSize,
+                isLarge ? 1u : 0u, /*heapIndex*/ 0u, (void*)chunkStart, (uint64_t)alignedSize);
+    }
 
     // In a working LXR the new object is born with RC=0 and stuck-if-young;
     // it gains references only through the write barrier / root scan. Because
@@ -9382,6 +10279,33 @@ static void LXREmitPhaseQpc(const char* phaseName, LARGE_INTEGER a, LARGE_INTEGE
     if (freq.QuadPart == 0) return;
     int64_t micros = (int64_t)((b.QuadPart - a.QuadPart) * 1000000 / freq.QuadPart);
     LXREmitPhaseEvent(phaseName, micros, concurrent);
+}
+
+// Standard GC lifecycle events (GCStart/GCHeapStats/GCEnd). A standalone GC is
+// entitled to fire the SAME events the built-in GC fires through the (unmodified)
+// GC->EE event sink, so an out-of-process dotnet-trace consumer reconstructs the
+// identical "collection count" + "heap size" time series for LXR as for
+// Workstation/Server GC (no runtime change; each self-gates to a no-op when the
+// provider is not enabled). depth = the generation this pause collected
+// (0 = a young/RC pause, 2 = a full trace/finish pause).
+static void LXREmitGCMarkers(uint32_t depth, uint64_t heapBytes)
+{
+    if (g_theGCToCLR == nullptr) return;
+    IGCToCLREventSink* sink = g_theGCToCLR->EventSink();
+    if (sink == nullptr) return;
+    uint32_t count = (uint32_t)g_lxrCounters.Epochs;
+    sink->FireGCStart_V2(count, depth, /*reason*/ 0, /*type*/ 0);
+    // Carry the whole managed heap in the gen2 slot; TraceEvent sums the per-
+    // generation sizes into GCHeapStats.TotalHeapSize (which the analyzer reads).
+    sink->FireGCHeapStats_V2(
+        0, 0,               // gen0 size / promoted
+        0, 0,               // gen1
+        heapBytes, 0,       // gen2 (carries the total live/committed heap)
+        0, 0,               // gen3 (LOH)
+        0, 0,               // gen4 (POH)
+        0, 0,               // finalization promoted size / count
+        0, 0, 0);           // pinned / sinkBlock / gcHandle counts
+    sink->FireGCEnd_V1(count, depth);
 }
 
 // Runs one LXR epoch. Every epoch replays the coalescing-RC modified buffers (a
@@ -10146,9 +11070,12 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     if (s_cadence) {
         const char* ptag = meStart ? "snapshot" : (meFinish ? "finish" :
             (phase == LXRPhase::TracePause ? "tracepause" : "rcpause"));
-        fprintf(stderr, "LXRGC: [cadence] type=%-10s committedMB=%lld epSinceTrace=%lld win=%d st=%d snap=%d mq=%d nurserySkipped=%lld traces=%lld winReclaims=%lld parks=%lld pause=%lldus\n",
+        fprintf(stderr, "LXRGC: [cadence] type=%-10s committedMB=%lld epSinceTrace=%lld win=%d st=%d snap=%d mq=%d spans=%lld ff=%d hb=%lld mtop=%zu preq=%d act=%d prk=%d nurserySkipped=%lld traces=%lld winReclaims=%lld parks=%lld pause=%lldus\n",
                 ptag, (long long)(g_committedInUse / (1024*1024)), (long long)g_epochsSinceTrace,
                 (int)g_traceWindowOpen, (int)g_traceState, (int)g_snapshotConsumed, (int)g_markerQuiescent,
+                (long long)g_windowSpans, (int)g_traceForceFinish,
+                (long long)g_markerRoundHeartbeat, (size_t)g_markTop,
+                (int)g_markParkReq, (int)g_markScanActive, (int)g_markScanParked,
                 (long long)g_lxrCounters.NurserySkipped,
                 (long long)g_lxrCounters.TracePauses, (long long)g_windowReclaims,
                 (long long)g_markerParkCount, (long long)pauseMicros);
@@ -10183,6 +11110,15 @@ static int64_t RunLXRCollection(int generation, bool forceTrace)
     // LXR ~3x). Same type taxonomy as the LXR_PAUSE_LOG line.
     LXREmitPauseEvent(meStart ? "snapshot" : (meFinish ? "finish" :
         (phase == LXRPhase::TracePause ? "tracepause" : "rcpause")), pauseMicros);
+    // Also fire the standard GCStart/GCHeapStats/GCEnd trio for this pause so the
+    // out-of-process analyzer reconstructs collection-count + heap-size series for
+    // LXR exactly as it does for the built-in GCs. A full trace/finish pause is a
+    // gen2 collection; a plain RC/snapshot pause is a young (gen0) collection.
+    if (pauseMicros > 0) {
+        uint32_t gcDepth = (phase == LXRPhase::TracePause || meFinish) ? 2u : 0u;
+        int64_t heapBytes = g_committedInUse; if (heapBytes < 0) heapBytes = 0;
+        LXREmitGCMarkers(gcDepth, (uint64_t)heapBytes);
+    }
     InterlockedExchangeAdd64(&g_lxrCounters.TotalPauseMicros, pauseMicros);
     // Pause-time telemetry (feeds GetTotalPauseDuration / GetLastGCPercentTimeInGC,
     // consumed by the dotnet.gc.pause.time meter + "% Time in GC" EventCounter, and
@@ -10369,6 +11305,7 @@ static void LXRDumpAllThreadStacks()
     // the binaries) plus the runtime PDB dir; fInvadeProcess=TRUE loads modules.
     const char* symPath =
         "C:\\github\\runtimelab\\src\\LXRGC\\samples\\WebApi\\publish;"
+        "C:\\github\\runtimelab\\src\\LXRGC\\samples\\GrowingCacheApp\\publish;"
         "C:\\github\\runtime\\artifacts\\bin\\coreclr\\windows.x64.Release\\PDB;"
         "C:\\github\\runtime\\artifacts\\bin\\coreclr\\windows.x64.Release";
     SymInitialize(proc, symPath, TRUE);
@@ -10835,6 +11772,7 @@ segment_handle LXRGCHeap::RegisterFrozenSegment(segment_info* pseginfo)
         {
             g_frozenSegments[i].InUse = true;
             g_frozenSegments[i].Base = (uint8_t*)pseginfo->pvMem;
+            g_frozenSegments[i].FirstObject = (uint8_t*)pseginfo->pvMem + pseginfo->ibFirstObject;
             g_frozenSegments[i].Allocated = (uint8_t*)pseginfo->pvMem + pseginfo->ibAllocated;
             g_frozenSegments[i].Committed = (uint8_t*)pseginfo->pvMem + pseginfo->ibCommit;
             g_frozenSegments[i].Reserved = (uint8_t*)pseginfo->pvMem + pseginfo->ibReserved;
